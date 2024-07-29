@@ -20,6 +20,7 @@
 #include "devnum-util.h"
 #include "env-util.h"
 #include "escape.h"
+#include "exec-credential.h"
 #include "exit-status.h"
 #include "fd-util.h"
 #include "fileio.h"
@@ -697,6 +698,9 @@ static int service_verify(Service *s) {
         if (s->runtime_max_usec == USEC_INFINITY && s->runtime_rand_extra_usec != 0)
                 log_unit_warning(UNIT(s), "Service has RuntimeRandomizedExtraSec= setting, but no RuntimeMaxSec=. Ignoring.");
 
+        if (s->type == SERVICE_SIMPLE && s->exec_command[SERVICE_EXEC_START_POST] && exec_context_has_credentials(&s->exec_context))
+                log_unit_warning(UNIT(s), "Service uses a combination of Type=simple, ExecStartPost=, and credentials. This could lead to race conditions. Continuing.");
+
         if (s->exit_type == SERVICE_EXIT_CGROUP && cg_unified() < CGROUP_UNIFIED_SYSTEMD)
                 log_unit_warning(UNIT(s), "Service has ExitType=cgroup set, but we are running with legacy cgroups v1, which might not work correctly. Continuing.");
 
@@ -825,6 +829,8 @@ static int service_add_extras(Service *s) {
                 /* Figure out a type automatically */
                 if (s->bus_name)
                         s->type = SERVICE_DBUS;
+                else if (exec_context_has_credentials(&s->exec_context))
+                        s->type = SERVICE_EXEC;
                 else if (s->exec_command[SERVICE_EXEC_START])
                         s->type = SERVICE_SIMPLE;
                 else
@@ -1228,13 +1234,12 @@ static void service_search_main_pid(Service *s) {
 }
 
 static void service_set_state(Service *s, ServiceState state) {
+        Unit *u = UNIT(ASSERT_PTR(s));
         ServiceState old_state;
         const UnitActiveState *table;
 
-        assert(s);
-
         if (s->state != state)
-                bus_unit_send_pending_change_signal(UNIT(s), false);
+                bus_unit_send_pending_change_signal(u, false);
 
         table = s->type == SERVICE_IDLE ? state_translation_table_idle : state_translation_table;
 
@@ -1268,8 +1273,8 @@ static void service_set_state(Service *s, ServiceState state) {
                    SERVICE_DEAD, SERVICE_FAILED,
                    SERVICE_DEAD_BEFORE_AUTO_RESTART, SERVICE_FAILED_BEFORE_AUTO_RESTART, SERVICE_AUTO_RESTART, SERVICE_AUTO_RESTART_QUEUED,
                    SERVICE_DEAD_RESOURCES_PINNED)) {
-                unit_unwatch_all_pids(UNIT(s));
-                unit_dequeue_rewatch_pids(UNIT(s));
+                unit_unwatch_all_pids(u);
+                unit_dequeue_rewatch_pids(u);
         }
 
         if (state != SERVICE_START)
@@ -1278,15 +1283,31 @@ static void service_set_state(Service *s, ServiceState state) {
         if (!IN_SET(state, SERVICE_START_POST, SERVICE_RUNNING, SERVICE_RELOAD, SERVICE_RELOAD_SIGNAL, SERVICE_RELOAD_NOTIFY))
                 service_stop_watchdog(s);
 
-        /* For the inactive states unit_notify() will trim the cgroup,
-         * but for exit we have to do that ourselves... */
-        if (state == SERVICE_EXITED && !MANAGER_IS_RELOADING(UNIT(s)->manager))
-                unit_prune_cgroup(UNIT(s));
+        if (state == SERVICE_EXITED && !MANAGER_IS_RELOADING(u->manager)) {
+                /* For the inactive states unit_notify() will trim the cgroup. But for exit we have to
+                 * do that ourselves... */
+                unit_prune_cgroup(u);
+
+                /* If none of ExecReload= and ExecStop*= is used, we can safely destroy runtime data
+                 * as soon as the service enters SERVICE_EXITED. This saves us from keeping the credential mount
+                 * for the whole duration of the oneshot service while no processes are actually running,
+                 * among other things. */
+
+                bool start_only = true;
+                for (ServiceExecCommand c = SERVICE_EXEC_RELOAD; c < _SERVICE_EXEC_COMMAND_MAX; c++)
+                        if (s->exec_command[c]) {
+                                start_only = false;
+                                break;
+                        }
+
+                if (start_only)
+                        unit_destroy_runtime_data(u, &s->exec_context);
+        }
 
         if (old_state != state)
-                log_unit_debug(UNIT(s), "Changed %s -> %s", service_state_to_string(old_state), service_state_to_string(state));
+                log_unit_debug(u, "Changed %s -> %s", service_state_to_string(old_state), service_state_to_string(state));
 
-        unit_notify(UNIT(s), table[old_state], table[state], s->reload_result == SERVICE_SUCCESS);
+        unit_notify(u, table[old_state], table[state], s->reload_result == SERVICE_SUCCESS);
 }
 
 static usec_t service_coldplug_timeout(Service *s) {
@@ -4320,46 +4341,55 @@ static void service_force_watchdog(Service *s) {
         service_enter_signal(s, SERVICE_STOP_WATCHDOG, SERVICE_FAILURE_WATCHDOG);
 }
 
-static bool service_notify_message_authorized(Service *s, pid_t pid) {
+static bool service_notify_message_authorized(Service *s, PidRef *pid) {
         assert(s);
-        assert(pid_is_valid(pid));
+        assert(pidref_is_set(pid));
 
-        NotifyAccess notify_access = service_get_notify_access(s);
+        switch (service_get_notify_access(s)) {
 
-        if (notify_access == NOTIFY_NONE) {
+        case NOTIFY_NONE:
                 /* Warn level only if no notifications are expected */
-                log_unit_warning(UNIT(s), "Got notification message from PID "PID_FMT", but reception is disabled", pid);
+                log_unit_warning(UNIT(s), "Got notification message from PID "PID_FMT", but reception is disabled", pid->pid);
                 return false;
-        }
 
-        if (notify_access == NOTIFY_MAIN && pid != s->main_pid.pid) {
+        case NOTIFY_ALL:
+                return true;
+
+        case NOTIFY_MAIN:
+                if (pidref_equal(pid, &s->main_pid))
+                        return true;
+
                 if (pidref_is_set(&s->main_pid))
-                        log_unit_debug(UNIT(s), "Got notification message from PID "PID_FMT", but reception only permitted for main PID "PID_FMT, pid, s->main_pid.pid);
+                        log_unit_debug(UNIT(s), "Got notification message from PID "PID_FMT", but reception only permitted for main PID "PID_FMT, pid->pid, s->main_pid.pid);
                 else
-                        log_unit_debug(UNIT(s), "Got notification message from PID "PID_FMT", but reception only permitted for main PID which is currently not known", pid);
+                        log_unit_debug(UNIT(s), "Got notification message from PID "PID_FMT", but reception only permitted for main PID which is currently not known", pid->pid);
 
                 return false;
-        }
 
-        if (notify_access == NOTIFY_EXEC && pid != s->main_pid.pid && pid != s->control_pid.pid) {
+        case NOTIFY_EXEC:
+                if (pidref_equal(pid, &s->main_pid) || pidref_equal(pid, &s->control_pid))
+                        return true;
+
                 if (pidref_is_set(&s->main_pid) && pidref_is_set(&s->control_pid))
                         log_unit_debug(UNIT(s), "Got notification message from PID "PID_FMT", but reception only permitted for main PID "PID_FMT" and control PID "PID_FMT,
-                                       pid, s->main_pid.pid, s->control_pid.pid);
+                                       pid->pid, s->main_pid.pid, s->control_pid.pid);
                 else if (pidref_is_set(&s->main_pid))
-                        log_unit_debug(UNIT(s), "Got notification message from PID "PID_FMT", but reception only permitted for main PID "PID_FMT, pid, s->main_pid.pid);
+                        log_unit_debug(UNIT(s), "Got notification message from PID "PID_FMT", but reception only permitted for main PID "PID_FMT, pid->pid, s->main_pid.pid);
                 else if (pidref_is_set(&s->control_pid))
-                        log_unit_debug(UNIT(s), "Got notification message from PID "PID_FMT", but reception only permitted for control PID "PID_FMT, pid, s->control_pid.pid);
+                        log_unit_debug(UNIT(s), "Got notification message from PID "PID_FMT", but reception only permitted for control PID "PID_FMT, pid->pid, s->control_pid.pid);
                 else
-                        log_unit_debug(UNIT(s), "Got notification message from PID "PID_FMT", but reception only permitted for main PID and control PID which are currently not known", pid);
+                        log_unit_debug(UNIT(s), "Got notification message from PID "PID_FMT", but reception only permitted for main PID and control PID which are currently not known", pid->pid);
 
                 return false;
-        }
 
-        return true;
+        default:
+                assert_not_reached();
+        }
 }
 
 static void service_notify_message(
                 Unit *u,
+                PidRef *pidref,
                 const struct ucred *ucred,
                 char * const *tags,
                 FDSet *fds) {
@@ -4367,14 +4397,15 @@ static void service_notify_message(
         Service *s = ASSERT_PTR(SERVICE(u));
         int r;
 
+        assert(pidref_is_set(pidref));
         assert(ucred);
 
-        if (!service_notify_message_authorized(s, ucred->pid))
+        if (!service_notify_message_authorized(s, pidref))
                 return;
 
         if (DEBUG_LOGGING) {
                 _cleanup_free_ char *cc = strv_join(tags, ", ");
-                log_unit_debug(u, "Got notification message from PID "PID_FMT": %s", ucred->pid, empty_to_na(cc));
+                log_unit_debug(u, "Got notification message from PID "PID_FMT": %s", pidref->pid, empty_to_na(cc));
         }
 
         usec_t monotonic_usec = USEC_INFINITY;

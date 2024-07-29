@@ -1102,6 +1102,9 @@ else
                         # Check if 'clang -target bpf' is supported.
                         clang_supports_bpf = run_command(clang, '-target', 'bpf', '--print-supported-cpus', check : false).returncode() == 0
                 endif
+                if bpf_framework.enabled() and not clang_supports_bpf
+                        error('bpf-framework was enabled but clang does not support bpf')
+                endif
         elif bpf_compiler == 'gcc'
                 bpf_gcc = find_program('bpf-gcc',
                                        'bpf-none-gcc',
@@ -1991,14 +1994,11 @@ endif
 conf.set_quoted('VERSION_TAG', version_tag)
 
 vcs_tag = get_option('vcs-tag')
-command = ['sh', '-c',
-           vcs_tag and fs.exists(project_source_root / '.git') ?
-                   'echo "-g$(git -C . describe --abbrev=7 --match="" --always --dirty=^)"' : ':']
 version_h = vcs_tag(
         input : 'src/version/version.h.in',
         output : 'version.h',
         fallback : '',
-        command : command,
+        command : [vcs_tag ? 'tools/vcs-tag.sh' : 'true', get_option('mode')],
 )
 
 shared_lib_tag = get_option('shared-lib-tag')
@@ -2069,7 +2069,8 @@ libsystemd_includes = [basic_includes, include_directories(
         'src/libsystemd/sd-json',
         'src/libsystemd/sd-netlink',
         'src/libsystemd/sd-network',
-        'src/libsystemd/sd-resolve')]
+        'src/libsystemd/sd-resolve',
+        'src/libsystemd/sd-varlink')]
 
 includes = [libsystemd_includes, include_directories('src/shared')]
 
@@ -2672,6 +2673,7 @@ if mkosi.found()
                         '--output-dir', meson.current_build_dir() / 'mkosi.output',
                         '--cache-dir', meson.current_build_dir() / 'mkosi.cache',
                         '--build-dir', meson.current_build_dir() / 'mkosi.builddir',
+                        '--extra-search-path', meson.current_build_dir(),
                         '--force',
                         'build',
                 ],

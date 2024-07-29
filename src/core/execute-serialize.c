@@ -2327,18 +2327,6 @@ static int exec_context_serialize(const ExecContext *c, FILE *f) {
         if (r < 0)
                 return r;
 
-        r = serialize_bool_elide(f, "exec-context-selinux-context-ignore", c->selinux_context_ignore);
-        if (r < 0)
-                return r;
-
-        r = serialize_bool_elide(f, "exec-context-apparmor-profile-ignore", c->apparmor_profile_ignore);
-        if (r < 0)
-                return r;
-
-        r = serialize_bool_elide(f, "exec-context-smack-process-label-ignore", c->smack_process_label_ignore);
-        if (r < 0)
-                return r;
-
         if (c->selinux_context) {
                 r = serialize_item_format(f, "exec-context-selinux-context",
                                           "%s%s",
@@ -3345,26 +3333,12 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         if (r < 0)
                                 return r;
                         c->no_new_privileges = r;
-                } else if ((val = startswith(l, "exec-context-selinux-context-ignore="))) {
-                        r = parse_boolean(val);
-                        if (r < 0)
-                                return r;
-                        c->selinux_context_ignore = r;
-                } else if ((val = startswith(l, "exec-context-apparmor-profile-ignore="))) {
-                        r = parse_boolean(val);
-                        if (r < 0)
-                                return r;
-                        c->apparmor_profile_ignore = r;
-                } else if ((val = startswith(l, "exec-context-smack-process-label-ignore="))) {
-                        r = parse_boolean(val);
-                        if (r < 0)
-                                return r;
-                        c->smack_process_label_ignore = r;
                 } else if ((val = startswith(l, "exec-context-selinux-context="))) {
                         if (val[0] == '-') {
                                 c->selinux_context_ignore = true;
                                 val++;
-                        }
+                        } else
+                                c->selinux_context_ignore = false;
 
                         r = free_and_strdup(&c->selinux_context, val);
                         if (r < 0)
@@ -3373,7 +3347,8 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         if (val[0] == '-') {
                                 c->apparmor_profile_ignore = true;
                                 val++;
-                        }
+                        } else
+                                c->apparmor_profile_ignore = false;
 
                         r = free_and_strdup(&c->apparmor_profile, val);
                         if (r < 0)
@@ -3382,7 +3357,8 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         if (val[0] == '-') {
                                 c->smack_process_label_ignore = true;
                                 val++;
-                        }
+                        } else
+                                c->smack_process_label_ignore = false;
 
                         r = free_and_strdup(&c->smack_process_label, val);
                         if (r < 0)
@@ -3672,8 +3648,7 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         if (r < 0)
                                 return r;
                 } else if ((val = startswith(l, "exec-context-set-credentials="))) {
-                        _cleanup_(exec_set_credential_freep) ExecSetCredential *sc = NULL;
-                        _cleanup_free_ char *id = NULL, *encrypted = NULL, *data = NULL;
+                        _cleanup_free_ char *id = NULL, *data = NULL, *encrypted = NULL;
 
                         r = extract_many_words(&val, " ", EXTRACT_DONT_COALESCE_SEPARATORS, &id, &data, &encrypted);
                         if (r < 0)
@@ -3684,28 +3659,20 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         r = parse_boolean(encrypted);
                         if (r < 0)
                                 return r;
+                        bool e = r;
 
-                        sc = new(ExecSetCredential, 1);
-                        if (!sc)
-                                return -ENOMEM;
+                        _cleanup_free_ void *d = NULL;
+                        size_t size;
 
-                        *sc = (ExecSetCredential) {
-                                .id =  TAKE_PTR(id),
-                                .encrypted = r,
-                        };
-
-                        r = unbase64mem(data, &sc->data, &sc->size);
+                        r = unbase64mem_full(data, SIZE_MAX, /* secure = */ true, &d, &size);
                         if (r < 0)
                                 return r;
 
-                        r = hashmap_ensure_put(&c->set_credentials, &exec_set_credential_hash_ops, sc->id, sc);
+                        r = exec_context_put_set_credential(c, id, TAKE_PTR(d), size, e);
                         if (r < 0)
                                 return r;
-
-                        TAKE_PTR(sc);
                 } else if ((val = startswith(l, "exec-context-load-credentials="))) {
-                        _cleanup_(exec_load_credential_freep) ExecLoadCredential *lc = NULL;
-                        _cleanup_free_ char *id = NULL, *encrypted = NULL, *path = NULL;
+                        _cleanup_free_ char *id = NULL, *path = NULL, *encrypted = NULL;
 
                         r = extract_many_words(&val, " ", EXTRACT_DONT_COALESCE_SEPARATORS, &id, &path, &encrypted);
                         if (r < 0)
@@ -3717,21 +3684,9 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         if (r < 0)
                                 return r;
 
-                        lc = new(ExecLoadCredential, 1);
-                        if (!lc)
-                                return -ENOMEM;
-
-                        *lc = (ExecLoadCredential) {
-                                .id =  TAKE_PTR(id),
-                                .path = TAKE_PTR(path),
-                                .encrypted = r,
-                        };
-
-                        r = hashmap_ensure_put(&c->load_credentials, &exec_load_credential_hash_ops, lc->id, lc);
+                        r = exec_context_put_load_credential(c, id, path, r > 0);
                         if (r < 0)
                                 return r;
-
-                        TAKE_PTR(lc);
                 } else if ((val = startswith(l, "exec-context-import-credentials="))) {
                         r = set_ensure_allocated(&c->import_credentials, &string_hash_ops);
                         if (r < 0)
