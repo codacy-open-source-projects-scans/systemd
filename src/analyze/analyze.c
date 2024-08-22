@@ -102,6 +102,7 @@ RuntimeScope arg_runtime_scope = RUNTIME_SCOPE_SYSTEM;
 RecursiveErrors arg_recursive_errors = _RECURSIVE_ERRORS_INVALID;
 bool arg_man = true;
 bool arg_generators = false;
+const char *arg_instance = "test_instance";
 double arg_svg_timescale = 1.0;
 bool arg_detailed_svg = false;
 char *arg_root = NULL;
@@ -272,6 +273,7 @@ static int help(int argc, char *argv[], void *userdata) {
                "     --man[=BOOL]            Do [not] check for existence of man pages\n"
                "     --generators[=BOOL]     Do [not] run unit generators\n"
                "                             (requires privileges)\n"
+               "     --instance=NAME         Specify fallback instance name for template units\n"
                "     --iterations=N          Show the specified number of iterations\n"
                "     --base-time=TIMESTAMP   Calculate calendar times relative to\n"
                "                             specified time\n"
@@ -319,6 +321,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_NO_PAGER,
                 ARG_MAN,
                 ARG_GENERATORS,
+                ARG_INSTANCE,
                 ARG_ITERATIONS,
                 ARG_BASE_TIME,
                 ARG_RECURSIVE_ERRORS,
@@ -356,6 +359,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "no-pager",         no_argument,       NULL, ARG_NO_PAGER         },
                 { "man",              optional_argument, NULL, ARG_MAN              },
                 { "generators",       optional_argument, NULL, ARG_GENERATORS       },
+                { "instance",         required_argument, NULL, ARG_INSTANCE         },
                 { "host",             required_argument, NULL, 'H'                  },
                 { "machine",          required_argument, NULL, 'M'                  },
                 { "iterations",       required_argument, NULL, ARG_ITERATIONS       },
@@ -484,6 +488,10 @@ static int parse_argv(int argc, char *argv[]) {
                                 return r;
                         break;
 
+                case ARG_INSTANCE:
+                        arg_instance = optarg;
+                        break;
+
                 case ARG_OFFLINE:
                         r = parse_boolean_argument("--offline", optarg, &arg_offline);
                         if (r < 0)
@@ -609,7 +617,7 @@ static int parse_argv(int argc, char *argv[]) {
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Option --security-policy= is only supported for security.");
 
-        if ((arg_root || arg_image) && (!STRPTR_IN_SET(argv[optind], "cat-config", "verify", "condition")) &&
+        if ((arg_root || arg_image) && (!STRPTR_IN_SET(argv[optind], "cat-config", "verify", "condition", "inspect-elf")) &&
            (!(streq_ptr(argv[optind], "security") && arg_offline)))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Options --root= and --image= are only supported for cat-config, verify, condition and security when used with --offline= right now.");

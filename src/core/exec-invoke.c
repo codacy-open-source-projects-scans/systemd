@@ -354,7 +354,7 @@ static int setup_input(
                         return -errno;
 
                 /* Try to make this the controlling tty, if it is a tty */
-                if (isatty(STDIN_FILENO))
+                if (isatty_safe(STDIN_FILENO))
                         (void) ioctl(STDIN_FILENO, TIOCSCTTY, context->std_input == EXEC_INPUT_TTY_FORCE);
 
                 return STDIN_FILENO;
@@ -4435,14 +4435,6 @@ int exec_invoke(
                 }
         }
 
-        if (context->nice_set) {
-                r = setpriority_closest(context->nice);
-                if (r < 0) {
-                        *exit_status = EXIT_NICE;
-                        return log_exec_error_errno(context, params, r, "Failed to set up process scheduling priority (nice level): %m");
-                }
-        }
-
         if (context->cpu_sched_set) {
                 struct sched_attr attr = {
                         .size = sizeof(attr),
@@ -4455,6 +4447,21 @@ int exec_invoke(
                 if (r < 0) {
                         *exit_status = EXIT_SETSCHEDULER;
                         return log_exec_error_errno(context, params, errno, "Failed to set up CPU scheduling: %m");
+                }
+        }
+
+        /*
+         * Set nice value _after_ the call to sched_setattr() because struct sched_attr includes sched_nice
+         * which we do not set, thus it will clobber any previously set nice value. Scheduling policy might
+         * be reasonably set together with nice value e.g. in case of SCHED_BATCH (see sched(7)).
+         * It would be ideal to set both with the same call, but we cannot easily do so because of all the
+         * extra logic in setpriority_closest().
+         */
+        if (context->nice_set) {
+                r = setpriority_closest(context->nice);
+                if (r < 0) {
+                        *exit_status = EXIT_NICE;
+                        return log_exec_error_errno(context, params, r, "Failed to set up process scheduling priority (nice level): %m");
                 }
         }
 

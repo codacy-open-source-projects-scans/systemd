@@ -645,7 +645,7 @@ def flush_routing_policy_rules():
                 have = True
                 print(f'### Removing IPv{ipv} routing policy rules that did not exist when the test started.')
             print(f'# {line}')
-            words = line.replace('lookup [l3mdev-table]', 'l3mdev').split()
+            words = line.replace('lookup [l3mdev-table]', 'l3mdev').replace('[detached]', '').split()
             priority = words[0].rstrip(':')
             call(f'ip -{ipv} rule del priority {priority} ' + ' '.join(words[1:]))
 
@@ -1556,6 +1556,7 @@ class NetworkdNetDevTests(unittest.TestCase, Utilities):
         print(output)
         self.assertRegex(output, 'dstport 1000 ')
         self.assertRegex(output, 'ethertype ip ')
+        self.assertRegex(output, 'srcportmin 1001 ')
 
     @expectedFailureIfModuleIsNotAvailable('batman-adv')
     def test_batadv(self):
@@ -1939,7 +1940,7 @@ class NetworkdNetDevTests(unittest.TestCase, Utilities):
 
         copy_network_unit('25-wireguard.netdev', '25-wireguard.network',
                           '25-wireguard-23-peers.netdev', '25-wireguard-23-peers.network',
-                          '25-wireguard-preshared-key.txt', '25-wireguard-private-key.txt',
+                          '25-wireguard-public-key.txt', '25-wireguard-preshared-key.txt', '25-wireguard-private-key.txt',
                           '25-wireguard-no-peer.netdev', '25-wireguard-no-peer.network')
         start_networkd()
         self.wait_online('wg99:routable', 'wg98:routable', 'wg97:carrier')
@@ -3209,58 +3210,108 @@ class NetworkdNetworkTests(unittest.TestCase, Utilities):
                     self.assertNotRegex(output, '192.168.0.1')
                 self.assertRegex(output, routable_map[carrier])
 
-    def test_routing_policy_rule(self):
-        copy_network_unit('25-routing-policy-rule-test1.network', '11-dummy.netdev')
-        start_networkd()
-        self.wait_online('test1:degraded')
+    def check_routing_policy_rule_test1(self):
+        print('### Checking routing policy rules requested by test1')
 
         output = check_output('ip rule list iif test1 priority 111')
         print(output)
-        self.assertRegex(output, '111:')
-        self.assertRegex(output, 'from 192.168.100.18')
-        self.assertRegex(output, r'tos (0x08|throughput)\s')
-        self.assertRegex(output, 'iif test1')
-        self.assertRegex(output, 'oif test1')
-        self.assertRegex(output, 'lookup 7')
-
-        output = check_output('ip rule list iif test1 priority 101')
-        print(output)
-        self.assertRegex(output, '101:')
-        self.assertRegex(output, 'from all')
-        self.assertRegex(output, 'iif test1')
-        self.assertRegex(output, 'lookup 9')
+        self.assertRegex(output, r'111:	from 192.168.100.18 tos (0x08|throughput) iif test1 oif test1 lookup 7')
 
         output = check_output('ip -6 rule list iif test1 priority 100')
         print(output)
-        self.assertRegex(output, '100:')
-        self.assertRegex(output, 'from all')
-        self.assertRegex(output, 'iif test1')
-        self.assertRegex(output, 'lookup 8')
+        self.assertIn('100:	from all iif test1 lookup 8', output)
+
+        output = check_output('ip rule list iif test1 priority 101')
+        print(output)
+        self.assertIn('101:	from all iif test1 lookup 9', output)
 
         output = check_output('ip rule list iif test1 priority 102')
         print(output)
-        self.assertRegex(output, '102:')
-        self.assertRegex(output, 'from 0.0.0.0/8')
-        self.assertRegex(output, 'iif test1')
-        self.assertRegex(output, 'lookup 10')
+        self.assertIn('102:	from 0.0.0.0/8 iif test1 lookup 10', output)
 
+        output = check_output('ip rule list iif test1 priority 103')
+        print(output)
+        self.assertIn('103:	from 10.0.0.0/16 iif test1 lookup 11 goto 111', output)
+
+        output = check_output('ip rule list iif test1 priority 104')
+        print(output)
+        self.assertIn('104:	from 10.1.0.0/16 iif test1 lookup 12 nop', output)
+
+    def check_routing_policy_rule_dummy98(self):
+        print('### Checking routing policy rules requested by dummy98')
+
+        output = check_output('ip rule list priority 112')
+        print(output)
+        self.assertRegex(output, r'112:	from 192.168.101.18 tos (0x08|throughput) iif dummy98 oif dummy98 lookup 8')
+
+    def _test_routing_policy_rule(self, manage_foreign_routes):
+        if not manage_foreign_routes:
+            copy_networkd_conf_dropin('networkd-manage-foreign-rules-no.conf')
+        copy_network_unit('25-routing-policy-rule-test1.network', '11-dummy.netdev')
+
+        stop_networkd()
+
+        check_output('ip -4 rule add priority 20001 table 9999 from 10.10.0.0/16')
+        check_output('ip -6 rule add priority 20001 table 9999 from 2001:db8:0:1::/64')
+
+        start_networkd()
+        self.wait_online('test1:degraded')
+
+        self.check_routing_policy_rule_test1()
         check_json(networkctl_json())
 
-    def test_routing_policy_rule_issue_11280(self):
+        output = check_output('ip -4 rule list priority 20001 table 9999 from 10.10.0.0/16')
+        print(output)
+        if manage_foreign_routes:
+            self.assertEqual(output, '')
+        else:
+            self.assertIn(output, '20001:	from 10.10.0.0/16 lookup 9999')
+            check_output('ip -4 rule del priority 20001 table 9999 from 10.10.0.0/16')
+
+        output = check_output('ip -6 rule list priority 20001 table 9999 from 2001:db8:0:1::/64')
+        print(output)
+        if manage_foreign_routes:
+            self.assertEqual(output, '')
+        else:
+            self.assertIn(output, '20001:	from 2001:db8:0:1::/64 lookup 9999')
+            check_output('ip -6 rule del priority 20001 table 9999 from 2001:db8:0:1::/64')
+
+    def test_routing_policy_rule(self):
+        first = True
+        for manage_foreign_routes in [True, False]:
+            if first:
+                first = False
+            else:
+                self.tearDown()
+
+            print(f'### test_routing_policy_rule(manage_foreign_routes={manage_foreign_routes})')
+            with self.subTest(manage_foreign_routes=manage_foreign_routes):
+                self._test_routing_policy_rule(manage_foreign_routes)
+
+    def test_routing_policy_rule_restart_and_reconfigure(self):
         copy_network_unit('25-routing-policy-rule-test1.network', '11-dummy.netdev',
                           '25-routing-policy-rule-dummy98.network', '12-dummy.netdev')
+
+        # For #11280 and #34068.
 
         for trial in range(3):
             restart_networkd(show_logs=(trial > 0))
             self.wait_online('test1:degraded', 'dummy98:degraded')
 
-            output = check_output('ip rule list table 7')
-            print(output)
-            self.assertRegex(output, '111:	from 192.168.100.18 tos (0x08|throughput) iif test1 oif test1 lookup 7')
+            self.check_routing_policy_rule_test1()
+            self.check_routing_policy_rule_dummy98()
 
-            output = check_output('ip rule list table 8')
-            print(output)
-            self.assertRegex(output, '112:	from 192.168.101.18 tos (0x08|throughput) iif dummy98 oif dummy98 lookup 8')
+            networkctl_reconfigure('test1')
+            self.wait_online('test1:degraded')
+
+            self.check_routing_policy_rule_test1()
+            self.check_routing_policy_rule_dummy98()
+
+            networkctl_reconfigure('dummy98')
+            self.wait_online('dummy98:degraded')
+
+            self.check_routing_policy_rule_test1()
+            self.check_routing_policy_rule_dummy98()
 
     def test_routing_policy_rule_reconfigure(self):
         copy_network_unit('25-routing-policy-rule-reconfigure2.network', '11-dummy.netdev')
@@ -3728,12 +3779,14 @@ class NetworkdNetworkTests(unittest.TestCase, Utilities):
 
     def test_ipv6_address_label(self):
         copy_network_unit('25-ipv6-address-label-section.network', '12-dummy.netdev')
+        copy_networkd_conf_dropin('networkd-address-label.conf')
         start_networkd()
         self.wait_online('dummy98:degraded')
 
         output = check_output('ip addrlabel list')
         print(output)
-        self.assertRegex(output, '2004:da8:1::/64')
+        self.assertRegex(output, '2004:da8:1::/64 dev dummy98 label 4444')
+        self.assertRegex(output, '2004:da8:2::/64 label 5555')
 
     def test_ipv6_proxy_ndp(self):
         copy_network_unit('25-ipv6-proxy-ndp.network', '12-dummy.netdev')

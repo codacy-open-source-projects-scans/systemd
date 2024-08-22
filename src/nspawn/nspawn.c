@@ -27,7 +27,6 @@
 #include "ether-addr-util.h"
 #include "barrier.h"
 #include "base-filesystem.h"
-#include "blkid-util.h"
 #include "btrfs-util.h"
 #include "build.h"
 #include "bus-error.h"
@@ -40,7 +39,6 @@
 #include "common-signal.h"
 #include "copy.h"
 #include "cpu-set-util.h"
-#include "creds-util.h"
 #include "dev-setup.h"
 #include "discover-image.h"
 #include "dissect-image.h"
@@ -63,15 +61,12 @@
 #include "machine-credential.h"
 #include "macro.h"
 #include "main-func.h"
-#include "missing_sched.h"
 #include "mkdir.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
 #include "namespace-util.h"
-#include "netlink-util.h"
 #include "nspawn-bind-user.h"
 #include "nspawn-cgroup.h"
-#include "nspawn-def.h"
 #include "nspawn-expose-ports.h"
 #include "nspawn-mount.h"
 #include "nspawn-network.h"
@@ -99,7 +94,6 @@
 #include "rlimit-util.h"
 #include "rm-rf.h"
 #include "seccomp-util.h"
-#include "selinux-util.h"
 #include "signal-util.h"
 #include "socket-util.h"
 #include "stat-util.h"
@@ -145,6 +139,7 @@ static char *arg_slice = NULL;
 static bool arg_private_network = false;
 static bool arg_read_only = false;
 static StartMode arg_start_mode = START_PID1;
+static char *arg_init = NULL;
 static bool arg_ephemeral = false;
 static LinkJournal arg_link_journal = LINK_AUTO;
 static bool arg_link_journal_try = false;
@@ -250,6 +245,7 @@ STATIC_DESTRUCTOR_REGISTER(arg_supplementary_gids, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_machine, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_hostname, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_slice, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_init, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_setenv, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_network_interfaces, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_network_macvlan, strv_freep);
@@ -294,7 +290,7 @@ static int handle_arg_console(const char *arg) {
         else if (streq(arg, "passive"))
                 arg_console_mode = CONSOLE_PASSIVE;
         else if (streq(arg, "pipe")) {
-                if (isatty(STDIN_FILENO) && isatty(STDOUT_FILENO))
+                if (isatty_safe(STDIN_FILENO) && isatty(STDOUT_FILENO))
                         log_full(arg_quiet ? LOG_DEBUG : LOG_NOTICE,
                                  "Console mode 'pipe' selected, but standard input/output are connected to an interactive TTY. "
                                  "Most likely you want to use 'interactive' console mode for proper interactivity and shell job control. "
@@ -302,7 +298,7 @@ static int handle_arg_console(const char *arg) {
 
                 arg_console_mode = CONSOLE_PIPE;
         } else if (streq(arg, "autopipe")) {
-                if (isatty(STDIN_FILENO) && isatty(STDOUT_FILENO))
+                if (isatty_safe(STDIN_FILENO) && isatty(STDOUT_FILENO))
                         arg_console_mode = CONSOLE_INTERACTIVE;
                 else
                         arg_console_mode = CONSOLE_PIPE;
@@ -353,6 +349,7 @@ static int help(void) {
                "\n%3$sExecution:%4$s\n"
                "  -a --as-pid2              Maintain a stub init as PID1, invoke binary as PID2\n"
                "  -b --boot                 Boot up full system (i.e. invoke init)\n"
+               "     --init=PATH            Path to init to invoke\n"
                "     --chdir=PATH           Set working directory in the container\n"
                "  -E --setenv=NAME[=VALUE]  Pass an environment variable to PID 1\n"
                "  -u --user=USER            Run the command under specified user or UID\n"
@@ -401,7 +398,7 @@ static int help(void) {
                "                            Add a virtual Ethernet connection to the container\n"
                "                            and attach it to an existing bridge on the host\n"
                "     --network-zone=NAME    Similar, but attach the new interface to an\n"
-               "                            an automatically managed bridge interface\n"
+               "                            automatically managed bridge interface\n"
                "     --network-namespace-path=PATH\n"
                "                            Set network namespace to the one represented by\n"
                "                            the specified kernel namespace file node\n"
@@ -533,23 +530,25 @@ static int detect_unified_cgroup_hierarchy_from_image(const char *directory) {
                 return log_error_errno(r, "Failed to determine whether we are in all unified mode.");
         if (r > 0) {
                 /* Unified cgroup hierarchy support was added in 230. Unfortunately the detection
-                 * routine only detects 231, so we'll have a false negative here for 230. */
+                 * routine only detects 231, so we'll have a false negative here for 230. If there is no
+                 * systemd installation in the container, we use the unified cgroup hierarchy. */
                 r = systemd_installation_has_version(directory, "230");
-                if (r < 0)
+                if (r < 0 && r != -ENOENT)
                         return log_error_errno(r, "Failed to determine systemd version in container: %m");
-                if (r > 0)
+                if (r == 0)
+                        arg_unified_cgroup_hierarchy = CGROUP_UNIFIED_NONE;
+                else
                         arg_unified_cgroup_hierarchy = CGROUP_UNIFIED_ALL;
-                else
-                        arg_unified_cgroup_hierarchy = CGROUP_UNIFIED_NONE;
         } else if (cg_unified_controller(SYSTEMD_CGROUP_CONTROLLER) > 0) {
-                /* Mixed cgroup hierarchy support was added in 233 */
+                /* Mixed cgroup hierarchy support was added in 233. If there is no systemd installation in
+                 * the container, we use the unified cgroup hierarchy. */
                 r = systemd_installation_has_version(directory, "233");
-                if (r < 0)
+                if (r < 0 && r != -ENOENT)
                         return log_error_errno(r, "Failed to determine systemd version in container: %m");
-                if (r > 0)
-                        arg_unified_cgroup_hierarchy = CGROUP_UNIFIED_SYSTEMD;
-                else
+                if (r == 0)
                         arg_unified_cgroup_hierarchy = CGROUP_UNIFIED_NONE;
+                else
+                        arg_unified_cgroup_hierarchy = CGROUP_UNIFIED_SYSTEMD;
         } else
                 arg_unified_cgroup_hierarchy = CGROUP_UNIFIED_NONE;
 
@@ -701,6 +700,7 @@ static int parse_argv(int argc, char *argv[]) {
         enum {
                 ARG_VERSION = 0x100,
                 ARG_PRIVATE_NETWORK,
+                ARG_INIT,
                 ARG_UUID,
                 ARG_READ_ONLY,
                 ARG_CAPABILITY,
@@ -768,6 +768,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "private-network",        no_argument,       NULL, ARG_PRIVATE_NETWORK        },
                 { "as-pid2",                no_argument,       NULL, 'a'                        },
                 { "boot",                   no_argument,       NULL, 'b'                        },
+                { "init",                   required_argument, NULL, ARG_INIT                   },
                 { "uuid",                   required_argument, NULL, ARG_UUID                   },
                 { "read-only",              no_argument,       NULL, ARG_READ_ONLY              },
                 { "capability",             required_argument, NULL, ARG_CAPABILITY             },
@@ -986,6 +987,14 @@ static int parse_argv(int argc, char *argv[]) {
 
                         arg_start_mode = START_BOOT;
                         arg_settings_mask |= SETTING_START_MODE;
+                        break;
+
+                case ARG_INIT:
+                        r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_init);
+                        if (r < 0)
+                                return r;
+
+                        arg_settings_mask |= SETTING_INIT;
                         break;
 
                 case 'a':
@@ -1781,6 +1790,9 @@ static int verify_arguments(void) {
 
         if (arg_userns_mode == USER_NAMESPACE_NO && !strv_isempty(arg_bind_user))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "--bind-user= requires --private-users");
+
+        if (arg_start_mode != START_BOOT && arg_init)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Cannot use --init= without --boot");
 
         /* Drop duplicate --bind-user= entries */
         strv_uniq(arg_bind_user);
@@ -3594,15 +3606,21 @@ static int inner_child(
                 memcpy_safe(a + 1, arg_parameters, m * sizeof(char*));
                 a[1 + m] = NULL;
 
-                FOREACH_STRING(init,
-                               "/usr/lib/systemd/systemd",
-                               "/lib/systemd/systemd",
-                               "/sbin/init") {
-                        a[0] = (char*) init;
+                if (arg_init) {
+                        a[0] = arg_init;
                         execve(a[0], a, env_use);
-                }
+                        exec_target = arg_init;
+                } else {
+                        FOREACH_STRING(init,
+                                        "/usr/lib/systemd/systemd",
+                                        "/lib/systemd/systemd",
+                                        "/sbin/init") {
+                                a[0] = (char*) init;
+                                execve(a[0], a, env_use);
+                        }
 
-                exec_target = "/usr/lib/systemd/systemd, /lib/systemd/systemd, /sbin/init";
+                        exec_target = "/usr/lib/systemd/systemd, /lib/systemd/systemd, /sbin/init";
+                }
         } else if (!strv_isempty(arg_parameters)) {
                 const char *dollar_path;
 
@@ -4588,6 +4606,9 @@ static int merge_settings(Settings *settings, const char *path) {
                 arg_start_mode = settings->start_mode;
                 strv_free_and_replace(arg_parameters, settings->parameters);
         }
+
+        if ((arg_settings_mask & SETTING_INIT) == 0 && settings->init)
+                free_and_replace(arg_init, settings->init);
 
         if ((arg_settings_mask & SETTING_EPHEMERAL) == 0 &&
             settings->ephemeral >= 0)
@@ -5862,7 +5883,7 @@ static int run(int argc, char *argv[]) {
         umask(0022);
 
         if (arg_console_mode < 0)
-                arg_console_mode = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO) ?
+                arg_console_mode = isatty_safe(STDIN_FILENO) && isatty(STDOUT_FILENO) ?
                                    CONSOLE_INTERACTIVE : CONSOLE_READ_ONLY;
 
         if (arg_console_mode == CONSOLE_PIPE) /* if we pass STDERR on to the container, don't add our own logs into it too */

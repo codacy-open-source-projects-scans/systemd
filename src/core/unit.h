@@ -17,15 +17,12 @@ typedef enum UnitMountDependencyType {
         _UNIT_MOUNT_DEPENDENCY_TYPE_INVALID = -EINVAL,
 } UnitMountDependencyType;
 
-#include "bpf-program.h"
 #include "cgroup.h"
 #include "condition.h"
 #include "emergency-action.h"
 #include "install.h"
 #include "list.h"
 #include "pidref.h"
-#include "set.h"
-#include "show-status.h"
 #include "unit-file.h"
 
 typedef struct UnitRef UnitRef;
@@ -883,7 +880,7 @@ void unit_unwatch_bus_name(Unit *u, const char *name);
 
 bool unit_job_is_applicable(Unit *u, JobType j);
 
-int set_unit_path(const char *p);
+int setenv_unit_path(const char *p);
 
 char* unit_dbus_path(Unit *u);
 char* unit_dbus_path_invocation_id(Unit *u);
@@ -1042,6 +1039,8 @@ void unit_freezer_complete(Unit *u, FreezerState kernel_state);
 Condition *unit_find_failed_condition(Unit *u);
 
 int unit_arm_timer(Unit *u, sd_event_source **source, bool relative, usec_t usec, sd_event_time_handler_t handler);
+
+bool unit_passes_filter(Unit *u, char * const *states, char * const *patterns);
 
 int unit_compare_priority(Unit *a, Unit *b);
 

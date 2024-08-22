@@ -2075,6 +2075,14 @@ _public_ int sd_json_variant_set_field_string(sd_json_variant **v, const char *f
         return sd_json_variant_set_field(v, field, m);
 }
 
+_public_ int sd_json_variant_set_field_id128(sd_json_variant **v, const char *field, sd_id128_t value) {
+        return sd_json_variant_set_field_string(v, field, SD_ID128_TO_STRING(value));
+}
+
+_public_ int sd_json_variant_set_field_uuid(sd_json_variant **v, const char *field, sd_id128_t value) {
+        return sd_json_variant_set_field_string(v, field, SD_ID128_TO_UUID_STRING(value));
+}
+
 _public_ int sd_json_variant_set_field_integer(sd_json_variant **v, const char *field, int64_t i) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *m = NULL;
         int r;
@@ -4098,7 +4106,7 @@ _public_ int sd_json_buildv(sd_json_variant **ret, va_list ap) {
                                                         SD_JSON_BUILD_PAIR("realtime", SD_JSON_BUILD_UNSIGNED(ts->realtime)),
                                                         SD_JSON_BUILD_PAIR("monotonic", SD_JSON_BUILD_UNSIGNED(ts->monotonic)));
                                         if (r < 0)
-                                                return r;
+                                                goto finish;
                                 } else
                                         add = JSON_VARIANT_MAGIC_NULL;
                         }

@@ -61,6 +61,10 @@ def main():
         print(f"TEST_NO_QEMU=1, skipping {args.name}", file=sys.stderr)
         exit(77)
 
+    if args.name in os.getenv("TEST_SKIP", "").split():
+        print(f"Skipping {args.name} due to TEST_SKIP", file=sys.stderr)
+        exit(77)
+
     keep_journal = os.getenv("TEST_SAVE_JOURNAL", "fail")
     shell = bool(int(os.getenv("TEST_SHELL", "0")))
 
@@ -145,7 +149,7 @@ def main():
         '--runtime-scratch=no',
         *args.mkosi_args,
         '--qemu-firmware', args.firmware,
-        '--qemu-kvm', "auto" if not bool(int(os.getenv("TEST_NO_KVM", "0"))) else "no",
+        *(['--qemu-kvm', 'no'] if int(os.getenv("TEST_NO_KVM", "0")) else []),
         '--kernel-command-line-extra',
         ' '.join([
             'systemd.hostname=H',

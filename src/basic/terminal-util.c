@@ -65,6 +65,12 @@ bool isatty_safe(int fd) {
         if (isatty(fd))
                 return true;
 
+        /* Linux/glibc returns EIO for hung up TTY on isatty(). Which is wrong, the thing doesn't stop being
+         * a TTY after all, just because it is temporarily hung up. Let's work around this here, until this
+         * is fixed in glibc. See: https://sourceware.org/bugzilla/show_bug.cgi?id=32103 */
+        if (errno == EIO)
+                return true;
+
         /* Be resilient if we're working on stdio, since they're set up by parent process. */
         assert(errno != EBADF || IN_SET(fd, STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO));
 
@@ -281,7 +287,7 @@ int open_terminal(const char *name, int mode) {
         }
 
         if (!isatty_safe(fd))
-                return negative_errno();
+                return -ENOTTY;
 
         return TAKE_FD(fd);
 }
@@ -432,6 +438,18 @@ int release_terminal(void) {
 int terminal_vhangup_fd(int fd) {
         assert(fd >= 0);
         return RET_NERRNO(ioctl(fd, TIOCVHANGUP));
+}
+
+int terminal_vhangup(const char *tty) {
+        _cleanup_close_ int fd = -EBADF;
+
+        assert(tty);
+
+        fd = open_terminal(tty, O_RDWR|O_NOCTTY|O_CLOEXEC);
+        if (fd < 0)
+                return fd;
+
+        return terminal_vhangup_fd(fd);
 }
 
 int vt_disallocate(const char *tty_path) {
@@ -968,8 +986,11 @@ int proc_cmdline_tty_size(const char *tty, unsigned *ret_rows, unsigned *ret_col
                 return 0;
 
         tty = skip_dev_prefix(tty);
+        if (path_startswith(tty, "pts/"))
+                return -EMEDIUMTYPE;
         if (!in_charset(tty, ALPHANUMERICAL))
-                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "%s contains non-alphanumeric characters", tty);
+                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "TTY name '%s' contains non-alphanumeric characters, not searching kernel cmdline for size.", tty);
 
         rowskey = strjoin("systemd.tty.rows.", tty);
         if (!rowskey)
@@ -1031,8 +1052,8 @@ bool on_tty(void) {
 
         if (cached_on_tty < 0)
                 cached_on_tty =
-                        isatty(STDOUT_FILENO) > 0 &&
-                        isatty(STDERR_FILENO) > 0;
+                        isatty_safe(STDOUT_FILENO) &&
+                        isatty_safe(STDERR_FILENO);
 
         return cached_on_tty;
 }
@@ -1487,7 +1508,7 @@ int vt_restore(int fd) {
         assert(fd >= 0);
 
         if (!isatty_safe(fd))
-                return log_debug_errno(errno, "Asked to restore the VT for an fd that does not refer to a terminal: %m");
+                return log_debug_errno(SYNTHETIC_ERRNO(ENOTTY), "Asked to restore the VT for an fd that does not refer to a terminal: %m");
 
         if (ioctl(fd, KDSETMODE, KD_TEXT) < 0)
                 RET_GATHER(ret, log_debug_errno(errno, "Failed to set VT to text mode, ignoring: %m"));
@@ -1514,7 +1535,7 @@ int vt_release(int fd, bool restore) {
          * VT-switching modes. */
 
         if (!isatty_safe(fd))
-                return log_debug_errno(errno, "Asked to release the VT for an fd that does not refer to a terminal: %m");
+                return log_debug_errno(SYNTHETIC_ERRNO(ENOTTY), "Asked to release the VT for an fd that does not refer to a terminal: %m");
 
         if (ioctl(fd, VT_RELDISP, 1) < 0)
                 return -errno;

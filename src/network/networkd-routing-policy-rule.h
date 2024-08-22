@@ -20,42 +20,45 @@ typedef struct RoutingPolicyRule {
         NetworkConfigSource source;
         NetworkConfigState state;
 
-        bool invert_rule;
-        bool priority_set;
-        bool l3mdev; /* FRA_L3MDEV */
+        unsigned n_ref;
 
-        uint8_t tos;
-        uint8_t type;
-        uint8_t ipproto; /* FRA_IP_PROTO */
-        uint8_t protocol; /* FRA_PROTOCOL */
-        uint8_t to_prefixlen;
-        uint8_t from_prefixlen;
-
-        uint32_t table;
-        uint32_t fwmark;
-        uint32_t fwmask;
-        uint32_t priority;
-
+        /* struct fib_rule_hdr */
         AddressFamily address_family; /* Specified by Family= */
         int family; /* Automatically determined by From= or To= */
+        uint8_t to_prefixlen;
+        uint8_t from_prefixlen;
+        uint8_t tos;
+        uint8_t type; /* a.k.a action */
+        uint32_t flags;
 
-        char *iif;
-        char *oif;
-
-        union in_addr_union to;
-        union in_addr_union from;
-
-        struct fib_rule_port_range sport;
-        struct fib_rule_port_range dport;
-        struct fib_rule_uid_range uid_range;
-
-        int suppress_prefixlen;
-        int32_t suppress_ifgroup;
+        /* attributes */
+        union in_addr_union to; /* FRA_DST */
+        union in_addr_union from; /* FRA_SRC */
+        char *iif; /* FRA_IIFNAME */
+        uint32_t priority_goto; /* FRA_GOTO */
+        bool priority_set;
+        uint32_t priority; /* FRA_PRIORITY */
+        uint32_t fwmark; /* FRA_FWMARK */
+        uint32_t realms; /* FRA_FLOW (IPv4 only) */
+        uint64_t tunnel_id; /* FRA_TUN_ID */
+        int32_t suppress_ifgroup; /* FRA_SUPPRESS_IFGROUP */
+        int32_t suppress_prefixlen; /* FRA_SUPPRESS_PREFIXLEN */
+        uint32_t table; /* FRA_TABLE, also used in struct fib_rule_hdr */
+        uint32_t fwmask; /* FRA_FWMASK */
+        char *oif; /* FRA_OIFNAME */
+        bool l3mdev; /* FRA_L3MDEV */
+        struct fib_rule_uid_range uid_range; /* FRA_UID_RANGE */
+        uint8_t protocol; /* FRA_PROTOCOL */
+        uint8_t ipproto; /* FRA_IP_PROTO */
+        struct fib_rule_port_range sport; /* FRA_SPORT_RANGE */
+        struct fib_rule_port_range dport; /* FRA_DPORT_RANGE */
 } RoutingPolicyRule;
 
-const char* fr_act_type_full_to_string(int t) _const_;
+int fr_act_type_from_string(const char *s) _pure_;
+const char* fr_act_type_to_string(int t) _const_;
 
-RoutingPolicyRule *routing_policy_rule_free(RoutingPolicyRule *rule);
+RoutingPolicyRule* routing_policy_rule_ref(RoutingPolicyRule *rule);
+RoutingPolicyRule* routing_policy_rule_unref(RoutingPolicyRule *rule);
 
 void network_drop_invalid_routing_policy_rules(Network *network);
 
@@ -79,6 +82,7 @@ CONFIG_PARSER_PROTOTYPE(config_parse_routing_policy_rule_table);
 CONFIG_PARSER_PROTOTYPE(config_parse_routing_policy_rule_fwmark_mask);
 CONFIG_PARSER_PROTOTYPE(config_parse_routing_policy_rule_prefix);
 CONFIG_PARSER_PROTOTYPE(config_parse_routing_policy_rule_priority);
+CONFIG_PARSER_PROTOTYPE(config_parse_routing_policy_rule_goto);
 CONFIG_PARSER_PROTOTYPE(config_parse_routing_policy_rule_device);
 CONFIG_PARSER_PROTOTYPE(config_parse_routing_policy_rule_l3mdev);
 CONFIG_PARSER_PROTOTYPE(config_parse_routing_policy_rule_port_range);
