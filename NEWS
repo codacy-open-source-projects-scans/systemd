@@ -31,6 +31,10 @@ CHANGES WITH 257 in spe:
           by default when combined with --scope, will be changed in a future
           release to be enabled by default.
 
+        * The FileDescriptorName= setting for socket units is now honored by
+          Accept=yes sockets too, where it was previously silently ignored and
+          "connection" was used unconditionally.
+
         * systemd-logind now always obeys inhibitor locks, where previously it
           ignored locks taken by the caller or when the caller was root. A
           privileged caller can always close the other sessions, remove the
@@ -46,6 +50,11 @@ CHANGES WITH 257 in spe:
           container if no systemd installation is found in a container's root
           filesystem. `$SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=0` can be used to override
           this behavior.
+
+        systemd-resolved:
+
+        * 'resolvconf' command now supports '-p' switch. If specified, the
+          interface will not be used as the default route.
 
         — <place>, <date>
 

@@ -203,6 +203,43 @@ static inline bool section_is_invalid(ConfigSection *section) {
         DEFINE_TRIVIAL_CLEANUP_FUNC(type*, free_func);                  \
         DEFINE_TRIVIAL_CLEANUP_FUNC(type*, free_func##_or_set_invalid);
 
+#define log_section_full_errno_zerook(section, level, error, ...)       \
+        ({                                                              \
+                const ConfigSection *_s = (section);                    \
+                log_syntax(/* unit = */ NULL,                           \
+                           level,                                       \
+                           _s ? _s->filename : NULL,                    \
+                           _s ? _s->line : 0,                           \
+                           error,                                       \
+                           __VA_ARGS__);                                \
+        })
+
+#define log_section_full_errno(section, level, error, ...)              \
+        ({                                                              \
+                int _error = (error);                                   \
+                ASSERT_NON_ZERO(_error);                                \
+                log_section_full_errno_zerook(section, level, _error, __VA_ARGS__); \
+        })
+
+#define log_section_full(section, level, fmt, ...)                      \
+        ({                                                              \
+                if (BUILD_MODE_DEVELOPER)                               \
+                        assert(!strstr(fmt, "%m"));                     \
+                (void) log_section_full_errno_zerook(section, level, 0, fmt, ##__VA_ARGS__); \
+        })
+
+#define log_section_debug(section, ...)                  log_section_full(section, LOG_DEBUG,   __VA_ARGS__)
+#define log_section_info(section, ...)                   log_section_full(section, LOG_INFO,    __VA_ARGS__)
+#define log_section_notice(section, ...)                 log_section_full(section, LOG_NOTICE,  __VA_ARGS__)
+#define log_section_warning(section, ...)                log_section_full(section, LOG_WARNING, __VA_ARGS__)
+#define log_section_error(section, ...)                  log_section_full(section, LOG_ERR,     __VA_ARGS__)
+
+#define log_section_debug_errno(section, error, ...)     log_section_full_errno(section, LOG_DEBUG,   error, __VA_ARGS__)
+#define log_section_info_errno(section, error, ...)      log_section_full_errno(section, LOG_INFO,    error, __VA_ARGS__)
+#define log_section_notice_errno(section, error, ...)    log_section_full_errno(section, LOG_NOTICE,  error, __VA_ARGS__)
+#define log_section_warning_errno(section, error, ...)   log_section_full_errno(section, LOG_WARNING, error, __VA_ARGS__)
+#define log_section_error_errno(section, error, ...)     log_section_full_errno(section, LOG_ERR,     error, __VA_ARGS__)
+
 CONFIG_PARSER_PROTOTYPE(config_parse_int);
 CONFIG_PARSER_PROTOTYPE(config_parse_unsigned);
 CONFIG_PARSER_PROTOTYPE(config_parse_long);
@@ -217,6 +254,7 @@ CONFIG_PARSER_PROTOTYPE(config_parse_si_uint64);
 CONFIG_PARSER_PROTOTYPE(config_parse_iec_uint64);
 CONFIG_PARSER_PROTOTYPE(config_parse_iec_uint64_infinity);
 CONFIG_PARSER_PROTOTYPE(config_parse_bool);
+CONFIG_PARSER_PROTOTYPE(config_parse_uint32_flag);
 CONFIG_PARSER_PROTOTYPE(config_parse_id128);
 CONFIG_PARSER_PROTOTYPE(config_parse_tristate);
 CONFIG_PARSER_PROTOTYPE(config_parse_string);
@@ -252,6 +290,7 @@ CONFIG_PARSER_PROTOTYPE(config_parse_pid);
 CONFIG_PARSER_PROTOTYPE(config_parse_sec_fix_0);
 CONFIG_PARSER_PROTOTYPE(config_parse_timezone);
 CONFIG_PARSER_PROTOTYPE(config_parse_calendar);
+CONFIG_PARSER_PROTOTYPE(config_parse_ip_protocol);
 
 typedef enum Disabled {
         DISABLED_CONFIGURATION,
@@ -283,7 +322,7 @@ typedef enum ConfigParseStringFlags {
                 }                                                       \
                                                                         \
                 *i = r;                                                 \
-                return 0;                                               \
+                return 1;                                               \
         }
 
 #define DEFINE_CONFIG_PARSE_PTR(function, parser, type, msg)            \
@@ -300,7 +339,7 @@ typedef enum ConfigParseStringFlags {
                         log_syntax(unit, LOG_WARNING, filename, line, r, \
                                    msg ", ignoring: %s", rvalue);       \
                                                                         \
-                return 0;                                               \
+                return 1;                                               \
         }
 
 #define DEFINE_CONFIG_PARSE_ENUM_FULL(function, from_string, type, msg) \
@@ -320,7 +359,7 @@ typedef enum ConfigParseStringFlags {
                 }                                                       \
                                                                         \
                 *i = x;                                                 \
-                return 0;                                               \
+                return 1;                                               \
         }
 
 #define DEFINE_CONFIG_PARSE_ENUM(function, name, type, msg)             \
@@ -337,7 +376,7 @@ typedef enum ConfigParseStringFlags {
                                                                         \
                 if (isempty(rvalue)) {                                  \
                         *i = default_value;                             \
-                        return 0;                                       \
+                        return 1;                                       \
                 }                                                       \
                                                                         \
                 x = name##_from_string(rvalue);                         \
@@ -348,7 +387,7 @@ typedef enum ConfigParseStringFlags {
                 }                                                       \
                                                                         \
                 *i = x;                                                 \
-                return 0;                                               \
+                return 1;                                               \
         }
 
 #define DEFINE_CONFIG_PARSE_ENUMV(function, name, type, invalid, msg)          \
@@ -411,7 +450,8 @@ typedef enum ConfigParseStringFlags {
                         *(xs + i) = invalid;                                   \
                 }                                                              \
                                                                                \
-                return free_and_replace(*enums, xs);                           \
+                free_and_replace(*enums, xs);                                  \
+                return 1;                                                      \
         }
 
 int config_parse_unsigned_bounded(

@@ -1890,6 +1890,7 @@ static bool manager_dbus_is_running(Manager *m, bool deserialized) {
                 return false;
         if (!IN_SET((deserialized ? SERVICE(u)->deserialized_state : SERVICE(u)->state),
                     SERVICE_RUNNING,
+                    SERVICE_MOUNTING,
                     SERVICE_RELOAD,
                     SERVICE_RELOAD_NOTIFY,
                     SERVICE_RELOAD_SIGNAL))
@@ -4952,7 +4953,7 @@ static int manager_dispatch_handoff_timestamp_fd(sd_event_source *source, int fd
 
         struct ucred *ucred = CMSG_FIND_DATA(&msghdr, SOL_SOCKET, SCM_CREDENTIALS, struct ucred);
         if (!ucred || !pid_is_valid(ucred->pid)) {
-                log_warning("Received notify message without valid credentials. Ignoring.");
+                log_warning("Received handoff timestamp message without valid credentials. Ignoring.");
                 return 0;
         }
 

@@ -2561,7 +2561,7 @@ static bool unit_process_job(Job *j, UnitActiveState ns, bool reload_success) {
                 if (j->state == JOB_RUNNING) {
                         if (ns == UNIT_ACTIVE)
                                 job_finish_and_invalidate(j, reload_success ? JOB_DONE : JOB_FAILED, true, false);
-                        else if (!IN_SET(ns, UNIT_ACTIVATING, UNIT_RELOADING)) {
+                        else if (!IN_SET(ns, UNIT_ACTIVATING, UNIT_RELOADING, UNIT_REFRESHING)) {
                                 unexpected = true;
 
                                 if (UNIT_IS_INACTIVE_OR_FAILED(ns))
@@ -3830,6 +3830,7 @@ void unit_reset_failed(Unit *u) {
 
         ratelimit_reset(&u->start_ratelimit);
         u->start_limit_hit = false;
+        u->debug_invocation = false;
 }
 
 Unit *unit_following(Unit *u) {
@@ -4216,9 +4217,10 @@ static int user_from_unit_name(Unit *u, char **ret) {
         return 0;
 }
 
-static int unit_verify_contexts(const Unit *u, const ExecContext *ec) {
+static int unit_verify_contexts(const Unit *u) {
         assert(u);
 
+        const ExecContext *ec = unit_get_exec_context(u);
         if (!ec)
                 return 0;
 
@@ -4231,6 +4233,11 @@ static int unit_verify_contexts(const Unit *u, const ExecContext *ec) {
         if (ec->working_directory && path_below_api_vfs(ec->working_directory) &&
             exec_needs_mount_namespace(ec, /* params = */ NULL, /* runtime = */ NULL))
                 return log_unit_error_errno(u, SYNTHETIC_ERRNO(ENOEXEC), "WorkingDirectory= may not be below /proc/, /sys/ or /dev/ when using mount namespacing. Refusing.");
+
+        const KillContext *kc = unit_get_kill_context(u);
+
+        if (ec->pam_name && kc && !IN_SET(kc->kill_mode, KILL_CONTROL_GROUP, KILL_MIXED))
+                return log_unit_error_errno(u, SYNTHETIC_ERRNO(ENOEXEC), "Unit has PAM enabled. Kill mode must be set to 'control-group' or 'mixed'. Refusing.");
 
         return 0;
 }
@@ -4362,7 +4369,7 @@ int unit_patch_contexts(Unit *u) {
                 }
         }
 
-        return unit_verify_contexts(u, ec);
+        return unit_verify_contexts(u);
 }
 
 ExecContext *unit_get_exec_context(const Unit *u) {
@@ -5400,24 +5407,30 @@ int unit_set_exec_params(Unit *u, ExecParameters *p) {
         if (!p->unit_id)
                 return -ENOMEM;
 
+        p->debug_invocation = u->debug_invocation;
+
         return 0;
 }
 
-int unit_fork_helper_process(Unit *u, const char *name, PidRef *ret) {
+int unit_fork_helper_process(Unit *u, const char *name, bool into_cgroup, PidRef *ret) {
+        CGroupRuntime *crt = NULL;
         pid_t pid;
         int r;
 
         assert(u);
         assert(ret);
 
-        /* Forks off a helper process and makes sure it is a member of the unit's cgroup. Returns == 0 in the child,
-         * and > 0 in the parent. The pid parameter is always filled in with the child's PID. */
+        /* Forks off a helper process and makes sure it is a member of the unit's cgroup, if configured to
+         * do so. Returns == 0 in the child, and > 0 in the parent. The pid parameter is always filled in
+         * with the child's PID. */
 
-        (void) unit_realize_cgroup(u);
+        if (into_cgroup) {
+                (void) unit_realize_cgroup(u);
 
-        CGroupRuntime *crt = unit_setup_cgroup_runtime(u);
-        if (!crt)
-                return -ENOMEM;
+                crt = unit_setup_cgroup_runtime(u);
+                if (!crt)
+                        return -ENOMEM;
+        }
 
         r = safe_fork(name, FORK_REOPEN_LOG|FORK_DEATHSIG_SIGTERM, &pid);
         if (r < 0)
@@ -5441,7 +5454,7 @@ int unit_fork_helper_process(Unit *u, const char *name, PidRef *ret) {
         (void) default_signals(SIGNALS_CRASH_HANDLER, SIGNALS_IGNORE);
         (void) ignore_signals(SIGPIPE);
 
-        if (crt->cgroup_path) {
+        if (crt && crt->cgroup_path) {
                 r = cg_attach_everywhere(u->manager->cgroup_supported, crt->cgroup_path, 0);
                 if (r < 0) {
                         log_unit_error_errno(u, r, "Failed to join unit cgroup %s: %m", empty_to_root(crt->cgroup_path));
@@ -5459,7 +5472,7 @@ int unit_fork_and_watch_rm_rf(Unit *u, char **paths, PidRef *ret_pid) {
         assert(u);
         assert(ret_pid);
 
-        r = unit_fork_helper_process(u, "(sd-rmrf)", &pid);
+        r = unit_fork_helper_process(u, "(sd-rmrf)", /* into_cgroup= */ true, &pid);
         if (r < 0)
                 return r;
         if (r == 0) {
@@ -5600,23 +5613,25 @@ static int unit_export_invocation_id(Unit *u) {
         return 0;
 }
 
-static int unit_export_log_level_max(Unit *u, const ExecContext *c) {
+static int unit_export_log_level_max(Unit *u, int log_level_max, bool overwrite) {
         const char *p;
         char buf[2];
         int r;
 
         assert(u);
-        assert(c);
 
-        if (u->exported_log_level_max)
+        /* When the debug_invocation logic runs, overwrite will be true as we always want to switch the max
+         * log level that the journal applies, and we want to always restore the previous level once done */
+
+        if (!overwrite && u->exported_log_level_max)
                 return 0;
 
-        if (c->log_level_max < 0)
+        if (log_level_max < 0)
                 return 0;
 
-        assert(c->log_level_max <= 7);
+        assert(log_level_max <= 7);
 
-        buf[0] = '0' + c->log_level_max;
+        buf[0] = '0' + log_level_max;
         buf[1] = 0;
 
         p = strjoina("/run/systemd/units/log-level-max:", u->id);
@@ -5766,7 +5781,7 @@ void unit_export_state_files(Unit *u) {
 
         c = unit_get_exec_context(u);
         if (c) {
-                (void) unit_export_log_level_max(u, c);
+                (void) unit_export_log_level_max(u, c->log_level_max, /* overwrite= */ false);
                 (void) unit_export_log_extra_fields(u, c);
                 (void) unit_export_log_ratelimit_interval(u, c);
                 (void) unit_export_log_ratelimit_burst(u, c);
@@ -5822,6 +5837,16 @@ void unit_unlink_state_files(Unit *u) {
 
                 u->exported_log_ratelimit_burst = false;
         }
+}
+
+int unit_overwrite_log_level_max(Unit *u, int log_level_max) {
+        assert(u);
+
+        if (!u->exported_log_level_max)
+                return 0; /* Nothing to do */
+
+        /* Ensure that the new log level is exported for the journal, in place of the previous one */
+        return unit_export_log_level_max(u, log_level_max, /* overwrite= */ true);
 }
 
 int unit_prepare_exec(Unit *u) {
@@ -6352,6 +6377,82 @@ Condition *unit_find_failed_condition(Unit *u) {
                         return c;
 
         return failed_trigger && !has_succeeded_trigger ? failed_trigger : NULL;
+}
+
+int unit_can_live_mount(const Unit *u, sd_bus_error *error) {
+        assert(u);
+
+        if (!UNIT_VTABLE(u)->live_mount) {
+                log_unit_debug(u, "Live mounting not supported for unit type '%s'", unit_type_to_string(u->type));
+                return sd_bus_error_setf(
+                                error,
+                                SD_BUS_ERROR_INVALID_ARGS,
+                                "Live mounting for unit '%s' cannot be scheduled: live mounting not supported for unit type '%s'",
+                                u->id,
+                                unit_type_to_string(u->type));
+        }
+
+        if (u->load_state != UNIT_LOADED) {
+                log_unit_debug(u, "Unit not loaded");
+                return sd_bus_error_setf(
+                                error,
+                                BUS_ERROR_NO_SUCH_UNIT,
+                                "Live mounting for unit '%s' cannot be scheduled: unit not loaded",
+                                u->id);
+        }
+
+        if (!UNIT_VTABLE(u)->can_live_mount)
+                return 0;
+
+        return UNIT_VTABLE(u)->can_live_mount(u, error);
+}
+
+int unit_live_mount(
+                Unit *u,
+                const char *src,
+                const char *dst,
+                sd_bus_message *message,
+                MountInNamespaceFlags flags,
+                const MountOptions *options,
+                sd_bus_error *error) {
+
+        assert(u);
+        assert(UNIT_VTABLE(u)->live_mount);
+
+        if (!UNIT_IS_ACTIVE_OR_RELOADING(unit_active_state(u))) {
+                log_unit_debug(u, "Unit not active");
+                return sd_bus_error_setf(
+                                error,
+                                BUS_ERROR_UNIT_INACTIVE,
+                                "Live mounting '%s' on '%s' for unit '%s' cannot be scheduled: unit not active",
+                                src,
+                                dst,
+                                u->id);
+        }
+
+        if (unit_active_state(u) == UNIT_REFRESHING) {
+                log_unit_debug(u, "Unit already live mounting");
+                return sd_bus_error_setf(
+                                error,
+                                BUS_ERROR_UNIT_BUSY,
+                                "Live mounting '%s' on '%s' for unit '%s' cannot be scheduled: another live mount in progress",
+                                src,
+                                dst,
+                                u->id);
+        }
+
+        if (u->job) {
+                log_unit_debug(u, "Unit already has a job in progress, cannot live mount");
+                return sd_bus_error_setf(
+                                error,
+                                BUS_ERROR_UNIT_BUSY,
+                                "Live mounting '%s' on '%s' for unit '%s' cannot be scheduled: another operation in progress",
+                                src,
+                                dst,
+                                u->id);
+        }
+
+        return UNIT_VTABLE(u)->live_mount(u, src, dst, message, flags, options, error);
 }
 
 static const char* const collect_mode_table[_COLLECT_MODE_MAX] = {

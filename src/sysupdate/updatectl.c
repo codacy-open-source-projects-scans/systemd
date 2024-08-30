@@ -324,7 +324,8 @@ static int parse_describe(sd_bus_message *reply, Version *ret) {
         Version v = {};
         char *version_json = NULL;
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *json = NULL, *contents_json = NULL;
-        bool newest = false, available = false, installed = false, obsolete = false, protected = false;
+        bool newest = false, available = false, installed = false, obsolete = false, protected = false,
+                incomplete = false;
         int r;
 
         assert(reply);
@@ -348,6 +349,7 @@ static int parse_describe(sd_bus_message *reply, Version *ret) {
                                      { "installed",      SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, PTR_TO_SIZE(&installed),     0 },
                                      { "obsolete",       SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, PTR_TO_SIZE(&obsolete),      0 },
                                      { "protected",      SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, PTR_TO_SIZE(&protected),     0 },
+                                     { "incomplete",     SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, PTR_TO_SIZE(&incomplete),    0 },
                                      { "changelog_urls", SD_JSON_VARIANT_ARRAY,   sd_json_dispatch_strv,    PTR_TO_SIZE(&v.changelog),   0 },
                                      { "contents",       SD_JSON_VARIANT_ARRAY,   sd_json_dispatch_variant, PTR_TO_SIZE(&contents_json), 0 },
                                      {},
@@ -362,6 +364,7 @@ static int parse_describe(sd_bus_message *reply, Version *ret) {
         SET_FLAG(v.flags, UPDATE_INSTALLED, installed);
         SET_FLAG(v.flags, UPDATE_OBSOLETE, obsolete);
         SET_FLAG(v.flags, UPDATE_PROTECTED, protected);
+        SET_FLAG(v.flags, UPDATE_INCOMPLETE, incomplete);
 
         r = sd_json_variant_format(contents_json, 0, &v.contents_json);
         if (r < 0)
@@ -534,7 +537,7 @@ static int describe(sd_bus *bus, const char *target_path, const char *version) {
                 r = terminal_urlify(*url, NULL, &changelog_link);
                 if (r < 0)
                         return log_error_errno(r, "Could not urlify link to change-log: %m");
-                
+
                 printf("ChangeLog: %s\n", strna(changelog_link));
         }
         printf("\n");
@@ -654,7 +657,7 @@ static int check_describe_finished(sd_bus_message *reply, void *userdata, sd_bus
                         NULL);
         if (r < 0)
                 return log_bus_error(r, &error, op->target_id, "get current version");
-        
+
         r = sd_bus_message_read_basic(reply, 's', &current);
         if (r < 0)
                 return bus_log_parse_error(r);
@@ -904,7 +907,7 @@ static int update_finished(sd_bus_message *m, void *userdata, sd_bus_error *erro
 }
 
 static int update_interrupted(sd_event_source *source, void *userdata) {
-        /* Since the event loop is exiting, we will never recieve the JobRemoved
+        /* Since the event loop is exiting, we will never receive the JobRemoved
          * signal. So, we must free the userdata here. */
         _cleanup_(operation_freep) Operation *op = ASSERT_PTR(userdata);
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
