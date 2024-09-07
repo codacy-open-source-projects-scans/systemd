@@ -188,8 +188,9 @@
       <varlistentry>
         <term><varname>ARP=</varname></term>
         <listitem>
-          <para>Takes a boolean. If set to true, the ARP (low-level Address Resolution Protocol)
-          for this interface is enabled. When unset, the kernel's default will be used.</para>
+          <para>Takes a boolean. If set to true, the IPv4 ARP (low-level Address Resolution Protocol)
+          and IPv6 NDP (Neighbor Discovery Protocol) for this interface are enabled. When unset, the
+          kernel's default will be used.</para>
           <para> For example, disabling ARP is useful when creating multiple MACVLAN or VLAN virtual
           interfaces atop a single lower-level physical interface, which will then only serve as a
           link/"bridge" device aggregating traffic to the same physical link and not participate in
@@ -6061,6 +6062,26 @@ ServerAddress=192.168.0.1/24</programlisting>
           <xi:include href="version-info.xml" xpointer="v246"/>
         </listitem>
       </varlistentry>
+    </variablelist>
+  </refsect1>
+
+  <refsect1>
+    <title>[ClassfulMultiQueueing] Section Options</title>
+    <para>The [ClassfulMultiQueueing] section manages the queueing discipline (qdisc) of Classful Multi Queueing (mq).</para>
+
+    <variablelist class='network-directives'>
+      <xi:include href="tc.xml" xpointer="qdisc-parent" />
+      <xi:include href="tc.xml" xpointer="qdisc-handle" />
+    </variablelist>
+  </refsect1>
+
+  <refsect1>
+    <title>[BandMultiQueueing] Section Options</title>
+    <para>The [BandMultiQueueing] section manages the queueing discipline (qdisc) of Band Multi Queueing (multiq).</para>
+
+    <variablelist class='network-directives'>
+      <xi:include href="tc.xml" xpointer="qdisc-parent" />
+      <xi:include href="tc.xml" xpointer="qdisc-handle" />
     </variablelist>
   </refsect1>
 

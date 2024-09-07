@@ -337,9 +337,10 @@ static int dhcp4_route_handler(sd_netlink *rtnl, sd_netlink_message *m, Request 
         int r;
 
         assert(m);
+        assert(req);
         assert(link);
 
-        r = route_configure_handler_internal(rtnl, m, link, route, "Could not set DHCPv4 route");
+        r = route_configure_handler_internal(rtnl, m, req, "Could not set DHCPv4 route");
         if (r <= 0)
                 return r;
 
@@ -2017,5 +2018,4 @@ static const char* const dhcp_client_identifier_table[_DHCP_CLIENT_ID_MAX] = {
 };
 
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP_FROM_STRING(dhcp_client_identifier, DHCPClientIdentifier);
-DEFINE_CONFIG_PARSE_ENUM(config_parse_dhcp_client_identifier, dhcp_client_identifier, DHCPClientIdentifier,
-                         "Failed to parse client identifier type");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_dhcp_client_identifier, dhcp_client_identifier, DHCPClientIdentifier);

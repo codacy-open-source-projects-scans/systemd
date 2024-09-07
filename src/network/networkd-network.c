@@ -551,6 +551,8 @@ int network_load_one(Manager *manager, OrderedHashmap **networks, const char *fi
                         "HeavyHitterFilter\0"
                         "HierarchyTokenBucket\0"
                         "HierarchyTokenBucketClass\0"
+                        "ClassfulMultiQueueing\0"
+                        "BandMultiQueueing\0"
                         "NetworkEmulator\0"
                         "PFIFO\0"
                         "PFIFOFast\0"
@@ -801,8 +803,8 @@ static Network *network_free(Network *network) {
         hashmap_free(network->rules_by_section);
         hashmap_free_with_destructor(network->dhcp_static_leases_by_section, dhcp_static_lease_free);
         ordered_hashmap_free_with_destructor(network->sr_iov_by_section, sr_iov_free);
-        hashmap_free_with_destructor(network->qdiscs_by_section, qdisc_free);
-        hashmap_free_with_destructor(network->tclasses_by_section, tclass_free);
+        hashmap_free(network->qdiscs_by_section);
+        hashmap_free(network->tclasses_by_section);
 
         return mfree(network);
 }
@@ -1056,11 +1058,8 @@ int config_parse_ignore_carrier_loss(
         return 0;
 }
 
-DEFINE_CONFIG_PARSE_ENUM(config_parse_required_family_for_online, link_required_address_family, AddressFamily,
-                         "Failed to parse RequiredFamilyForOnline= setting");
-
-DEFINE_CONFIG_PARSE_ENUM(config_parse_keep_configuration, keep_configuration, KeepConfiguration,
-                         "Failed to parse KeepConfiguration= setting");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_required_family_for_online, link_required_address_family, AddressFamily);
+DEFINE_CONFIG_PARSE_ENUM(config_parse_keep_configuration, keep_configuration, KeepConfiguration);
 
 static const char* const keep_configuration_table[_KEEP_CONFIGURATION_MAX] = {
         [KEEP_CONFIGURATION_NO]           = "no",
@@ -1082,4 +1081,4 @@ static const char* const activation_policy_table[_ACTIVATION_POLICY_MAX] = {
 };
 
 DEFINE_STRING_TABLE_LOOKUP(activation_policy, ActivationPolicy);
-DEFINE_CONFIG_PARSE_ENUM(config_parse_activation_policy, activation_policy, ActivationPolicy, "Failed to parse activation policy");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_activation_policy, activation_policy, ActivationPolicy);

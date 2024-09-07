@@ -93,7 +93,7 @@ typedef struct MountEntry {
         const char *path_const;   /* Memory allocated on stack or static */
         MountMode mode;
         bool ignore:1;            /* Ignore if path does not exist? */
-        bool has_prefix:1;        /* Already is prefixed by the root dir? */
+        bool has_prefix:1;        /* Already prefixed by the root dir? */
         bool read_only:1;         /* Shall this mount point be read-only? */
         bool nosuid:1;            /* Shall set MS_NOSUID on the mount itself */
         bool noexec:1;            /* Shall set MS_NOEXEC on the mount itself */
@@ -119,6 +119,12 @@ typedef struct MountList {
         MountEntry *mounts;
         size_t n_mounts;
 } MountList;
+
+static const BindMount bind_log_sockets_table[] = {
+        { (char*) "/run/systemd/journal/socket",  (char*) "/run/systemd/journal/socket",  .read_only = true, .nosuid = true, .noexec = true, .nodev = true, .ignore_enoent = true },
+        { (char*) "/run/systemd/journal/stdout",  (char*) "/run/systemd/journal/stdout",  .read_only = true, .nosuid = true, .noexec = true, .nodev = true, .ignore_enoent = true },
+        { (char*) "/run/systemd/journal/dev-log", (char*) "/run/systemd/journal/dev-log", .read_only = true, .nosuid = true, .noexec = true, .nodev = true, .ignore_enoent = true },
+};
 
 /* If MountAPIVFS= is used, let's mount /sys, /proc, /dev and /run into the it, but only as a fallback if the user hasn't mounted
  * something there already. These mounts are hence overridden by any other explicitly configured mounts. */
@@ -441,6 +447,8 @@ static int append_bind_mounts(MountList *ml, const BindMount *binds, size_t n) {
                         .mode = b->recursive ? MOUNT_BIND_RECURSIVE : MOUNT_BIND,
                         .read_only = b->read_only,
                         .nosuid = b->nosuid,
+                        .noexec = b->noexec,
+                        .flags = b->nodev ? MS_NODEV : 0,
                         .source_const = b->source,
                         .ignore = b->ignore_enoent,
                 };
@@ -1078,7 +1086,7 @@ static int create_temporary_mount_point(RuntimeScope scope, char **ret) {
         return 0;
 }
 
-static int mount_private_dev(MountEntry *m, RuntimeScope scope) {
+static int mount_private_dev(const MountEntry *m, const NamespaceParameters *p) {
         static const char devnodes[] =
                 "/dev/null\0"
                 "/dev/zero\0"
@@ -1093,8 +1101,9 @@ static int mount_private_dev(MountEntry *m, RuntimeScope scope) {
         int r;
 
         assert(m);
+        assert(p);
 
-        r = create_temporary_mount_point(scope, &temporary_mount);
+        r = create_temporary_mount_point(p->runtime_scope, &temporary_mount);
         if (r < 0)
                 return r;
 
@@ -1139,9 +1148,15 @@ static int mount_private_dev(MountEntry *m, RuntimeScope scope) {
         FOREACH_STRING(d, "/dev/mqueue", "/dev/hugepages")
                 (void) bind_mount_device_dir(temporary_mount, d);
 
-        const char *devlog = strjoina(temporary_mount, "/dev/log");
-        if (symlink("/run/systemd/journal/dev-log", devlog) < 0)
-                log_debug_errno(errno, "Failed to create symlink '%s' to /run/systemd/journal/dev-log, ignoring: %m", devlog);
+        /* We assume /run/systemd/journal/ is available if not changing root, which isn't entirely accurate
+         * but shouldn't matter, as either way the user would get ENOENT when accessing /dev/log */
+        if ((!p->root_image && !p->root_directory) || p->bind_log_sockets) {
+                const char *devlog = strjoina(temporary_mount, "/dev/log");
+                if (symlink("/run/systemd/journal/dev-log", devlog) < 0)
+                        log_debug_errno(errno,
+                                        "Failed to create symlink '%s' to /run/systemd/journal/dev-log, ignoring: %m",
+                                        devlog);
+        }
 
         NULSTR_FOREACH(d, devnodes) {
                 r = clone_device_node(d, temporary_mount, &can_mknod);
@@ -1720,7 +1735,7 @@ static int apply_one_mount(
                 break;
 
         case MOUNT_PRIVATE_DEV:
-                return mount_private_dev(m, p->runtime_scope);
+                return mount_private_dev(m, p);
 
         case MOUNT_BIND_DEV:
                 return mount_bind_dev(m);
@@ -2585,6 +2600,11 @@ int setup_namespace(const NamespaceParameters *p, char **error_path) {
                         .read_only = true,
                         .source_malloc = TAKE_PTR(q),
                 };
+
+        } else if (p->bind_log_sockets) {
+                r = append_bind_mounts(&ml, bind_log_sockets_table, ELEMENTSOF(bind_log_sockets_table));
+                if (r < 0)
+                        return r;
         }
 
         /* Will be used to add bind mounts at runtime */
@@ -2761,7 +2781,6 @@ void bind_mount_free_many(BindMount *b, size_t n) {
 
 int bind_mount_add(BindMount **b, size_t *n, const BindMount *item) {
         _cleanup_free_ char *s = NULL, *d = NULL;
-        BindMount *c;
 
         assert(b);
         assert(n);
@@ -2775,17 +2794,16 @@ int bind_mount_add(BindMount **b, size_t *n, const BindMount *item) {
         if (!d)
                 return -ENOMEM;
 
-        c = reallocarray(*b, *n + 1, sizeof(BindMount));
-        if (!c)
+        if (!GREEDY_REALLOC(*b, *n + 1))
                 return -ENOMEM;
 
-        *b = c;
-
-        c[(*n)++] = (BindMount) {
+        (*b)[(*n)++] = (BindMount) {
                 .source = TAKE_PTR(s),
                 .destination = TAKE_PTR(d),
                 .read_only = item->read_only,
+                .nodev = item->nodev,
                 .nosuid = item->nosuid,
+                .noexec = item->noexec,
                 .recursive = item->recursive,
                 .ignore_enoent = item->ignore_enoent,
         };

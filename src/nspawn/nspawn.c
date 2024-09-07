@@ -36,6 +36,7 @@
 #include "capability-util.h"
 #include "cgroup-util.h"
 #include "chase.h"
+#include "chattr-util.h"
 #include "common-signal.h"
 #include "copy.h"
 #include "cpu-set-util.h"
@@ -2193,7 +2194,7 @@ static int copy_devnodes(const char *dest) {
                                 /* Explicitly warn the user when /dev is already populated. */
                                 if (errno == EEXIST)
                                         log_notice("%s/dev/ is pre-mounted and pre-populated. If a pre-mounted /dev/ is provided it needs to be an unpopulated file system.", dest);
-                                if (errno != EPERM)
+                                if (!ERRNO_IS_PRIVILEGE(errno) || arg_uid_shift != 0)
                                         return log_error_errno(errno, "mknod(%s) failed: %m", to);
 
                                 /* Some systems abusively restrict mknod but allow bind mounts. */
@@ -2203,11 +2204,11 @@ static int copy_devnodes(const char *dest) {
                                 r = mount_nofollow_verbose(LOG_DEBUG, from, to, NULL, MS_BIND, NULL);
                                 if (r < 0)
                                         return log_error_errno(r, "Both mknod and bind mount (%s) failed: %m", to);
+                        } else {
+                                r = userns_lchown(to, 0, 0);
+                                if (r < 0)
+                                        return log_error_errno(r, "chown() of device node %s failed: %m", to);
                         }
-
-                        r = userns_lchown(to, 0, 0);
-                        if (r < 0)
-                                return log_error_errno(r, "chown() of device node %s failed: %m", to);
 
                         dn = path_join("/dev", S_ISCHR(st.st_mode) ? "char" : "block");
                         if (!dn)
@@ -4066,7 +4067,7 @@ static int outer_child(
                 return r;
 
         if (arg_read_only && arg_volatile_mode == VOLATILE_NO &&
-                !has_custom_root_mount(arg_custom_mounts, arg_n_custom_mounts)) {
+            !has_custom_root_mount(arg_custom_mounts, arg_n_custom_mounts)) {
                 r = bind_remount_recursive(directory, MS_RDONLY, MS_RDONLY, NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to make tree read-only: %m");
@@ -4485,10 +4486,15 @@ static int nspawn_dispatch_notify_fd(sd_event_source *source, int fd, uint32_t r
         n = recvmsg_safe(fd, &msghdr, MSG_DONTWAIT|MSG_CMSG_CLOEXEC);
         if (ERRNO_IS_NEG_TRANSIENT(n))
                 return 0;
-        else if (n == -EXFULL) {
-                log_warning("Got message with truncated control data (too many fds sent?), ignoring.");
+        if (n == -ECHRNG) {
+                log_warning_errno(n, "Got message with truncated control data (too many fds sent?), ignoring.");
                 return 0;
-        } else if (n < 0)
+        }
+        if (n == -EXFULL) {
+                log_warning_errno(n, "Got message with truncated payload data, ignoring.");
+                return 0;
+        }
+        if (n < 0)
                 return log_warning_errno(n, "Couldn't read notification socket: %m");
 
         cmsg_close_all(&msghdr);
@@ -4496,11 +4502,6 @@ static int nspawn_dispatch_notify_fd(sd_event_source *source, int fd, uint32_t r
         ucred = CMSG_FIND_DATA(&msghdr, SOL_SOCKET, SCM_CREDENTIALS, struct ucred);
         if (!ucred || ucred->pid != inner_child_pid) {
                 log_debug("Received notify message without valid credentials. Ignoring.");
-                return 0;
-        }
-
-        if ((size_t) n >= sizeof(buf)) {
-                log_warning("Received notify message exceeded maximum size. Ignoring.");
                 return 0;
         }
 
@@ -6073,7 +6074,7 @@ static int run(int argc, char *argv[]) {
                         {
                                 BLOCK_SIGNALS(SIGINT);
                                 r = copy_file(arg_image, np, O_EXCL, arg_read_only ? 0400 : 0600,
-                                              COPY_REFLINK|COPY_CRTIME|COPY_SIGINT);
+                                              COPY_REFLINK|COPY_CRTIME|COPY_SIGINT|COPY_NOCOW_AFTER);
                         }
                         if (r == -EINTR) {
                                 log_error_errno(r, "Interrupted while copying image file to %s, removed again.", np);

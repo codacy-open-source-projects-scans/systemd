@@ -2641,23 +2641,9 @@ static int compile_bind_mounts(
                 return -ENOMEM;
 
         FOREACH_ARRAY(item, context->bind_mounts, context->n_bind_mounts) {
-                _cleanup_free_ char *s = NULL, *d = NULL;
-
-                s = strdup(item->source);
-                if (!s)
-                        return -ENOMEM;
-
-                d = strdup(item->destination);
-                if (!d)
-                        return -ENOMEM;
-
-                bind_mounts[h++] = (BindMount) {
-                        .source = TAKE_PTR(s),
-                        .destination = TAKE_PTR(d),
-                        .read_only = item->read_only,
-                        .recursive = item->recursive,
-                        .ignore_enoent = item->ignore_enoent,
-                };
+                r = bind_mount_add(&bind_mounts, &h, item);
+                if (r < 0)
+                        return r;
         }
 
         for (ExecDirectoryType t = 0; t < _EXEC_DIRECTORY_TYPE_MAX; t++) {
@@ -2881,13 +2867,8 @@ static int setup_ephemeral(
         if (*root_image) {
                 log_debug("Making ephemeral copy of %s to %s", *root_image, new_root);
 
-                fd = copy_file(*root_image,
-                               new_root,
-                               O_EXCL,
-                               0600,
-                               COPY_LOCK_BSD|
-                               COPY_REFLINK|
-                               COPY_CRTIME);
+                fd = copy_file(*root_image, new_root, O_EXCL, 0600,
+                               COPY_LOCK_BSD|COPY_REFLINK|COPY_CRTIME|COPY_NOCOW_AFTER);
                 if (fd < 0)
                         return log_debug_errno(fd, "Failed to copy image %s to %s: %m",
                                                *root_image, new_root);
@@ -3240,6 +3221,7 @@ static int apply_mount_namespace(
                 .private_tmp = needs_sandboxing ? context->private_tmp : false,
 
                 .mount_apivfs = needs_sandboxing && exec_context_get_effective_mount_apivfs(context),
+                .bind_log_sockets = needs_sandboxing && exec_context_get_effective_bind_log_sockets(context),
 
                 /* If NNP is on, we can turn on MS_NOSUID, since it won't have any effect anymore. */
                 .mount_nosuid = needs_sandboxing && context->no_new_privileges && !mac_selinux_use(),
@@ -3861,6 +3843,7 @@ static bool exec_context_need_unprivileged_private_users(
                context->ipc_namespace_path ||
                context->private_mounts > 0 ||
                context->mount_apivfs > 0 ||
+               context->bind_log_sockets > 0 ||
                context->n_bind_mounts > 0 ||
                context->n_temporary_filesystems > 0 ||
                context->root_directory ||

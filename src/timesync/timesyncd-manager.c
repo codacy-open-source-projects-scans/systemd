@@ -423,15 +423,18 @@ static int manager_receive_response(sd_event_source *source, int fd, uint32_t re
         }
 
         len = recvmsg_safe(fd, &msghdr, MSG_DONTWAIT);
-        if (len == -EAGAIN)
+        if (ERRNO_IS_NEG_TRANSIENT(len))
                 return 0;
         if (len < 0) {
-                log_warning_errno(len, "Error receiving message, disconnecting: %m");
+                log_warning_errno(len, "Error receiving message, disconnecting: %s",
+                                  len == -ECHRNG ? "got truncated control data" :
+                                  len == -EXFULL ? "got truncated payload data" :
+                                  STRERROR((int) len));
                 return manager_connect(m);
         }
 
-        /* Too short or too long packet? */
-        if (iov.iov_len < sizeof(struct ntp_msg) || (msghdr.msg_flags & MSG_TRUNC)) {
+        /* Too short packet? */
+        if (iov.iov_len < sizeof(struct ntp_msg)) {
                 log_warning("Invalid response from server. Disconnecting.");
                 return manager_connect(m);
         }
@@ -1024,7 +1027,7 @@ clear:
         return r;
 }
 
-bool manager_is_connected(Manager *m) {
+static bool manager_is_connected(Manager *m) {
         assert(m);
 
         /* Return true when the manager is sending a request, resolving a server name, or
@@ -1049,11 +1052,15 @@ static int manager_network_event_handler(sd_event_source *s, int fd, uint32_t re
         connected = manager_is_connected(m);
 
         if (connected && !online) {
-                log_info("No network connectivity, watching for changes.");
+                /* When m->talking is false, we have not received any responses from the server,
+                 * and it is not necessary to log about disconnection. */
+                log_full(m->talking ? LOG_INFO : LOG_DEBUG,
+                         "No network connectivity, watching for changes.");
                 manager_disconnect(m);
 
         } else if ((!connected || changed) && online) {
-                log_info("Network configuration changed, trying to establish connection.");
+                log_full(connected ? LOG_DEBUG : LOG_INFO,
+                         "Network configuration changed, trying to establish connection.");
 
                 if (m->current_server_address)
                         r = manager_begin(m);

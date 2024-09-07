@@ -4489,6 +4489,17 @@ class NetworkdTCTests(unittest.TestCase, Utilities):
         self.assertIn('rtt 1s', output)
         self.assertIn('ack-filter-aggressive', output)
 
+        # Test for replacing existing qdisc. See #31226.
+        with open(os.path.join(network_unit_dir, '25-qdisc-cake.network'), mode='a', encoding='utf-8') as f:
+            f.write('Bandwidth=250M\n')
+
+        networkctl_reload()
+        self.wait_online('dummy98:routable')
+
+        output = check_output('tc qdisc show dev dummy98')
+        print(output)
+        self.assertIn('bandwidth 250Mbit', output)
+
     @expectedFailureIfModuleIsNotAvailable('sch_codel')
     def test_qdisc_codel(self):
         copy_network_unit('25-qdisc-codel.network', '12-dummy.netdev')
@@ -4636,6 +4647,25 @@ class NetworkdTCTests(unittest.TestCase, Utilities):
         output = check_output('tc qdisc show dev test1')
         print(output)
         self.assertRegex(output, 'qdisc ingress')
+
+    def test_qdisc_mq(self):
+        copy_network_unit('25-tun.netdev', '25-tap.netdev', '25-qdisc-mq.network')
+        start_networkd()
+        self.wait_online('testtun99:degraded', 'testtap99:degraded')
+
+        output = check_output('tc qdisc show dev testtun99')
+        print(output)
+        self.assertIn('qdisc mq 2: root', output)
+
+    @expectedFailureIfModuleIsNotAvailable('sch_multiq')
+    def test_qdisc_multiq(self):
+        copy_network_unit('25-tun.netdev', '25-tap.netdev', '25-qdisc-multiq.network')
+        start_networkd()
+        self.wait_online('testtun99:degraded', 'testtap99:degraded')
+
+        output = check_output('tc qdisc show dev testtun99')
+        print(output)
+        self.assertIn('qdisc multiq 2: root', output)
 
     @expectedFailureIfModuleIsNotAvailable('sch_netem')
     def test_qdisc_netem(self):
@@ -5734,12 +5764,14 @@ class NetworkdRATests(unittest.TestCase, Utilities):
         self.check_ndisc_mtu(1410)
 
         check_output('ip link set dev veth99 mtu 1600')
+        check_output('ip link set dev veth-peer mtu 1600')
         self.check_ndisc_mtu(1410)
 
         check_output(f'{test_ndisc_send} --interface veth-peer --type ra --lifetime 1hour --mtu 1700')
         self.check_ndisc_mtu(1600)
 
         check_output('ip link set dev veth99 mtu 1800')
+        check_output('ip link set dev veth-peer mtu 1800')
         self.check_ndisc_mtu(1700)
 
     def test_ipv6_token_prefixstable(self):

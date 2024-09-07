@@ -48,6 +48,7 @@
 #include "io-util.h"
 #include "json-util.h"
 #include "list.h"
+#include "logarithm.h"
 #include "loop-util.h"
 #include "main-func.h"
 #include "mkdir.h"
@@ -259,6 +260,78 @@ static PartitionEncryptedVolume* partition_encrypted_volume_free(PartitionEncryp
         return mfree(c);
 }
 
+typedef enum SubvolumeFlags {
+        SUBVOLUME_RO               = 1 << 0,
+        _SUBVOLUME_FLAGS_MASK      = SUBVOLUME_RO,
+        _SUBVOLUME_FLAGS_INVALID   = -EINVAL,
+        _SUBVOLUME_FLAGS_ERRNO_MAX = -ERRNO_MAX, /* Ensure the whole errno range fits into this enum */
+} SubvolumeFlags;
+
+static SubvolumeFlags subvolume_flags_from_string_one(const char *s) {
+        /* This is a bitmask (i.e. not dense), hence we don't use the "string-table.h" stuff here. */
+
+        assert(s);
+
+        if (streq(s, "ro"))
+                return SUBVOLUME_RO;
+
+        return _SUBVOLUME_FLAGS_INVALID;
+}
+
+static SubvolumeFlags subvolume_flags_from_string(const char *s) {
+        SubvolumeFlags flags = 0;
+        int r;
+
+        assert(s);
+
+        for (;;) {
+                _cleanup_free_ char *f = NULL;
+                SubvolumeFlags ff;
+
+                r = extract_first_word(&s, &f, ",", EXTRACT_DONT_COALESCE_SEPARATORS);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        break;
+
+                ff = subvolume_flags_from_string_one(f);
+                if (ff < 0)
+                        return -EBADRQC; /* recognizable error */
+
+                flags |= ff;
+        }
+
+        return flags;
+}
+
+static char* subvolume_flags_to_string(SubvolumeFlags flags) {
+        const char *l[CONST_LOG2U(_SUBVOLUME_FLAGS_MASK + 1) + 1]; /* one string per known flag at most */
+        size_t m = 0;
+
+        if (FLAGS_SET(flags, SUBVOLUME_RO))
+                l[m++] = "ro";
+
+        assert(m < ELEMENTSOF(l));
+        l[m] = NULL;
+
+        return strv_join((char**) l, ",");
+}
+
+typedef struct Subvolume {
+        char *path;
+        SubvolumeFlags flags;
+} Subvolume;
+
+static Subvolume* subvolume_free(Subvolume *s) {
+        if (!s)
+                return NULL;
+
+        free(s->path);
+        return mfree(s);
+}
+
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(subvolume_hash_ops, char, path_hash_func, path_compare, Subvolume, subvolume_free);
+
 typedef struct Partition {
         char *definition_path;
         char **drop_in_files;
@@ -304,7 +377,7 @@ typedef struct Partition {
         char **exclude_files_source;
         char **exclude_files_target;
         char **make_directories;
-        char **subvolumes;
+        OrderedHashmap *subvolumes;
         char *default_subvolume;
         EncryptMode encrypt;
         VerityMode verity;
@@ -312,6 +385,8 @@ typedef struct Partition {
         MinimizeMode minimize;
         uint64_t verity_data_block_size;
         uint64_t verity_hash_block_size;
+        char *compression;
+        char *compression_level;
 
         uint64_t gpt_flags;
         int no_auto;
@@ -469,8 +544,11 @@ static Partition* partition_free(Partition *p) {
         strv_free(p->exclude_files_source);
         strv_free(p->exclude_files_target);
         strv_free(p->make_directories);
-        strv_free(p->subvolumes);
+        ordered_hashmap_free(p->subvolumes);
+        free(p->default_subvolume);
         free(p->verity_match_key);
+        free(p->compression);
+        free(p->compression_level);
 
         iovec_done(&p->roothash);
 
@@ -504,8 +582,11 @@ static void partition_foreignize(Partition *p) {
         p->exclude_files_source = strv_free(p->exclude_files_source);
         p->exclude_files_target = strv_free(p->exclude_files_target);
         p->make_directories = strv_free(p->make_directories);
-        p->subvolumes = strv_free(p->subvolumes);
+        p->subvolumes = ordered_hashmap_free(p->subvolumes);
+        p->default_subvolume = mfree(p->default_subvolume);
         p->verity_match_key = mfree(p->verity_match_key);
+        p->compression = mfree(p->compression);
+        p->compression_level = mfree(p->compression_level);
 
         p->priority = 0;
         p->weight = 1000;
@@ -1677,6 +1758,86 @@ static int config_parse_make_dirs(
         }
 }
 
+static int config_parse_subvolumes(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        OrderedHashmap **subvolumes = ASSERT_PTR(data);
+        const char *p = ASSERT_PTR(rvalue);
+        int r;
+
+        for (;;) {
+                _cleanup_free_ char *word = NULL, *path = NULL, *f = NULL, *d = NULL;
+                Subvolume *s = NULL;
+
+                r = extract_first_word(&p, &word, NULL, EXTRACT_UNQUOTE);
+                if (r == -ENOMEM)
+                        return log_oom();
+                if (r < 0) {
+                        log_syntax(unit, LOG_WARNING, filename, line, r, "Invalid syntax, ignoring: %s", rvalue);
+                        return 0;
+                }
+                if (r == 0)
+                        return 0;
+
+                r = extract_many_words((const char **) &word, ":", EXTRACT_UNQUOTE|EXTRACT_DONT_COALESCE_SEPARATORS, &path, &f);
+                if (r < 0) {
+                        log_syntax(unit, LOG_WARNING, filename, line, r, "Invalid syntax, ignoring: %s", word);
+                        continue;
+                }
+
+                r = specifier_printf(path, PATH_MAX-1, system_and_tmp_specifier_table, arg_root, NULL, &d);
+                if (r < 0) {
+                        log_syntax(unit, LOG_WARNING, filename, line, r,
+                                   "Failed to expand specifiers in Subvolumes= parameter, ignoring: %s", path);
+                        continue;
+                }
+
+                r = path_simplify_and_warn(d, PATH_CHECK_ABSOLUTE, unit, filename, line, lvalue);
+                if (r < 0)
+                        continue;
+
+                s = ordered_hashmap_get(*subvolumes, d);
+                if (!s) {
+                        s = new(Subvolume, 1);
+                        if (!s)
+                                return log_oom();
+
+                        *s = (Subvolume) {
+                                .path = TAKE_PTR(d),
+                        };
+
+                        r = ordered_hashmap_ensure_put(subvolumes, &subvolume_hash_ops, s->path, s);
+                        if (r < 0) {
+                                subvolume_free(s);
+                                return r;
+                        }
+                }
+
+                if (f) {
+                        SubvolumeFlags flags = subvolume_flags_from_string(f);
+                        if (flags == -EBADRQC) {
+                                log_syntax(unit, LOG_WARNING, filename, line, r, "Unknown subvolume flag in subvolume, ignoring: %s", f);
+                                continue;
+                        }
+                        if (flags < 0) {
+                                log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to parse subvolume flags, ignoring: %s", f);
+                                continue;
+                        }
+
+                        s->flags = flags;
+                }
+        }
+}
+
 static int config_parse_default_subvolume(
                 const char *unit,
                 const char *filename,
@@ -1712,7 +1873,7 @@ static int config_parse_default_subvolume(
         return free_and_replace(*subvol, p);
 }
 
-static DEFINE_CONFIG_PARSE_ENUM_WITH_DEFAULT(config_parse_encrypt, encrypt_mode, EncryptMode, ENCRYPT_OFF, "Invalid encryption mode");
+static DEFINE_CONFIG_PARSE_ENUM_WITH_DEFAULT(config_parse_encrypt, encrypt_mode, EncryptMode, ENCRYPT_OFF);
 
 static int config_parse_gpt_flags(
                 const char *unit,
@@ -1899,8 +2060,8 @@ static int config_parse_encrypted_volume(
         return 0;
 }
 
-static DEFINE_CONFIG_PARSE_ENUM_WITH_DEFAULT(config_parse_verity, verity_mode, VerityMode, VERITY_OFF, "Invalid verity mode");
-static DEFINE_CONFIG_PARSE_ENUM_WITH_DEFAULT(config_parse_minimize, minimize_mode, MinimizeMode, MINIMIZE_OFF, "Invalid minimize mode");
+static DEFINE_CONFIG_PARSE_ENUM_WITH_DEFAULT(config_parse_verity, verity_mode, VerityMode, VERITY_OFF);
+static DEFINE_CONFIG_PARSE_ENUM_WITH_DEFAULT(config_parse_minimize, minimize_mode, MinimizeMode, MINIMIZE_OFF);
 
 static int partition_finalize_fstype(Partition *p, const char *path) {
         _cleanup_free_ char *e = NULL, *upper = NULL;
@@ -1933,43 +2094,45 @@ static int partition_finalize_fstype(Partition *p, const char *path) {
 static int partition_read_definition(Partition *p, const char *path, const char *const *conf_file_dirs) {
 
         ConfigTableItem table[] = {
-                { "Partition", "Type",                     config_parse_type,              0, &p->type                    },
-                { "Partition", "Label",                    config_parse_label,             0, &p->new_label               },
-                { "Partition", "UUID",                     config_parse_uuid,              0, p                           },
-                { "Partition", "Priority",                 config_parse_int32,             0, &p->priority                },
-                { "Partition", "Weight",                   config_parse_weight,            0, &p->weight                  },
-                { "Partition", "PaddingWeight",            config_parse_weight,            0, &p->padding_weight          },
-                { "Partition", "SizeMinBytes",             config_parse_size4096,         -1, &p->size_min                },
-                { "Partition", "SizeMaxBytes",             config_parse_size4096,          1, &p->size_max                },
-                { "Partition", "PaddingMinBytes",          config_parse_size4096,         -1, &p->padding_min             },
-                { "Partition", "PaddingMaxBytes",          config_parse_size4096,          1, &p->padding_max             },
-                { "Partition", "FactoryReset",             config_parse_bool,              0, &p->factory_reset           },
-                { "Partition", "CopyBlocks",               config_parse_copy_blocks,       0, p                           },
-                { "Partition", "Format",                   config_parse_fstype,            0, &p->format                  },
-                { "Partition", "CopyFiles",                config_parse_copy_files,        0, &p->copy_files              },
-                { "Partition", "ExcludeFiles",             config_parse_exclude_files,     0, &p->exclude_files_source    },
-                { "Partition", "ExcludeFilesTarget",       config_parse_exclude_files,     0, &p->exclude_files_target    },
-                { "Partition", "MakeDirectories",          config_parse_make_dirs,         0, &p->make_directories        },
-                { "Partition", "Encrypt",                  config_parse_encrypt,           0, &p->encrypt                 },
-                { "Partition", "Verity",                   config_parse_verity,            0, &p->verity                  },
-                { "Partition", "VerityMatchKey",           config_parse_string,            0, &p->verity_match_key        },
-                { "Partition", "Flags",                    config_parse_gpt_flags,         0, &p->gpt_flags               },
-                { "Partition", "ReadOnly",                 config_parse_tristate,          0, &p->read_only               },
-                { "Partition", "NoAuto",                   config_parse_tristate,          0, &p->no_auto                 },
-                { "Partition", "GrowFileSystem",           config_parse_tristate,          0, &p->growfs                  },
-                { "Partition", "SplitName",                config_parse_string,            0, &p->split_name_format       },
-                { "Partition", "Minimize",                 config_parse_minimize,          0, &p->minimize                },
-                { "Partition", "Subvolumes",               config_parse_make_dirs,         0, &p->subvolumes              },
-                { "Partition", "DefaultSubvolume",         config_parse_default_subvolume, 0, &p->default_subvolume       },
-                { "Partition", "VerityDataBlockSizeBytes", config_parse_block_size,        0, &p->verity_data_block_size  },
-                { "Partition", "VerityHashBlockSizeBytes", config_parse_block_size,        0, &p->verity_hash_block_size  },
-                { "Partition", "MountPoint",               config_parse_mountpoint,        0, p                           },
-                { "Partition", "EncryptedVolume",          config_parse_encrypted_volume,  0, p                           },
+                { "Partition", "Type",                     config_parse_type,              0,                                  &p->type                    },
+                { "Partition", "Label",                    config_parse_label,             0,                                  &p->new_label               },
+                { "Partition", "UUID",                     config_parse_uuid,              0,                                  p                           },
+                { "Partition", "Priority",                 config_parse_int32,             0,                                  &p->priority                },
+                { "Partition", "Weight",                   config_parse_weight,            0,                                  &p->weight                  },
+                { "Partition", "PaddingWeight",            config_parse_weight,            0,                                  &p->padding_weight          },
+                { "Partition", "SizeMinBytes",             config_parse_size4096,         -1,                                  &p->size_min                },
+                { "Partition", "SizeMaxBytes",             config_parse_size4096,          1,                                  &p->size_max                },
+                { "Partition", "PaddingMinBytes",          config_parse_size4096,         -1,                                  &p->padding_min             },
+                { "Partition", "PaddingMaxBytes",          config_parse_size4096,          1,                                  &p->padding_max             },
+                { "Partition", "FactoryReset",             config_parse_bool,              0,                                  &p->factory_reset           },
+                { "Partition", "CopyBlocks",               config_parse_copy_blocks,       0,                                  p                           },
+                { "Partition", "Format",                   config_parse_fstype,            0,                                  &p->format                  },
+                { "Partition", "CopyFiles",                config_parse_copy_files,        0,                                  &p->copy_files              },
+                { "Partition", "ExcludeFiles",             config_parse_exclude_files,     0,                                  &p->exclude_files_source    },
+                { "Partition", "ExcludeFilesTarget",       config_parse_exclude_files,     0,                                  &p->exclude_files_target    },
+                { "Partition", "MakeDirectories",          config_parse_make_dirs,         0,                                  &p->make_directories        },
+                { "Partition", "Encrypt",                  config_parse_encrypt,           0,                                  &p->encrypt                 },
+                { "Partition", "Verity",                   config_parse_verity,            0,                                  &p->verity                  },
+                { "Partition", "VerityMatchKey",           config_parse_string,            0,                                  &p->verity_match_key        },
+                { "Partition", "Flags",                    config_parse_gpt_flags,         0,                                  &p->gpt_flags               },
+                { "Partition", "ReadOnly",                 config_parse_tristate,          0,                                  &p->read_only               },
+                { "Partition", "NoAuto",                   config_parse_tristate,          0,                                  &p->no_auto                 },
+                { "Partition", "GrowFileSystem",           config_parse_tristate,          0,                                  &p->growfs                  },
+                { "Partition", "SplitName",                config_parse_string,            0,                                  &p->split_name_format       },
+                { "Partition", "Minimize",                 config_parse_minimize,          0,                                  &p->minimize                },
+                { "Partition", "Subvolumes",               config_parse_subvolumes,        0,                                  &p->subvolumes              },
+                { "Partition", "DefaultSubvolume",         config_parse_default_subvolume, 0,                                  &p->default_subvolume       },
+                { "Partition", "VerityDataBlockSizeBytes", config_parse_block_size,        0,                                  &p->verity_data_block_size  },
+                { "Partition", "VerityHashBlockSizeBytes", config_parse_block_size,        0,                                  &p->verity_hash_block_size  },
+                { "Partition", "MountPoint",               config_parse_mountpoint,        0,                                  p                           },
+                { "Partition", "EncryptedVolume",          config_parse_encrypted_volume,  0,                                  p                           },
+                { "Partition", "Compression",              config_parse_string,            CONFIG_PARSE_STRING_SAFE_AND_ASCII, &p->compression             },
+                { "Partition", "CompressionLevel",         config_parse_string,            CONFIG_PARSE_STRING_SAFE_AND_ASCII, &p->compression_level       },
                 {}
         };
-        int r;
         _cleanup_free_ char *filename = NULL;
         const char* dropin_dirname;
+        int r;
 
         r = path_extract_filename(path, &filename);
         if (r < 0)
@@ -2087,7 +2250,7 @@ static int partition_read_definition(Partition *p, const char *path, const char 
                                   "SizeMinBytes=/SizeMaxBytes= cannot be used with Verity=%s.",
                                   verity_mode_to_string(p->verity));
 
-        if (p->default_subvolume && !path_strv_contains(p->subvolumes, p->default_subvolume))
+        if (p->default_subvolume && !ordered_hashmap_contains(p->subvolumes, p->default_subvolume))
                 return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
                                   "DefaultSubvolume= must be one of the paths in Subvolumes=.");
 
@@ -4073,7 +4236,7 @@ static int partition_encrypt(Context *context, Partition *p, PartitionTarget *ta
 
         if (IN_SET(p->encrypt, ENCRYPT_TPM2, ENCRYPT_KEY_FILE_TPM2)) {
 #if HAVE_TPM2
-                _cleanup_(iovec_done) struct iovec pubkey = {}, blob = {}, srk = {};
+                _cleanup_(iovec_done) struct iovec pubkey = {}, srk = {};
                 _cleanup_(iovec_done_erase) struct iovec secret = {};
                 _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
                 ssize_t base64_encoded_size;
@@ -4146,35 +4309,71 @@ static int partition_encrypt(Context *context, Partition *p, PartitionTarget *ta
                                 return log_error_errno(r, "Could not get hash mask: %m");
                 }
 
-                TPM2B_DIGEST policy = TPM2B_DIGEST_MAKE(NULL, TPM2_SHA256_DIGEST_SIZE);
+                TPM2B_DIGEST policy_hash[2] = {
+                        TPM2B_DIGEST_MAKE(NULL, TPM2_SHA256_DIGEST_SIZE),
+                        TPM2B_DIGEST_MAKE(NULL, TPM2_SHA256_DIGEST_SIZE),
+                };
+                size_t n_policy_hash = 1;
+
+                /* If both PCR public key unlock and pcrlock unlock is selected, then shard the encryption key. */
                 r = tpm2_calculate_sealing_policy(
                                 arg_tpm2_hash_pcr_values,
                                 arg_tpm2_n_hash_pcr_values,
                                 iovec_is_set(&pubkey) ? &public : NULL,
                                 /* use_pin= */ false,
-                                arg_tpm2_pcrlock ? &pcrlock_policy : NULL,
-                                &policy);
+                                arg_tpm2_pcrlock && !iovec_is_set(&pubkey) ? &pcrlock_policy : NULL,
+                                policy_hash + 0);
                 if (r < 0)
-                        return log_error_errno(r, "Could not calculate sealing policy digest: %m");
+                        return log_error_errno(r, "Could not calculate sealing policy digest for shard 0: %m");
 
-                if (arg_tpm2_device_key)
+                if (arg_tpm2_pcrlock && iovec_is_set(&pubkey)) {
+                        r = tpm2_calculate_sealing_policy(
+                                        arg_tpm2_hash_pcr_values,
+                                        arg_tpm2_n_hash_pcr_values,
+                                        /* pubkey= */ NULL,      /* Turn this one off for the 2nd shard */
+                                        /* use_pin= */ false,
+                                        &pcrlock_policy,         /* But turn this one on */
+                                        policy_hash + 1);
+                        if (r < 0)
+                                return log_error_errno(r, "Could not calculate sealing policy digest for shard 1: %m");
+
+                        n_policy_hash++;
+                }
+
+                struct iovec *blobs = NULL;
+                size_t n_blobs = 0;
+                CLEANUP_ARRAY(blobs, n_blobs, iovec_array_free);
+
+                if (arg_tpm2_device_key) {
+                        if (n_policy_hash > 1)
+                                return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
+                                                       "Combined signed PCR policies and pcrlock policies cannot be calculated offline, currently.");
+
+                        blobs = new0(struct iovec, 1);
+                        if (!blobs)
+                                return log_oom();
+
+                        n_blobs = 1;
+
                         r = tpm2_calculate_seal(
                                         arg_tpm2_seal_key_handle,
                                         &device_key_public,
                                         /* attributes= */ NULL,
                                         /* secret= */ NULL,
-                                        &policy,
+                                        policy_hash + 0,
                                         /* pin= */ NULL,
                                         &secret,
-                                        &blob,
+                                        blobs + 0,
                                         &srk);
-                else
+                } else
                         r = tpm2_seal(tpm2_context,
                                       arg_tpm2_seal_key_handle,
-                                      &policy,
+                                      policy_hash,
+                                      n_policy_hash,
                                       /* pin= */ NULL,
                                       &secret,
-                                      &blob,
+                                      &blobs,
+                                      &n_blobs,
                                       /* ret_primary_alg= */ NULL,
                                       &srk);
                 if (r < 0)
@@ -4198,6 +4397,11 @@ static int partition_encrypt(Context *context, Partition *p, PartitionTarget *ta
                 if (keyslot < 0)
                         return log_error_errno(keyslot, "Failed to add new TPM2 key: %m");
 
+                struct iovec policy_hash_as_iovec[2] = {
+                        IOVEC_MAKE(policy_hash[0].buffer, policy_hash[0].size),
+                        IOVEC_MAKE(policy_hash[1].buffer, policy_hash[1].size),
+                };
+
                 r = tpm2_make_luks2_json(
                                 keyslot,
                                 hash_pcr_mask,
@@ -4205,8 +4409,10 @@ static int partition_encrypt(Context *context, Partition *p, PartitionTarget *ta
                                 &pubkey,
                                 arg_tpm2_public_key_pcr_mask,
                                 /* primary_alg= */ 0,
-                                &blob,
-                                &IOVEC_MAKE(policy.buffer, policy.size),
+                                blobs,
+                                n_blobs,
+                                policy_hash_as_iovec,
+                                n_policy_hash,
                                 /* salt= */ NULL, /* no salt because tpm2_seal has no pin */
                                 &srk,
                                 &pcrlock_policy.nv_handle,
@@ -4553,7 +4759,7 @@ static int progress_bytes(uint64_t n_bytes, void *userdata) {
 
         p->copy_blocks_done += n_bytes;
 
-        if (asprintf(&s, "%s %s %s %s/%s ",
+        if (asprintf(&s, "%s %s %s %s/%s",
                      strna(p->copy_blocks_path),
                      special_glyph(SPECIAL_GLYPH_ARROW_RIGHT),
                      strna(p->definition_path),
@@ -4817,24 +5023,39 @@ static int add_subvolume_path(const char *path, Set **subvolumes) {
         return 0;
 }
 
+static int make_subvolumes_strv(const Partition *p, char ***ret) {
+        _cleanup_strv_free_ char **subvolumes = NULL;
+        Subvolume *subvolume;
+
+        assert(p);
+        assert(ret);
+
+        ORDERED_HASHMAP_FOREACH(subvolume, p->subvolumes)
+                if (strv_extend(&subvolumes, subvolume->path) < 0)
+                        return log_oom();
+
+        *ret = TAKE_PTR(subvolumes);
+        return 0;
+}
+
 static int make_subvolumes_set(
-                Context *context,
                 const Partition *p,
                 const char *source,
                 const char *target,
                 Set **ret) {
+
         _cleanup_set_free_ Set *subvolumes = NULL;
+        Subvolume *subvolume;
         int r;
 
-        assert(context);
         assert(p);
         assert(target);
         assert(ret);
 
-        STRV_FOREACH(subvolume, p->subvolumes) {
+        ORDERED_HASHMAP_FOREACH(subvolume, p->subvolumes) {
                 _cleanup_free_ char *path = NULL;
 
-                const char *s = path_startswith(*subvolume, target);
+                const char *s = path_startswith(subvolume->path, target);
                 if (!s)
                         continue;
 
@@ -4876,10 +5097,15 @@ static usec_t epoch_or_infinity(void) {
 }
 
 static int do_copy_files(Context *context, Partition *p, const char *root) {
+        _cleanup_strv_free_ char **subvolumes = NULL;
         int r;
 
         assert(p);
         assert(root);
+
+        r = make_subvolumes_strv(p, &subvolumes);
+        if (r < 0)
+                return r;
 
         /* copy_tree_at() automatically copies the permissions of source directories to target directories if
          * it created them. However, the root directory is created by us, so we have to manually take care
@@ -4916,7 +5142,7 @@ static int do_copy_files(Context *context, Partition *p, const char *root) {
                 if (r < 0)
                         return r;
 
-                r = make_subvolumes_set(context, p, *source, *target, &subvolumes_by_source_inode);
+                r = make_subvolumes_set(p, *source, *target, &subvolumes_by_source_inode);
                 if (r < 0)
                         return r;
 
@@ -4949,7 +5175,7 @@ static int do_copy_files(Context *context, Partition *p, const char *root) {
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to extract directory from '%s': %m", *target);
 
-                                r = mkdir_p_root_full(root, dn, UID_INVALID, GID_INVALID, 0755, ts, p->subvolumes);
+                                r = mkdir_p_root_full(root, dn, UID_INVALID, GID_INVALID, 0755, ts, subvolumes);
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to create parent directory '%s': %m", dn);
 
@@ -4961,14 +5187,14 @@ static int do_copy_files(Context *context, Partition *p, const char *root) {
                                                 sfd, ".",
                                                 pfd, fn,
                                                 UID_INVALID, GID_INVALID,
-                                                COPY_REFLINK|COPY_HOLES|COPY_MERGE|COPY_REPLACE|COPY_SIGINT|COPY_HARDLINKS|COPY_ALL_XATTRS|COPY_GRACEFUL_WARN|COPY_TRUNCATE,
+                                                COPY_REFLINK|COPY_HOLES|COPY_MERGE|COPY_REPLACE|COPY_SIGINT|COPY_HARDLINKS|COPY_ALL_XATTRS|COPY_GRACEFUL_WARN|COPY_TRUNCATE|COPY_RESTORE_DIRECTORY_TIMESTAMPS,
                                                 denylist, subvolumes_by_source_inode);
                         } else
                                 r = copy_tree_at(
                                                 sfd, ".",
                                                 tfd, ".",
                                                 UID_INVALID, GID_INVALID,
-                                                COPY_REFLINK|COPY_HOLES|COPY_MERGE|COPY_REPLACE|COPY_SIGINT|COPY_HARDLINKS|COPY_ALL_XATTRS|COPY_GRACEFUL_WARN|COPY_TRUNCATE,
+                                                COPY_REFLINK|COPY_HOLES|COPY_MERGE|COPY_REPLACE|COPY_SIGINT|COPY_HARDLINKS|COPY_ALL_XATTRS|COPY_GRACEFUL_WARN|COPY_TRUNCATE|COPY_RESTORE_DIRECTORY_TIMESTAMPS,
                                                 denylist, subvolumes_by_source_inode);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to copy '%s%s' to '%s%s': %m",
@@ -4989,7 +5215,7 @@ static int do_copy_files(Context *context, Partition *p, const char *root) {
                         if (r < 0)
                                 return log_error_errno(r, "Failed to extract directory from '%s': %m", *target);
 
-                        r = mkdir_p_root_full(root, dn, UID_INVALID, GID_INVALID, 0755, ts, p->subvolumes);
+                        r = mkdir_p_root_full(root, dn, UID_INVALID, GID_INVALID, 0755, ts, subvolumes);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to create parent directory: %m");
 
@@ -5023,15 +5249,41 @@ static int do_copy_files(Context *context, Partition *p, const char *root) {
 }
 
 static int do_make_directories(Partition *p, const char *root) {
+        _cleanup_strv_free_ char **subvolumes = NULL;
         int r;
 
         assert(p);
         assert(root);
 
+        r = make_subvolumes_strv(p, &subvolumes);
+        if (r < 0)
+                return r;
+
         STRV_FOREACH(d, p->make_directories) {
-                r = mkdir_p_root_full(root, *d, UID_INVALID, GID_INVALID, 0755, epoch_or_infinity(), p->subvolumes);
+                r = mkdir_p_root_full(root, *d, UID_INVALID, GID_INVALID, 0755, epoch_or_infinity(), subvolumes);
                 if (r < 0)
                         return log_error_errno(r, "Failed to create directory '%s' in file system: %m", *d);
+        }
+
+        return 0;
+}
+
+static int make_subvolumes_read_only(Partition *p, const char *root) {
+        _cleanup_free_ char *path = NULL;
+        Subvolume *subvolume;
+        int r;
+
+        ORDERED_HASHMAP_FOREACH(subvolume, p->subvolumes) {
+                if (!FLAGS_SET(subvolume->flags, SUBVOLUME_RO))
+                        continue;
+
+                path = path_join(root, subvolume->path);
+                if (!path)
+                        return log_oom();
+
+                r = btrfs_subvol_set_read_only(path, true);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to make subvolume '%s' read-only: %m", subvolume->path);
         }
 
         return 0;
@@ -5132,6 +5384,9 @@ static int partition_populate_filesystem(Context *context, Partition *p, const c
                 if (do_make_directories(p, fs) < 0)
                         _exit(EXIT_FAILURE);
 
+                if (make_subvolumes_read_only(p, fs) < 0)
+                        _exit(EXIT_FAILURE);
+
                 if (set_default_subvolume(p, fs) < 0)
                         _exit(EXIT_FAILURE);
 
@@ -5149,8 +5404,8 @@ static int partition_populate_filesystem(Context *context, Partition *p, const c
 }
 
 static int finalize_extra_mkfs_options(const Partition *p, const char *root, char ***ret) {
-        int r;
         _cleanup_strv_free_ char **sv = NULL;
+        int r;
 
         assert(p);
         assert(ret);
@@ -5162,17 +5417,26 @@ static int finalize_extra_mkfs_options(const Partition *p, const char *root, cha
                                        p->format);
 
         if (partition_needs_populate(p) && root && streq(p->format, "btrfs")) {
-                STRV_FOREACH(subvol, p->subvolumes) {
-                        if (streq_ptr(*subvol, p->default_subvolume))
-                                continue;
+                Subvolume *subvolume;
 
-                        r = strv_extend_many(&sv, "--subvol", *subvol);
-                        if (r < 0)
+                ORDERED_HASHMAP_FOREACH(subvolume, p->subvolumes) {
+                        _cleanup_free_ char *s = NULL, *f = NULL;
+
+                        s = strdup(subvolume->path);
+                        if (!s)
                                 return log_oom();
-                }
 
-                if (p->default_subvolume) {
-                        r = strv_extend_many(&sv, "--default-subvol", p->default_subvolume);
+                        f = subvolume_flags_to_string(subvolume->flags);
+                        if (!f)
+                                return log_oom();
+
+                        if (streq_ptr(subvolume->path, p->default_subvolume) && !strextend_with_separator(&f, ",", "default"))
+                                return log_oom();
+
+                        if (!isempty(f) && !strextend_with_separator(&s, ":", f))
+                                return log_oom();
+
+                        r = strv_extend_many(&sv, "--subvol", s);
                         if (r < 0)
                                 return log_oom();
                 }
@@ -5256,7 +5520,8 @@ static int context_mkfs(Context *context) {
 
                 r = make_filesystem(partition_target_path(t), p->format, strempty(p->new_label), root,
                                     p->fs_uuid, arg_discard, /* quiet = */ false,
-                                    context->fs_sector_size, extra_mkfs_options);
+                                    context->fs_sector_size, p->compression, p->compression_level,
+                                    extra_mkfs_options);
                 if (r < 0)
                         return r;
 
@@ -6820,6 +7085,8 @@ static int context_minimize(Context *context) {
                                     fs_uuid,
                                     arg_discard, /* quiet = */ false,
                                     context->fs_sector_size,
+                                    p->compression,
+                                    p->compression_level,
                                     extra_mkfs_options);
                 if (r < 0)
                         return r;
@@ -6901,6 +7168,8 @@ static int context_minimize(Context *context) {
                                     arg_discard,
                                     /* quiet = */ false,
                                     context->fs_sector_size,
+                                    p->compression,
+                                    p->compression_level,
                                     extra_mkfs_options);
                 if (r < 0)
                         return r;
@@ -8257,6 +8526,10 @@ static int run(int argc, char *argv[]) {
         if (!context)
                 return log_oom();
 
+        r = context_read_seed(context, arg_root);
+        if (r < 0)
+                return r;
+
         r = context_copy_from(context);
         if (r < 0)
                 return r;
@@ -8333,10 +8606,6 @@ static int run(int argc, char *argv[]) {
                 if (r < 0)
                         return r;
         }
-
-        r = context_read_seed(context, arg_root);
-        if (r < 0)
-                return r;
 
         /* Make sure each partition has a unique UUID and unique label */
         r = context_acquire_partition_uuids_and_labels(context);
