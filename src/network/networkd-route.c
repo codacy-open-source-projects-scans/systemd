@@ -720,7 +720,7 @@ static int route_update_on_existing(Request *req) {
         int r;
 
         if (!req->manager)
-                /* Already detached? At least there are two posibilities then.
+                /* Already detached? At least there are two possibilities then.
                  * 1) The interface is removed, and all queued requests for the interface are cancelled.
                  * 2) networkd is now stopping, hence all queued requests are cancelled.
                  * Anyway, we can ignore the request, and there is nothing we can do. */
@@ -1008,19 +1008,15 @@ static int static_route_handler(sd_netlink *rtnl, sd_netlink_message *m, Request
 }
 
 static int link_request_wireguard_routes(Link *link, bool only_ipv4) {
-        NetDev *netdev;
         Route *route;
         int r;
 
         assert(link);
 
-        if (!streq_ptr(link->kind, "wireguard"))
+        if (!link->netdev || link->netdev->kind != NETDEV_KIND_WIREGUARD)
                 return 0;
 
-        if (netdev_get(link->manager, link->ifname, &netdev) < 0)
-                return 0;
-
-        Wireguard *w = WIREGUARD(netdev);
+        Wireguard *w = WIREGUARD(link->netdev);
 
         SET_FOREACH(route, w->routes) {
                 if (only_ipv4 && route->family != AF_INET)

@@ -528,11 +528,15 @@ static int append_extensions(
                               &result);
                 if (r < 0)
                         return r;
-                if (!result.path)
+                if (!result.path) {
+                        if (m->ignore_enoent)
+                                continue;
+
                         return log_debug_errno(
                                         SYNTHETIC_ERRNO(ENOENT),
                                         "No matching entry in .v/ directory %s found.",
                                         m->source);
+                }
 
                 r = verity_settings_load(&verity, result.path, /* root_hash_path= */ NULL, /* root_hash_sig_path= */ NULL);
                 if (r < 0)
@@ -575,10 +579,6 @@ static int append_extensions(
                 const char *e = *extension_directory;
                 bool ignore_enoent = false;
 
-                /* Pick up the counter where the ExtensionImages left it. */
-                if (asprintf(&mount_point, "%s/unit-extensions/%zu", private_namespace_dir, n_mount_images++) < 0)
-                        return -ENOMEM;
-
                 /* Look for any prefixes */
                 if (startswith(e, "-")) {
                         e++;
@@ -596,11 +596,19 @@ static int append_extensions(
                               &result);
                 if (r < 0)
                         return r;
-                if (!result.path)
+                if (!result.path) {
+                        if (ignore_enoent)
+                                continue;
+
                         return log_debug_errno(
                                         SYNTHETIC_ERRNO(ENOENT),
                                         "No matching entry in .v/ directory %s found.",
                                         e);
+                }
+
+                /* Pick up the counter where the ExtensionImages left it. */
+                if (asprintf(&mount_point, "%s/unit-extensions/%zu", private_namespace_dir, n_mount_images++) < 0)
+                        return -ENOMEM;
 
                 for (size_t j = 0; hierarchies && hierarchies[j]; ++j) {
                         char *prefixed_hierarchy = path_join(mount_point, hierarchies[j]);
@@ -3227,3 +3235,11 @@ static const char* const private_tmp_table[_PRIVATE_TMP_MAX] = {
 };
 
 DEFINE_STRING_TABLE_LOOKUP_WITH_BOOLEAN(private_tmp, PrivateTmp, PRIVATE_TMP_CONNECTED);
+
+static const char* const private_users_table[_PRIVATE_USERS_MAX] = {
+        [PRIVATE_USERS_OFF]      = "off",
+        [PRIVATE_USERS_SELF]     = "self",
+        [PRIVATE_USERS_IDENTITY] = "identity",
+};
+
+DEFINE_STRING_TABLE_LOOKUP_WITH_BOOLEAN(private_users, PrivateUsers, PRIVATE_USERS_SELF);

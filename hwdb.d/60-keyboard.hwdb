@@ -223,12 +223,16 @@ evdev:atkbd:dmi:bvn*:bvr*:bd*:svnPackard*Bell*:pn*:*
 
 # Swift SF314-511
 evdev:atkbd:dmi:bvn*:bvr*:bd*:svnAcer*:pnSwiftSF314-511:pvr*
- KEYBOARD_KEY_8a=f20					# Fn+F12, microphone mute
+ KEYBOARD_KEY_8a=f20                                    # Fn+F12, microphone mute
 
 # Predator PHN16-71
 evdev:atkbd:dmi:bvn*:bvr*:bd*:svnAcer*:pnPredatorPHN16-71:*
  KEYBOARD_KEY_ef=unknown                                # Keyboard backlight up
  KEYBOARD_KEY_f5=prog1                                  # "predator sense" button
+ KEYBOARD_KEY_66=micmute                                # Microphone mute button
+
+# Predator PHN16-72
+evdev:atkbd:dmi:bvn*:bvr*:bd*:svnAcer*:pnPredatorPHN16-72:*
  KEYBOARD_KEY_66=micmute                                # Microphone mute button
 
 # Nitro AN515-58
@@ -259,7 +263,7 @@ evdev:atkbd:dmi:bvn*:bvr*:bd*:svnAlienware*:pnM17xR3:*
 # Aquarius Cmp NS483
 evdev:atkbd:dmi:bvn*:bvr*:bd*:svnAquarius*:pnCmp*NS483*:*
  KEYBOARD_KEY_56=backslash
- KEYBOARD_KEY_76=f21					# Touchpad Toggle
+ KEYBOARD_KEY_76=f21                                    # Touchpad Toggle
 
 ###########################################################
 # Asus
@@ -336,12 +340,14 @@ evdev:atkbd:dmi:bvn*:bvr*:bd*:svnNotebook:pnW65_67SZ:*
 evdev:atkbd:dmi:bvn*:bvr*:svnNotebook:pnNS50_70MU:*
 evdev:atkbd:dmi:bvn*:bvr*:svnNotebook:pnNV4XMB,ME,MZ:*
 evdev:atkbd:dmi:bvn*:bvr*:svnNotebook:pnNS5x_NS7xPU:*
-evdev:atkbd:dmi:bvn*:bvr*:svnNotebook:pnNV4xPZ:*
-evdev:atkbd:dmi:bvn*:bvr*:svnNotebook:pnV54x_6x_TU:*
  KEYBOARD_KEY_f7=f21                                    # Touchpad Toggle
  KEYBOARD_KEY_f8=f21                                    # Touchpad Toggle
 
 evdev:atkbd:dmi:bvn*:bvr*:svnNotebook:pnV5xTNC_TND_TNE:*
+evdev:atkbd:dmi:bvn*:bvr*:svnNotebook:pnNV4xPZ:*
+evdev:atkbd:dmi:bvn*:bvr*:svnNotebook:pnV54x_6x_TU:*
+ KEYBOARD_KEY_f7=f21                                    # Touchpad Toggle
+ KEYBOARD_KEY_f8=f21                                    # Touchpad Toggle
  KEYBOARD_KEY_81=f20                                    # Fn+4; Mic Mute
 
 ###########################################################
@@ -976,7 +982,7 @@ evdev:atkbd:dmi:bvn*:bvr*:bd*:svnJP-IK:pnLEAPW502:pvr*
 
 # LE14U/LE15U
 evdev:atkbd:dmi:bvn*:bvr*:bd*:svnKVADRA*:pn*LE1*U*:*
- KEYBOARD_KEY_76=f21					# Fn+F1 Toggle touchpad, sends meta+ctrl+toggle
+ KEYBOARD_KEY_76=f21                                    # Fn+F1 Toggle touchpad, sends meta+ctrl+toggle
 
 ###########################################################
 # Lenovo
@@ -1904,9 +1910,9 @@ evdev:atkbd:dmi:bvn*:bvr*:bd*:svn[sS][aA][mM][sS][uU][nN][gG]*:pn*700T*:*
 # Galaxy Book (2021) NP750XDA-KD4SE
 evdev:atkbd:dmi:bvn*:bvr*:bd*:svn[sS][aA][mM][sS][uU][nN][gG]*:pn750XDA:pvr*
  KEYBOARD_KEY_81=!esc
- KEYBOARD_KEY_ce=!prog1 	# Fn+F1 launch settings
- KEYBOARD_KEY_ae=!volumedown 	# Fn+F7 volume down
- KEYBOARD_KEY_b0=!volumeup	# Fn+F8 volume up
+ KEYBOARD_KEY_ce=!prog1         # Fn+F1 launch settings
+ KEYBOARD_KEY_ae=!volumedown    # Fn+F7 volume down
+ KEYBOARD_KEY_b0=!volumeup      # Fn+F8 volume up
 
 
 ###########################################################
@@ -2031,13 +2037,13 @@ evdev:name:Toshiba*input*device:dmi:bvn*:bvr*:bd*:svnTOSHIBA*:pnSatellite*P75-A:
 
 # Portege Z830 ACPI quickstart buttons
 evdev:name:Quickstart Button 1:dmi:bvn*:bvr*:bd*:svnTOSHIBA*:pnPORTEGEZ830:*
- KEYBOARD_KEY_1=prog1					# TOSHIBA eco button
+ KEYBOARD_KEY_1=prog1                                   # TOSHIBA eco button
 
 evdev:name:Quickstart Button 2:dmi:bvn*:bvr*:bd*:svnTOSHIBA*:pnPORTEGEZ830:*
- KEYBOARD_KEY_1=prog2					# TOSHIBA Presentation button
+ KEYBOARD_KEY_1=prog2                                   # TOSHIBA Presentation button
 
 evdev:name:Quickstart Button 3:dmi:bvn*:bvr*:bd*:svnTOSHIBA*:pnPORTEGEZ830:*
- KEYBOARD_KEY_1=f21					# Touchpad toggle
+ KEYBOARD_KEY_1=f21                                     # Touchpad toggle
 
 ###########################################################
 # VIA
@@ -2070,11 +2076,11 @@ evdev:atkbd:dmi:bvn*:bvr*:bd*:svnINET:pnP325J:*
 # Home: LeftCtrl + Esc -> LeftMeta  (ignore LeftCtrl, map Esc to LeftMeta)
 # Back: Backspace      -> back      (map backspace to back)
 evdev:name:FTSC1000:00 2808:509C Keyboard:dmi:*:svnXiaomiInc:pnMipad2:*
- KEYBOARD_KEY_700e0=unknown	# LeftCtrl -> ignore
- KEYBOARD_KEY_700e3=unknown	# LeftMeta -> ignore
- KEYBOARD_KEY_70016=menu	# S -> menu
- KEYBOARD_KEY_70029=leftmeta	# Esc -> LeftMeta (Windows key / Win8 tablets home)
- KEYBOARD_KEY_7002a=back	# Backspace -> back
+ KEYBOARD_KEY_700e0=unknown                             # LeftCtrl -> ignore
+ KEYBOARD_KEY_700e3=unknown                             # LeftMeta -> ignore
+ KEYBOARD_KEY_70016=menu                                # S -> menu
+ KEYBOARD_KEY_70029=leftmeta                            # Esc -> LeftMeta (Windows key / Win8 tablets home)
+ KEYBOARD_KEY_7002a=back                                # Backspace -> back
 
 ###########################################################
 # Zepto
@@ -2186,7 +2192,7 @@ evdev:atkbd:dmi:bvn*:bvr*:bd*:svnViewSonic:pnVPAD10:*
 evdev:name:AT Translated Set 2 keyboard:dmi:bvn*:bvr*:bd*:svnPositivoBahia-VAIO:pnVJPW1[12]F11X*:pvr*:*
 # Vaio FE14 (VJFE41F11X, VJE42F11X, VJFE44F11X, VJFE54F11X)
 evdev:name:AT Translated Set 2 keyboard:dmi:bvn*:bvr*:bd*:svnPositivoBahia-VAIO:pnVJFE*:pvr*:*
- KEYBOARD_KEY_76=f21		                        # Fn+F1 toggle touchpad
+ KEYBOARD_KEY_76=f21                                    # Fn+F1 toggle touchpad
 
 ###########################################################
 # Positivo

@@ -20,8 +20,8 @@
 #include "dns-domain.h"
 #include "errno-list.h"
 #include "escape.h"
+#include "format-ifname.h"
 #include "format-table.h"
-#include "format-util.h"
 #include "gcrypt-util.h"
 #include "hostname-util.h"
 #include "json-util.h"
@@ -1617,7 +1617,9 @@ typedef struct GlobalInfo {
         bool dnssec_supported;
 } GlobalInfo;
 
-static void link_info_clear(LinkInfo *p) {
+static void link_info_done(LinkInfo *p) {
+        assert(p);
+
         free(p->current_dns);
         free(p->current_dns_ex);
         strv_free(p->dns);
@@ -1626,7 +1628,9 @@ static void link_info_clear(LinkInfo *p) {
         strv_free(p->ntas);
 }
 
-static void global_info_clear(GlobalInfo *p) {
+static void global_info_done(GlobalInfo *p) {
+        assert(p);
+
         free(p->current_dns);
         free(p->current_dns_ex);
         strv_free(p->dns);
@@ -1726,7 +1730,7 @@ static int status_ifindex(sd_bus *bus, int ifindex, const char *name, StatusMode
         };
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
-        _cleanup_(link_info_clear) LinkInfo link_info = {};
+        _cleanup_(link_info_done) LinkInfo link_info = {};
         _cleanup_(table_unrefp) Table *table = NULL;
         _cleanup_free_ char *p = NULL;
         char ifi[DECIMAL_STR_MAX(int)], ifname[IF_NAMESIZE];
@@ -1761,52 +1765,56 @@ static int status_ifindex(sd_bus *bus, int ifindex, const char *name, StatusMode
 
         pager_open(arg_pager_flags);
 
-        if (mode == STATUS_DNS)
+        switch (mode) {
+
+        case STATUS_DNS:
                 return status_print_strv_ifindex(ifindex, name, link_info.dns_ex ?: link_info.dns);
 
-        if (mode == STATUS_DOMAIN)
+        case STATUS_DOMAIN:
                 return status_print_strv_ifindex(ifindex, name, link_info.domains);
 
-        if (mode == STATUS_NTA)
+        case STATUS_NTA:
                 return status_print_strv_ifindex(ifindex, name, link_info.ntas);
 
-        if (mode == STATUS_DEFAULT_ROUTE) {
+        case STATUS_DEFAULT_ROUTE:
                 printf("%sLink %i (%s)%s: %s\n",
                        ansi_highlight(), ifindex, name, ansi_normal(),
                        yes_no(link_info.default_route));
 
                 return 0;
-        }
 
-        if (mode == STATUS_LLMNR) {
+        case STATUS_LLMNR:
                 printf("%sLink %i (%s)%s: %s\n",
                        ansi_highlight(), ifindex, name, ansi_normal(),
                        strna(link_info.llmnr));
 
                 return 0;
-        }
 
-        if (mode == STATUS_MDNS) {
+        case STATUS_MDNS:
                 printf("%sLink %i (%s)%s: %s\n",
                        ansi_highlight(), ifindex, name, ansi_normal(),
                        strna(link_info.mdns));
 
                 return 0;
-        }
 
-        if (mode == STATUS_PRIVATE) {
+        case STATUS_PRIVATE:
                 printf("%sLink %i (%s)%s: %s\n",
                        ansi_highlight(), ifindex, name, ansi_normal(),
                        strna(link_info.dns_over_tls));
 
                 return 0;
-        }
 
-        if (mode == STATUS_DNSSEC) {
+        case STATUS_DNSSEC:
                 printf("%sLink %i (%s)%s: %s\n",
                        ansi_highlight(), ifindex, name, ansi_normal(),
                        strna(link_info.dnssec));
 
+                return 0;
+
+        case STATUS_ALL:
+                break;
+
+        default:
                 return 0;
         }
 
@@ -1874,6 +1882,12 @@ static int status_ifindex(sd_bus *bus, int ifindex, const char *name, StatusMode
         r = dump_list(table, "DNS Domain", link_info.domains);
         if (r < 0)
                 return r;
+
+        r = table_add_many(table,
+                           TABLE_FIELD, "Default Route",
+                           TABLE_BOOLEAN, link_info.default_route);
+        if (r < 0)
+                return table_log_add_error(r);
 
         r = table_print(table, NULL);
         if (r < 0)
@@ -2002,7 +2016,7 @@ static int status_global(sd_bus *bus, StatusMode mode, bool *empty_line) {
         };
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
-        _cleanup_(global_info_clear) GlobalInfo global_info = {};
+        _cleanup_(global_info_done) GlobalInfo global_info = {};
         _cleanup_(table_unrefp) Table *table = NULL;
         int r;
 
@@ -2022,40 +2036,45 @@ static int status_global(sd_bus *bus, StatusMode mode, bool *empty_line) {
 
         pager_open(arg_pager_flags);
 
-        if (mode == STATUS_DNS)
+        switch (mode) {
+
+        case STATUS_DNS:
                 return status_print_strv_global(global_info.dns_ex ?: global_info.dns);
 
-        if (mode == STATUS_DOMAIN)
+        case STATUS_DOMAIN:
                 return status_print_strv_global(global_info.domains);
 
-        if (mode == STATUS_NTA)
+        case STATUS_NTA:
                 return status_print_strv_global(global_info.ntas);
 
-        if (mode == STATUS_LLMNR) {
+        case STATUS_LLMNR:
                 printf("%sGlobal%s: %s\n", ansi_highlight(), ansi_normal(),
                        strna(global_info.llmnr));
 
                 return 0;
-        }
 
-        if (mode == STATUS_MDNS) {
+        case STATUS_MDNS:
                 printf("%sGlobal%s: %s\n", ansi_highlight(), ansi_normal(),
                        strna(global_info.mdns));
 
                 return 0;
-        }
 
-        if (mode == STATUS_PRIVATE) {
+        case STATUS_PRIVATE:
                 printf("%sGlobal%s: %s\n", ansi_highlight(), ansi_normal(),
                        strna(global_info.dns_over_tls));
 
                 return 0;
-        }
 
-        if (mode == STATUS_DNSSEC) {
+        case STATUS_DNSSEC:
                 printf("%sGlobal%s: %s\n", ansi_highlight(), ansi_normal(),
                        strna(global_info.dnssec));
 
+                return 0;
+
+        case STATUS_ALL:
+                break;
+
+        default:
                 return 0;
         }
 

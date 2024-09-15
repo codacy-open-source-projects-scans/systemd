@@ -188,7 +188,7 @@ mimepackagesdir = prefixdir / 'share/mime/packages'
 
 configfiledir = get_option('configfiledir')
 if configfiledir == ''
-        configfiledir= sysconfdir
+        configfiledir = sysconfdir
 endif
 pkgconfigfiledir = configfiledir / 'systemd'
 
@@ -228,6 +228,13 @@ if libcryptsetup_plugins_dir == ''
         libcryptsetup_plugins_dir = libdir / 'cryptsetup'
 endif
 
+shellprofiledir = get_option('shellprofiledir')
+if shellprofiledir == ''
+        shellprofiledir = sysconfdir / 'profile.d'
+endif
+conf.set10('LINK_SHELL_EXTRA_DROPIN', shellprofiledir != 'no' and not shellprofiledir.startswith('/usr/'))
+conf.set('SHELLPROFILEDIR', shellprofiledir, description : 'shell profile directory')
+
 memory_accounting_default = get_option('memory-accounting-default')
 status_unit_format_default = get_option('status-unit-format-default')
 if status_unit_format_default == 'auto'
@@ -257,6 +264,7 @@ conf.set_quoted('RANDOM_SEED_DIR',                            randomseeddir)
 conf.set_quoted('RC_LOCAL_PATH',                              get_option('rc-local'))
 conf.set_quoted('SSHCONFDIR',                                 sshconfdir)
 conf.set_quoted('SSHDCONFDIR',                                sshdconfdir)
+conf.set_quoted('SHELLPROFILEDIR',                            shellprofiledir)
 conf.set_quoted('SYSCONF_DIR',                                sysconfdir)
 conf.set_quoted('SYSCTL_DIR',                                 sysctldir)
 conf.set_quoted('SYSTEMCTL_BINARY_PATH',                      bindir / 'systemctl')
@@ -764,7 +772,6 @@ foreach header : ['crypt.h',
                   'linux/ioprio.h',
                   'linux/memfd.h',
                   'linux/time_types.h',
-                  'linux/vm_sockets.h',
                   'sys/auxv.h',
                   'sys/sdt.h',
                   'threads.h',
@@ -1281,7 +1288,8 @@ foreach ident : ['crypt_set_metadata_size',
                  'crypt_reencrypt_run',
                  'crypt_set_data_offset',
                  'crypt_set_keyring_to_link',
-                 'crypt_resume_by_volume_key']
+                 'crypt_resume_by_volume_key',
+                 'crypt_token_set_external_path']
         have_ident = have and cc.has_function(
                 ident,
                 prefix : '#include <libcryptsetup.h>',
@@ -2702,6 +2710,7 @@ subdir('man')
 subdir('modprobe.d')
 subdir('network')
 subdir('presets')
+subdir('profile.d')
 subdir('shell-completion/bash')
 subdir('shell-completion/zsh')
 subdir('sysctl.d')
@@ -2924,6 +2933,7 @@ summary({
         'ssh server privilege separation directory' : sshdprivsepdir,
         'ssh client configuration directory' : sshconfdir,
         'libcryptsetup plugins directory' : libcryptsetup_plugins_dir,
+        'Shell profile directory' :         shellprofiledir,
         'RPM macros directory' :            rpmmacrosdir,
         'modprobe.d directory' :            modprobedir,
         'D-Bus policy directory' :          dbuspolicydir,

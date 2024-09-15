@@ -32,6 +32,7 @@
 #include "edit-util.h"
 #include "env-util.h"
 #include "fd-util.h"
+#include "format-ifname.h"
 #include "format-table.h"
 #include "hostname-util.h"
 #include "import-util.h"
@@ -1219,8 +1220,6 @@ static int process_forward(sd_event *event, PTYForward **forward, int master, PT
         assert(master >= 0);
         assert(name);
 
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGWINCH, SIGTERM, SIGINT) >= 0);
-
         if (!arg_quiet) {
                 if (streq(name, ".host"))
                         log_info("Connected to the local host. Press ^] three times within 1s to exit session.");
@@ -1228,8 +1227,9 @@ static int process_forward(sd_event *event, PTYForward **forward, int master, PT
                         log_info("Connected to machine %s. Press ^] three times within 1s to exit session.", name);
         }
 
-        (void) sd_event_add_signal(event, NULL, SIGINT, NULL, NULL);
-        (void) sd_event_add_signal(event, NULL, SIGTERM, NULL, NULL);
+        r = sd_event_set_signal_exit(event, true);
+        if (r < 0)
+                return log_error_errno(r, "Failed to enable SIGINT/SITERM handling: %m");
 
         r = pty_forward_new(event, master, flags, forward);
         if (r < 0)
@@ -1958,7 +1958,8 @@ static int clean_images(int argc, char *argv[], void *userdata) {
 static int chainload_importctl(int argc, char *argv[]) {
         int r;
 
-        log_notice("The 'machinectl %1$s' command has been replaced by 'importctl -m %1$s'. Redirecting invocation.", argv[optind]);
+        if (!arg_quiet)
+                log_notice("The 'machinectl %1$s' command has been replaced by 'importctl -m %1$s'. Redirecting invocation.", argv[optind]);
 
         _cleanup_strv_free_ char **c =
                 strv_new("importctl", "--class=machine");
