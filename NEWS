@@ -2,6 +2,15 @@ systemd System and Service Manager
 
 CHANGES WITH 257 in spe:
 
+        Incompatible changes:
+
+        * The --purge switch of systemd-tmpfiles (which was added in v256) has
+          been reworked: it will now only apply to tmpfiles.d/ lines marked
+          with the new "$" flag. This is an incompatible change, and means any
+          tmpfiles.d/ files which shall be used together with --purge need to
+          be updated accordingly. This change has been made to make it harder
+          to accidentally delete too many files when using --purge incorrectly.
+
         Announcements of Future Feature Removals and Incompatible Changes:
 
         * Support for automatic flushing of the nscd user/group database caches
@@ -49,7 +58,7 @@ CHANGES WITH 257 in spe:
 
         * systemd-nspawn will now mount the unified cgroup hierarchy into a
           container if no systemd installation is found in a container's root
-          filesystem. `$SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=0` can be used to override
+          filesystem. $SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=0 can be used to override
           this behavior.
 
         libsystemd:
@@ -63,6 +72,9 @@ CHANGES WITH 257 in spe:
           supported natively.
 
         Service and system management:
+
+        * Global user units are now enabled or disabled based on preset files
+          on first boot as well just like system units are already.
 
         * Environment variable $REMOTE_ADDR is now set when using socket
           activation for AF_UNIX sockets.
@@ -85,7 +97,7 @@ CHANGES WITH 257 in spe:
           /usr/lib/clock-epoch, and /var/lib/systemd/timesync/clock. See
           systemd(1) for an detailed updated description.
 
-        * Ctrl-Alt-Delete is reenabled during late shutdown, so that the user
+        * Ctrl-Alt-Delete is re-enabled during late shutdown, so that the user
           can still initiate a reboot if the system freezes.
 
         * Unit option PrivateUsers=identity can be used to request a user
@@ -174,9 +186,9 @@ CHANGES WITH 257 in spe:
         * A new .profile PE section type is now documented and supported in
           systemd-measure, ukify, systemd-stub and systemd-boot. Those new
           sections allow multiple "profiles" to be stored together in the UKI,
-          with .profile sections creating groupings the UKI, allowing some
-          sections to be shared and other sections like .cmdline or .initrd
-          unique to the profile.
+          with .profile sections creating groupings of sections in the UKI,
+          allowing some sections to be shared and other sections like .cmdline
+          or .initrd unique to the profile.
 
         * ukify gained an --extend switch to import an existing UKI to
           be extended, and a --measure-base= switch to support measurement
@@ -202,7 +214,7 @@ CHANGES WITH 257 in spe:
           versions.
 
         * systemd-sysupdate gained a new --transfer-source= option to set the
-          directory to which transfer sources cofigured with
+          directory to which transfer sources configured with
           PathRelativeTo=explicit will be interpreted.
 
         Miscellaneous:
@@ -243,7 +255,7 @@ CHANGES WITH 257 in spe:
           of the random seed file in ESP. (This is useful when producing an
           image that will be used multiple times.)
 
-        * systemd-cryptenroll gained new options -fido2-salt-file= and
+        * systemd-cryptenroll gained new options --fido2-salt-file= and
           --fido2-parameters-in-header= to simplify manual enrollment of FIDO2
           tokens.
 

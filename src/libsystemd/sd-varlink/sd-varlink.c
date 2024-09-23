@@ -410,7 +410,7 @@ static int varlink_connect_ssh_exec(sd_varlink **ret, const char *where) {
         full_cmdline = strv_new("ssh", "-e", "none", "-T", h, "env", "SYSTEMD_VARLINK_LISTEN=-");
         if (!full_cmdline)
                 return log_oom_debug();
-        r = strv_extend_strv(&full_cmdline, cmdline, /* filter_duplicates= */ false);
+        r = strv_extend_strv_consume(&full_cmdline, TAKE_PTR(cmdline), /* filter_duplicates= */ false);
         if (r < 0)
                 return log_oom_debug();
 
@@ -1229,7 +1229,7 @@ static int generic_method_get_interface_description(
                 sd_varlink_method_flags_t flags,
                 void *userdata) {
 
-        static const struct sd_json_dispatch_field dispatch_table[] = {
+        static const sd_json_dispatch_field dispatch_table[] = {
                 { "interface",  SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string, 0, SD_JSON_MANDATORY },
                 {}
         };

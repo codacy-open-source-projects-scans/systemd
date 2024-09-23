@@ -2434,6 +2434,8 @@ static int create_interactively(void) {
                 return 0;
         }
 
+        any_key_to_proceed();
+
         r = acquire_bus(&bus);
         if (r < 0)
                 return r;
@@ -3650,7 +3652,7 @@ static int parse_argv(int argc, char *argv[]) {
                                         return log_error_errno(r, "Failed to parse SSH authorized keys list: %m");
                         }
 
-                        r = strv_extend_strv(&l, add, true);
+                        r = strv_extend_strv_consume(&l, TAKE_PTR(add), /* filter_duplicates = */ true);
                         if (r < 0)
                                 return log_oom();
 

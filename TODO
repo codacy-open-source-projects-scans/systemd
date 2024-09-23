@@ -189,6 +189,8 @@ Features:
 * go through our codebase, and convert "vertical tables" (i.e. things such as
   "systemctl status") to use table_new_vertical() for output
 
+* pcrlock: add support for multi-profile UKIs
+
 * logind: when logging in use new tmpfs quota support to configure quota on
   /tmp/ + /dev/shm/. But do so only in case of tmpfs, because otherwise quota
   is persistent and any persistent settings mean we don#t have to reapply them.
@@ -1860,7 +1862,7 @@ Features:
 
 * fstab-generator: default to tmpfs-as-root if only usr= is specified on the kernel cmdline
 
-* docs: bring https://systemd.io/MY_SERVICE_CANT_GET_REATLIME up to date
+* docs: bring https://systemd.io/MY_SERVICE_CANT_GET_REALTIME up to date
 
 * add a job mode that will fail if a transaction would mean stopping
   running units. Use this in timedated to manage the NTP service
