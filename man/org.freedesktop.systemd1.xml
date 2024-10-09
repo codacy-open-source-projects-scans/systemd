@@ -2550,18 +2550,9 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
       was already active).</para>
 
       <para><varname>ActiveState</varname> contains a state value that reflects whether the unit is currently
-      active or not. The following states are currently defined: <literal>active</literal>,
-      <literal>reloading</literal>, <literal>inactive</literal>, <literal>failed</literal>,
-      <literal>activating</literal>, and <literal>deactivating</literal>. <literal>active</literal> indicates
-      that unit is active (obviously...). <literal>reloading</literal> indicates that the unit is active and
-      currently reloading its configuration. <literal>inactive</literal> indicates that it is inactive and
-      the previous run was successful or no previous run has taken place yet. <literal>failed</literal>
-      indicates that it is inactive and the previous run was not successful (more information about the
-      reason for this is available on the unit type specific interfaces, for example for services in the
-      <varname>Result</varname> property, see below). <literal>activating</literal> indicates that the unit
-      has previously been inactive but is currently in the process of entering an active state. Conversely
-      <literal>deactivating</literal> indicates that the unit is currently in the process of
-      deactivation.</para>
+      active or not. The following states are currently defined:</para>
+
+      <xi:include href="unit-states.xml" xpointer="table"/>
 
       <para><varname>SubState</varname> encodes states of the same state machine that
       <varname>ActiveState</varname> covers, but knows more fine-grained states that are
@@ -2798,6 +2789,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
       readonly s OOMPolicy = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly a(sst) OpenFile = [...];
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly as ExtraFileDescriptorNames = ['...', ...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly i ReloadSignal = ...;
       readonly t ExecMainStartTimestamp = ...;
@@ -4107,6 +4100,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
 
     <variablelist class="dbus-property" generated="True" extra-ref="OpenFile"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="ExtraFileDescriptorNames"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="ReloadSignal"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="ExecMainStartTimestamp"/>
@@ -4852,6 +4847,12 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
       <varname>StateDirectory</varname>, <varname>CacheDirectory</varname> and <varname>LogsDirectory</varname>,
       which will create a symlink of the given name to the respective directory. The messages take an unused
       <varname>flags</varname> parameter, reserved for future backward-compatible changes.</para>
+
+      <para><varname>ExtraFileDescriptorNames</varname> contains file descriptor names passed to the service via
+      the <varname>ExtraFileDescriptors</varname> property in the <function>StartTransientUnit()</function>
+      method. See <citerefentry><refentrytitle>sd_listen_fds</refentrytitle><manvolnum>3</manvolnum></citerefentry>
+      for more details on how to retrieve these file descriptors. Unlike the <varname>ExtraFileDescriptors</varname>
+      input property, <varname>ExtraFileDescriptorNames</varname> only contains names and not the file descriptors.</para>
     </refsect2>
   </refsect1>
 
@@ -12218,6 +12219,7 @@ $ gdbus introspect --system --dest org.freedesktop.systemd1 \
       <varname>LiveMountResult</varname>,
       <varname>PrivateTmpEx</varname>,
       <varname>ImportCredentialEx</varname>,
+      <varname>ExtraFileDescriptorNames</varname>,
       <varname>BindLogSockets</varname>, and
       <varname>PrivateUsersEx</varname> were added in version 257.</para>
     </refsect2>

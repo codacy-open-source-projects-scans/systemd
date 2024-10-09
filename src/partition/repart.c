@@ -3877,7 +3877,6 @@ static int context_dump(Context *context, bool late) {
         return 0;
 }
 
-
 static bool context_changed(const Context *context) {
         assert(context);
 
@@ -5458,8 +5457,8 @@ static int file_is_denylisted(const char *source, Hashmap *denylist) {
         if (PTR_TO_INT(hashmap_get(denylist, &st)) == DENY_INODE)
                 return 1;
 
-        if (stat(arg_copy_source, &rst) < 0)
-                return log_error_errno(errno, "Failed to stat '%s': %m", arg_copy_source);
+        if (stat(empty_to_root(arg_copy_source), &rst) < 0)
+                return log_error_errno(errno, "Failed to stat '%s': %m", empty_to_root(arg_copy_source));
 
         pfd = chase_and_open_parent(source, arg_copy_source, CHASE_PREFIX_ROOT, /*ret_filename=*/ NULL);
         if (pfd < 0)
@@ -5518,6 +5517,8 @@ static int do_copy_files(Context *context, Partition *p, const char *root) {
                         return -errno;
 
                 sfd = chase_and_open(*source, arg_copy_source, CHASE_PREFIX_ROOT, O_PATH|O_DIRECTORY|O_CLOEXEC|O_NOCTTY, NULL);
+                if (sfd == -ENOTDIR)
+                        continue;
                 if (sfd < 0)
                         return log_error_errno(sfd, "Failed to open source file '%s%s': %m", strempty(arg_copy_source), *source);
 
@@ -9023,17 +9024,17 @@ static int run(int argc, char *argv[]) {
                         return r;
         }
 
-        /* Make sure each partition has a unique UUID and unique label */
-        r = context_acquire_partition_uuids_and_labels(context);
-        if (r < 0)
-                return r;
-
         /* Open all files to copy blocks from now, since we want to take their size into consideration */
         r = context_open_copy_block_paths(
                         context,
                         loop_device ? loop_device->devno :         /* if --image= is specified, only allow partitions on the loopback device */
                                       arg_root && !arg_image ? 0 : /* if --root= is specified, don't accept any block device */
                                       (dev_t) -1);                 /* if neither is specified, make no restrictions */
+        if (r < 0)
+                return r;
+
+        /* Make sure each partition has a unique UUID and unique label */
+        r = context_acquire_partition_uuids_and_labels(context);
         if (r < 0)
                 return r;
 

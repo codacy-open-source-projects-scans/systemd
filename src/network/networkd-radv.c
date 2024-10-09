@@ -881,7 +881,6 @@ void network_adjust_radv(Network *network) {
                 if (prefix_section_verify(prefix) < 0)
                         prefix_free(prefix);
 
-
         RoutePrefix *route;
         HASHMAP_FOREACH(route, network->route_prefixes_by_section)
                 if (route_prefix_section_verify(route) < 0)
@@ -1332,13 +1331,10 @@ int config_parse_radv_dns(
                         }
                 }
 
-                struct in6_addr *m;
-                m = reallocarray(n->router_dns, n->n_router_dns + 1, sizeof(struct in6_addr));
-                if (!m)
+                if (!GREEDY_REALLOC(n->router_dns, n->n_router_dns + 1))
                         return log_oom();
 
-                m[n->n_router_dns++] = a.in6;
-                n->router_dns = m;
+                n->router_dns[n->n_router_dns++] = a.in6;
         }
 }
 
