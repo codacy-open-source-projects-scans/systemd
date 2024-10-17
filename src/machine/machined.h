@@ -16,6 +16,7 @@ typedef struct Manager Manager;
 #include "machine-dbus.h"
 #include "machine.h"
 #include "operation.h"
+#include "pidref.h"
 
 struct Manager {
         sd_event *event;
@@ -44,7 +45,7 @@ struct Manager {
 };
 
 int manager_add_machine(Manager *m, const char *name, Machine **ret);
-int manager_get_machine_by_pid(Manager *m, pid_t pid, Machine **ret);
+int manager_get_machine_by_pidref(Manager *m, const PidRef *pidref, Machine **ret);
 
 extern const BusObjectImplementation manager_object;
 
@@ -67,3 +68,5 @@ void manager_enqueue_gc(Manager *m);
 
 int machine_get_addresses(Machine* machine, struct local_address **ret_addresses);
 int machine_get_os_release(Machine *machine, char ***ret_os_release);
+int manager_acquire_image(Manager *m, const char *name, Image **ret);
+int rename_image_and_update_cache(Manager *m, Image *image, const char* new_name);

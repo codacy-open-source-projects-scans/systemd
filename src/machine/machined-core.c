@@ -12,19 +12,19 @@
 #include "strv.h"
 #include "user-util.h"
 
-int manager_get_machine_by_pid(Manager *m, pid_t pid, Machine **ret) {
+int manager_get_machine_by_pidref(Manager *m, const PidRef *pidref, Machine **ret) {
         Machine *mm;
         int r;
 
         assert(m);
-        assert(pid_is_valid(pid));
+        assert(pidref_is_set(pidref));
         assert(ret);
 
-        mm = hashmap_get(m->machines_by_leader, &PIDREF_MAKE_FROM_PID(pid));
+        mm = hashmap_get(m->machines_by_leader, pidref);
         if (!mm) {
                 _cleanup_free_ char *unit = NULL;
 
-                r = cg_pid_get_unit(pid, &unit);
+                r = cg_pidref_get_unit(pidref, &unit);
                 if (r >= 0)
                         mm = hashmap_get(m->machines_by_unit, unit);
         }
@@ -400,5 +400,85 @@ int machine_get_os_release(Machine *machine, char ***ret_os_release) {
         }
 
         *ret_os_release = TAKE_PTR(l);
+        return 0;
+}
+
+static int image_flush_cache(sd_event_source *s, void *userdata) {
+        Manager *m = ASSERT_PTR(userdata);
+
+        assert(s);
+
+        hashmap_clear(m->image_cache);
+        return 0;
+}
+
+int manager_acquire_image(Manager *m, const char *name, Image **ret) {
+        int r;
+
+        assert(m);
+        assert(name);
+
+        Image *existing = hashmap_get(m->image_cache, name);
+        if (existing) {
+                if (ret)
+                        *ret = existing;
+                return 0;
+        }
+
+        if (!m->image_cache_defer_event) {
+                r = sd_event_add_defer(m->event, &m->image_cache_defer_event, image_flush_cache, m);
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to add deferred event: %m");
+
+                r = sd_event_source_set_priority(m->image_cache_defer_event, SD_EVENT_PRIORITY_IDLE);
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to set source priority for event: %m");
+        }
+
+        r = sd_event_source_set_enabled(m->image_cache_defer_event, SD_EVENT_ONESHOT);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to enable source: %m") ;
+
+        _cleanup_(image_unrefp) Image *image = NULL;
+        r = image_find(IMAGE_MACHINE, name, NULL, &image);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to find image: %m");
+
+        image->userdata = m;
+
+        r = hashmap_ensure_put(&m->image_cache, &image_hash_ops, image->name, image);
+        if (r < 0)
+                return r;
+
+        if (ret)
+                *ret = image;
+
+        TAKE_PTR(image);
+        return 0;
+}
+
+int rename_image_and_update_cache(Manager *m, Image *image, const char* new_name) {
+        int r;
+
+        assert(m);
+        assert(image);
+        assert(new_name);
+
+        /* The image is cached with its name, hence it is necessary to remove from the cache before renaming. */
+        assert_se(hashmap_remove_value(m->image_cache, image->name, image));
+
+        r = image_rename(image, new_name);
+        if (r < 0) {
+                image = image_unref(image);
+                return r;
+        }
+
+        /* Then save the object again in the cache. */
+        r = hashmap_put(m->image_cache, image->name, image);
+        if (r < 0) {
+                image = image_unref(image);
+                log_debug_errno(r, "Failed to put renamed image into cache, ignoring: %m");
+        }
+
         return 0;
 }

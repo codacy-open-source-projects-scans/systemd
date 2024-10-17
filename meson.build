@@ -367,6 +367,7 @@ endif
 # avoid them.
 basic_disabled_warnings = [
         '-Wno-missing-field-initializers',
+        '-Wno-unknown-warning-option',
         '-Wno-unused-parameter',
         '-Wno-nonnull-compare',
 ]
@@ -561,10 +562,10 @@ conf.set_quoted('LONG_MAX_STR', '@0@'.format(long_max))
 
 decl_headers = '''
 #include <dirent.h>
-#include <uchar.h>
+#include <sched.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
-#include <sched.h>
+#include <uchar.h>
 '''
 
 foreach decl : ['char16_t',

@@ -526,6 +526,8 @@ static int append_extensions(
                               &pick_filter_image_raw,
                               PICK_ARCHITECTURE|PICK_TRIES,
                               &result);
+                if (r == -ENOENT && m->ignore_enoent)
+                        continue;
                 if (r < 0)
                         return r;
                 if (!result.path) {
@@ -594,6 +596,8 @@ static int append_extensions(
                               &pick_filter_image_dir,
                               PICK_ARCHITECTURE|PICK_TRIES,
                               &result);
+                if (r == -ENOENT && ignore_enoent)
+                        continue;
                 if (r < 0)
                         return r;
                 if (!result.path) {
@@ -1940,7 +1944,7 @@ static bool namespace_parameters_mount_apivfs(const NamespaceParameters *p) {
  * - that are outside of the relevant root directory
  * - which are duplicates
  */
-static void drop_unused_mounts(MountList *ml, const char *root_directory) {
+static void sort_and_drop_unused_mounts(MountList *ml, const char *root_directory) {
         assert(ml);
         assert(root_directory);
 
@@ -2085,7 +2089,7 @@ static int apply_mounts(
                 if (!again)
                         break;
 
-                drop_unused_mounts(ml, root);
+                sort_and_drop_unused_mounts(ml, root);
         }
 
         /* Now that all filesystems have been set up, but before the
@@ -2661,7 +2665,7 @@ int setup_namespace(const NamespaceParameters *p, char **error_path) {
         if (r < 0)
                 return r;
 
-        drop_unused_mounts(&ml, root);
+        sort_and_drop_unused_mounts(&ml, root);
 
         /* All above is just preparation, figuring out what to do. Let's now actually start doing something. */
 
@@ -3221,7 +3225,7 @@ static const char* const proc_subset_table[_PROC_SUBSET_MAX] = {
 DEFINE_STRING_TABLE_LOOKUP(proc_subset, ProcSubset);
 
 static const char* const private_tmp_table[_PRIVATE_TMP_MAX] = {
-        [PRIVATE_TMP_OFF]          = "off",
+        [PRIVATE_TMP_NO]           = "no",
         [PRIVATE_TMP_CONNECTED]    = "connected",
         [PRIVATE_TMP_DISCONNECTED] = "disconnected",
 };
@@ -3229,7 +3233,7 @@ static const char* const private_tmp_table[_PRIVATE_TMP_MAX] = {
 DEFINE_STRING_TABLE_LOOKUP_WITH_BOOLEAN(private_tmp, PrivateTmp, PRIVATE_TMP_CONNECTED);
 
 static const char* const private_users_table[_PRIVATE_USERS_MAX] = {
-        [PRIVATE_USERS_OFF]      = "off",
+        [PRIVATE_USERS_NO]       = "no",
         [PRIVATE_USERS_SELF]     = "self",
         [PRIVATE_USERS_IDENTITY] = "identity",
 };

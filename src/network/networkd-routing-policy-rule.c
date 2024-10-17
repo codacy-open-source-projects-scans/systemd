@@ -12,6 +12,7 @@
 #include "hashmap.h"
 #include "ip-protocol-list.h"
 #include "netlink-util.h"
+#include "network-util.h"
 #include "networkd-manager.h"
 #include "networkd-queue.h"
 #include "networkd-route-util.h"
@@ -111,7 +112,7 @@ static int routing_policy_rule_new(RoutingPolicyRule **ret) {
                 .suppress_prefixlen = -1,
                 .suppress_ifgroup = -1,
                 .protocol = RTPROT_UNSPEC,
-                .type = FR_ACT_TO_TBL,
+                .action = FR_ACT_TO_TBL,
         };
 
         *ret = rule;
@@ -196,7 +197,7 @@ static void routing_policy_rule_hash_func(const RoutingPolicyRule *rule, struct 
 
         /* See rule_exists() in net/core/fib_rules.c of the kernel. */
         siphash24_compress_typesafe(rule->family, state);
-        siphash24_compress_typesafe(rule->type, state);
+        siphash24_compress_typesafe(rule->action, state);
         siphash24_compress_typesafe(rule->table, state);
         siphash24_compress_typesafe(rule->priority, state);
         siphash24_compress_string(rule->iif, state);
@@ -215,12 +216,12 @@ static void routing_policy_rule_hash_func(const RoutingPolicyRule *rule, struct 
         siphash24_compress_typesafe(rule->dport, state);
 
         /* See fib4_rule_compare() in net/ipv4/fib_rules.c, and fib6_rule_compare() in net/ipv6/fib6_rules.c. */
-        siphash24_compress_typesafe(rule->from_prefixlen, state);
-        siphash24_compress_typesafe(rule->to_prefixlen, state);
+        siphash24_compress_typesafe(rule->from.prefixlen, state);
+        siphash24_compress_typesafe(rule->to.prefixlen, state);
         siphash24_compress_typesafe(rule->tos, state);
         siphash24_compress_typesafe(rule->realms, state);
-        in_addr_hash_func(&rule->from, rule->family, state);
-        in_addr_hash_func(&rule->to, rule->family, state);
+        in_addr_hash_func(&rule->from.address, rule->family, state);
+        in_addr_hash_func(&rule->to.address, rule->family, state);
 }
 
 static int routing_policy_rule_compare_func_full(const RoutingPolicyRule *a, const RoutingPolicyRule *b, bool all) {
@@ -235,7 +236,7 @@ static int routing_policy_rule_compare_func_full(const RoutingPolicyRule *a, con
                         return r;
         }
 
-        r = CMP(a->type, b->type);
+        r = CMP(a->action, b->action);
         if (r != 0)
                 return r;
 
@@ -301,11 +302,11 @@ static int routing_policy_rule_compare_func_full(const RoutingPolicyRule *a, con
         if (r != 0)
                 return r;
 
-        r = CMP(a->from_prefixlen, b->from_prefixlen);
+        r = CMP(a->from.prefixlen, b->from.prefixlen);
         if (r != 0)
                 return r;
 
-        r = CMP(a->to_prefixlen, b->to_prefixlen);
+        r = CMP(a->to.prefixlen, b->to.prefixlen);
         if (r != 0)
                 return r;
 
@@ -318,11 +319,11 @@ static int routing_policy_rule_compare_func_full(const RoutingPolicyRule *a, con
                 return r;
 
         if (all) {
-                r = memcmp(&a->from, &b->from, FAMILY_ADDRESS_SIZE(a->family));
+                r = memcmp(&a->from.address, &b->from.address, FAMILY_ADDRESS_SIZE(a->family));
                 if (r != 0)
                         return r;
 
-                r = memcmp(&a->to, &b->to, FAMILY_ADDRESS_SIZE(a->family));
+                r = memcmp(&a->to.address, &b->to.address, FAMILY_ADDRESS_SIZE(a->family));
                 if (r != 0)
                         return r;
         }
@@ -365,7 +366,7 @@ static bool routing_policy_rule_can_update(const RoutingPolicyRule *existing, co
                 return false;
 
         /* GOTO target cannot be updated. */
-        if (existing->type == FR_ACT_GOTO && existing->priority_goto != requesting->priority_goto)
+        if (existing->action == FR_ACT_GOTO && existing->priority_goto != requesting->priority_goto)
                 return false;
 
         return true;
@@ -515,7 +516,7 @@ static int routing_policy_rule_acquire_priority(Manager *manager, RoutingPolicyR
                 }
 
         /* priority must be smaller than goto target */
-        for (priority = rule->type == FR_ACT_GOTO ? rule->priority_goto - 1 : 32765; priority > 0; priority--)
+        for (priority = rule->action == FR_ACT_GOTO ? rule->priority_goto - 1 : 32765; priority > 0; priority--)
                 if (!set_contains(priorities, UINT32_TO_PTR(priority)))
                         break;
 
@@ -544,8 +545,8 @@ static void log_routing_policy_rule_debug(const RoutingPolicyRule *rule, const c
                        "%s %s routing policy rule (%s): priority: %"PRIu32", %s -> %s, iif: %s, oif: %s, table: %s",
                        str, strna(network_config_source_to_string(rule->source)), strna(state),
                        rule->priority,
-                       IN_ADDR_PREFIX_TO_STRING(rule->family, &rule->from, rule->from_prefixlen),
-                       IN_ADDR_PREFIX_TO_STRING(rule->family, &rule->to, rule->to_prefixlen),
+                       IN_ADDR_PREFIX_TO_STRING(rule->family, &rule->from.address, rule->from.prefixlen),
+                       IN_ADDR_PREFIX_TO_STRING(rule->family, &rule->to.address, rule->to.prefixlen),
                        strna(rule->iif), strna(rule->oif), strna(table));
 }
 
@@ -555,22 +556,22 @@ static int routing_policy_rule_set_netlink_message(const RoutingPolicyRule *rule
         assert(rule);
         assert(m);
 
-        if (rule->from_prefixlen > 0) {
-                r = netlink_message_append_in_addr_union(m, FRA_SRC, rule->family, &rule->from);
+        if (rule->from.prefixlen > 0) {
+                r = netlink_message_append_in_addr_union(m, FRA_SRC, rule->family, &rule->from.address);
                 if (r < 0)
                         return r;
 
-                r = sd_rtnl_message_routing_policy_rule_set_fib_src_prefixlen(m, rule->from_prefixlen);
+                r = sd_rtnl_message_routing_policy_rule_set_src_prefixlen(m, rule->from.prefixlen);
                 if (r < 0)
                         return r;
         }
 
-        if (rule->to_prefixlen > 0) {
-                r = netlink_message_append_in_addr_union(m, FRA_DST, rule->family, &rule->to);
+        if (rule->to.prefixlen > 0) {
+                r = netlink_message_append_in_addr_union(m, FRA_DST, rule->family, &rule->to.address);
                 if (r < 0)
                         return r;
 
-                r = sd_rtnl_message_routing_policy_rule_set_fib_dst_prefixlen(m, rule->to_prefixlen);
+                r = sd_rtnl_message_routing_policy_rule_set_dst_prefixlen(m, rule->to.prefixlen);
                 if (r < 0)
                         return r;
         }
@@ -667,11 +668,11 @@ static int routing_policy_rule_set_netlink_message(const RoutingPolicyRule *rule
                         return r;
         }
 
-        r = sd_rtnl_message_routing_policy_rule_set_fib_type(m, rule->type);
+        r = sd_rtnl_message_routing_policy_rule_set_action(m, rule->action);
         if (r < 0)
                 return r;
 
-        if (rule->type == FR_ACT_GOTO) {
+        if (rule->action == FR_ACT_GOTO) {
                 r = sd_netlink_message_append_u32(m, FRA_GOTO, rule->priority_goto);
                 if (r < 0)
                         return r;
@@ -1039,13 +1040,13 @@ int link_request_static_routing_policy_rules(Link *link) {
 }
 
 static const RoutingPolicyRule kernel_rules[] = {
-        { .family = AF_INET,  .priority_set = true, .priority = 0,     .table = RT_TABLE_LOCAL,   .type = FR_ACT_TO_TBL, .uid_range.start = UID_INVALID, .uid_range.end = UID_INVALID, .suppress_prefixlen = -1, .suppress_ifgroup = -1, },
-        { .family = AF_INET,  .priority_set = true, .priority = 1000,  .table = RT_TABLE_UNSPEC,  .type = FR_ACT_TO_TBL, .uid_range.start = UID_INVALID, .uid_range.end = UID_INVALID, .suppress_prefixlen = -1, .suppress_ifgroup = -1, .l3mdev = true },
-        { .family = AF_INET,  .priority_set = true, .priority = 32766, .table = RT_TABLE_MAIN,    .type = FR_ACT_TO_TBL, .uid_range.start = UID_INVALID, .uid_range.end = UID_INVALID, .suppress_prefixlen = -1, .suppress_ifgroup = -1, },
-        { .family = AF_INET,  .priority_set = true, .priority = 32767, .table = RT_TABLE_DEFAULT, .type = FR_ACT_TO_TBL, .uid_range.start = UID_INVALID, .uid_range.end = UID_INVALID, .suppress_prefixlen = -1, .suppress_ifgroup = -1, },
-        { .family = AF_INET6, .priority_set = true, .priority = 0,     .table = RT_TABLE_LOCAL,   .type = FR_ACT_TO_TBL, .uid_range.start = UID_INVALID, .uid_range.end = UID_INVALID, .suppress_prefixlen = -1, .suppress_ifgroup = -1, },
-        { .family = AF_INET6, .priority_set = true, .priority = 1000,  .table = RT_TABLE_UNSPEC,  .type = FR_ACT_TO_TBL, .uid_range.start = UID_INVALID, .uid_range.end = UID_INVALID, .suppress_prefixlen = -1, .suppress_ifgroup = -1, .l3mdev = true },
-        { .family = AF_INET6, .priority_set = true, .priority = 32766, .table = RT_TABLE_MAIN,    .type = FR_ACT_TO_TBL, .uid_range.start = UID_INVALID, .uid_range.end = UID_INVALID, .suppress_prefixlen = -1, .suppress_ifgroup = -1, },
+        { .family = AF_INET,  .priority_set = true, .priority = 0,     .table = RT_TABLE_LOCAL,   .action = FR_ACT_TO_TBL, .uid_range.start = UID_INVALID, .uid_range.end = UID_INVALID, .suppress_prefixlen = -1, .suppress_ifgroup = -1, },
+        { .family = AF_INET,  .priority_set = true, .priority = 1000,  .table = RT_TABLE_UNSPEC,  .action = FR_ACT_TO_TBL, .uid_range.start = UID_INVALID, .uid_range.end = UID_INVALID, .suppress_prefixlen = -1, .suppress_ifgroup = -1, .l3mdev = true },
+        { .family = AF_INET,  .priority_set = true, .priority = 32766, .table = RT_TABLE_MAIN,    .action = FR_ACT_TO_TBL, .uid_range.start = UID_INVALID, .uid_range.end = UID_INVALID, .suppress_prefixlen = -1, .suppress_ifgroup = -1, },
+        { .family = AF_INET,  .priority_set = true, .priority = 32767, .table = RT_TABLE_DEFAULT, .action = FR_ACT_TO_TBL, .uid_range.start = UID_INVALID, .uid_range.end = UID_INVALID, .suppress_prefixlen = -1, .suppress_ifgroup = -1, },
+        { .family = AF_INET6, .priority_set = true, .priority = 0,     .table = RT_TABLE_LOCAL,   .action = FR_ACT_TO_TBL, .uid_range.start = UID_INVALID, .uid_range.end = UID_INVALID, .suppress_prefixlen = -1, .suppress_ifgroup = -1, },
+        { .family = AF_INET6, .priority_set = true, .priority = 1000,  .table = RT_TABLE_UNSPEC,  .action = FR_ACT_TO_TBL, .uid_range.start = UID_INVALID, .uid_range.end = UID_INVALID, .suppress_prefixlen = -1, .suppress_ifgroup = -1, .l3mdev = true },
+        { .family = AF_INET6, .priority_set = true, .priority = 32766, .table = RT_TABLE_MAIN,    .action = FR_ACT_TO_TBL, .uid_range.start = UID_INVALID, .uid_range.end = UID_INVALID, .suppress_prefixlen = -1, .suppress_ifgroup = -1, },
 };
 
 static bool routing_policy_rule_is_created_by_kernel(const RoutingPolicyRule *rule) {
@@ -1100,24 +1101,24 @@ int manager_rtnl_process_rule(sd_netlink *rtnl, sd_netlink_message *message, Man
                 return 0;
         }
 
-        r = netlink_message_read_in_addr_union(message, FRA_SRC, tmp->family, &tmp->from);
+        r = netlink_message_read_in_addr_union(message, FRA_SRC, tmp->family, &tmp->from.address);
         if (r < 0 && r != -ENODATA) {
                 log_warning_errno(r, "rtnl: could not get FRA_SRC attribute, ignoring: %m");
                 return 0;
         } else if (r >= 0) {
-                r = sd_rtnl_message_routing_policy_rule_get_fib_src_prefixlen(message, &tmp->from_prefixlen);
+                r = sd_rtnl_message_routing_policy_rule_get_src_prefixlen(message, &tmp->from.prefixlen);
                 if (r < 0) {
                         log_warning_errno(r, "rtnl: received rule message without valid source prefix length, ignoring: %m");
                         return 0;
                 }
         }
 
-        r = netlink_message_read_in_addr_union(message, FRA_DST, tmp->family, &tmp->to);
+        r = netlink_message_read_in_addr_union(message, FRA_DST, tmp->family, &tmp->to.address);
         if (r < 0 && r != -ENODATA) {
                 log_warning_errno(r, "rtnl: could not get FRA_DST attribute, ignoring: %m");
                 return 0;
         } else if (r >= 0) {
-                r = sd_rtnl_message_routing_policy_rule_get_fib_dst_prefixlen(message, &tmp->to_prefixlen);
+                r = sd_rtnl_message_routing_policy_rule_get_dst_prefixlen(message, &tmp->to.prefixlen);
                 if (r < 0) {
                         log_warning_errno(r, "rtnl: received rule message without valid destination prefix length, ignoring: %m");
                         return 0;
@@ -1157,9 +1158,9 @@ int manager_rtnl_process_rule(sd_netlink *rtnl, sd_netlink_message *message, Man
                 return 0;
         }
 
-        r = sd_rtnl_message_routing_policy_rule_get_fib_type(message, &tmp->type);
+        r = sd_rtnl_message_routing_policy_rule_get_action(message, &tmp->action);
         if (r < 0 && r != -ENODATA) {
-                log_warning_errno(r, "rtnl: could not get FIB rule type, ignoring: %m");
+                log_warning_errno(r, "rtnl: could not get FIB rule action, ignoring: %m");
                 return 0;
         }
 
@@ -1409,7 +1410,7 @@ static int config_parse_routing_policy_rule_goto(
                 return 0;
         }
 
-        rule->type = FR_ACT_GOTO;
+        rule->action = FR_ACT_GOTO;
         rule->priority_goto = priority;
         return 1;
 }
@@ -1463,46 +1464,6 @@ static int config_parse_routing_policy_rule_fwmark(
         r = parse_fwmark_fwmask(rvalue, &rule->fwmark, &rule->fwmask);
         if (r < 0) {
                 log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to parse RPDB rule firewall mark or mask, ignoring: %s", rvalue);
-                return 0;
-        }
-
-        return 1;
-}
-
-static int config_parse_routing_policy_rule_prefix(
-                const char *unit,
-                const char *filename,
-                unsigned line,
-                const char *section,
-                unsigned section_line,
-                const char *lvalue,
-                int ltype,
-                const char *rvalue,
-                void *data,
-                void *userdata) {
-
-        RoutingPolicyRule *rule = ASSERT_PTR(userdata);
-        union in_addr_union *buffer;
-        uint8_t *prefixlen;
-        int r;
-
-        assert(rvalue);
-
-        if (streq_ptr(lvalue, "To")) {
-                buffer = &rule->to;
-                prefixlen = &rule->to_prefixlen;
-        } else if (streq_ptr(lvalue, "From")) {
-                buffer = &rule->from;
-                prefixlen = &rule->from_prefixlen;
-        } else
-                assert_not_reached();
-
-        if (rule->family == AF_UNSPEC)
-                r = in_addr_prefix_from_string_auto(rvalue, &rule->family, buffer, prefixlen);
-        else
-                r = in_addr_prefix_from_string(rvalue, rule->family, buffer, prefixlen);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r, "RPDB rule prefix is invalid, ignoring assignment: %s", rvalue);
                 return 0;
         }
 
@@ -1605,7 +1566,7 @@ static int config_parse_routing_policy_rule_suppress(
         return 1;
 }
 
-static int config_parse_routing_policy_rule_type(
+static int config_parse_routing_policy_rule_action(
                 const char *unit,
                 const char *filename,
                 unsigned line,
@@ -1625,7 +1586,7 @@ static int config_parse_routing_policy_rule_type(
         r = fr_act_type_from_string(rvalue);
         if (r < 0) {
                 log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Could not parse FIB rule type \"%s\", ignoring assignment: %m", rvalue);
+                           "Could not parse FIB rule action \"%s\", ignoring assignment: %m", rvalue);
                 return 0;
         }
 
@@ -1662,13 +1623,14 @@ int config_parse_routing_policy_rule(
                 [ROUTING_POLICY_RULE_L3MDEV]             = { .parser = config_parse_bool,                           .ltype = 0,               .offset = offsetof(RoutingPolicyRule, l3mdev),             },
                 [ROUTING_POLICY_RULE_SPORT]              = { .parser = config_parse_routing_policy_rule_port_range, .ltype = 0,               .offset = offsetof(RoutingPolicyRule, sport),              },
                 [ROUTING_POLICY_RULE_DPORT]              = { .parser = config_parse_routing_policy_rule_port_range, .ltype = 0,               .offset = offsetof(RoutingPolicyRule, dport),              },
-                [ROUTING_POLICY_RULE_PREFIX]             = { .parser = config_parse_routing_policy_rule_prefix,     .ltype = 0,               .offset = 0,                                               },
+                [ROUTING_POLICY_RULE_FROM]               = { .parser = config_parse_in_addr_prefix,                 .ltype = 0,               .offset = offsetof(RoutingPolicyRule, from),               },
+                [ROUTING_POLICY_RULE_TO]                 = { .parser = config_parse_in_addr_prefix,                 .ltype = 0,               .offset = offsetof(RoutingPolicyRule, to),                 },
                 [ROUTING_POLICY_RULE_PRIORITY]           = { .parser = config_parse_routing_policy_rule_priority,   .ltype = 0,               .offset = 0,                                               },
                 [ROUTING_POLICY_RULE_SUPPRESS_IFGROUP]   = { .parser = config_parse_routing_policy_rule_suppress,   .ltype = INT32_MAX,       .offset = offsetof(RoutingPolicyRule, suppress_ifgroup),   },
                 [ROUTING_POLICY_RULE_SUPPRESS_PREFIXLEN] = { .parser = config_parse_routing_policy_rule_suppress,   .ltype = 128,             .offset = offsetof(RoutingPolicyRule, suppress_prefixlen), },
                 [ROUTING_POLICY_RULE_TABLE]              = { .parser = config_parse_routing_policy_rule_table,      .ltype = 0,               .offset = offsetof(RoutingPolicyRule, table),              },
                 [ROUTING_POLICY_RULE_TOS]                = { .parser = config_parse_uint8,                          .ltype = 0,               .offset = offsetof(RoutingPolicyRule, tos),                },
-                [ROUTING_POLICY_RULE_TYPE]               = { .parser = config_parse_routing_policy_rule_type,       .ltype = 0,               .offset = offsetof(RoutingPolicyRule, type),               },
+                [ROUTING_POLICY_RULE_ACTION]             = { .parser = config_parse_routing_policy_rule_action,     .ltype = 0,               .offset = offsetof(RoutingPolicyRule, action),             },
                 [ROUTING_POLICY_RULE_UID_RANGE]          = { .parser = config_parse_routing_policy_rule_uid_range,  .ltype = 0,               .offset = offsetof(RoutingPolicyRule, uid_range),          },
         };
 
@@ -1707,6 +1669,12 @@ static int routing_policy_rule_section_verify(RoutingPolicyRule *rule) {
         if (section_is_invalid(rule->section))
                 return -EINVAL;
 
+        rule->family = rule->from.family;
+        if (rule->family == AF_UNSPEC)
+                rule->family = rule->to.family;
+        else if (rule->to.family != AF_UNSPEC && rule->to.family != rule->family)
+                return log_rule_section(rule, "From= and To= settings for routing policy rule contradict each other.");
+
         if ((rule->family == AF_INET && FLAGS_SET(rule->address_family, ADDRESS_FAMILY_IPV6)) ||
             (rule->family == AF_INET6 && FLAGS_SET(rule->address_family, ADDRESS_FAMILY_IPV4)))
                 return log_rule_section(rule, "Address family specified by Family= conflicts with To= and/or From=.");
@@ -1724,7 +1692,7 @@ static int routing_policy_rule_section_verify(RoutingPolicyRule *rule) {
         if (rule->l3mdev)
                 rule->table = RT_TABLE_UNSPEC;
 
-        if (rule->type == FR_ACT_GOTO) {
+        if (rule->action == FR_ACT_GOTO) {
                 if (rule->priority_goto <= 0)
                         return log_rule_section(rule, "Type=goto is specified but the target priority GoTo= is unspecified.");
 

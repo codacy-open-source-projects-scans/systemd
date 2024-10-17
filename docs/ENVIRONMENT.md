@@ -351,6 +351,13 @@ All tools:
   default is not appropriate for a given system. Defaults to `5`, accepts
   positive integers.
 
+* `$SYSTEMD_DEFAULT_MOUNT_RATE_LIMIT_INTERVAL_SEC` — can be set to override the mount
+  units interval rate limit for parsing `/proc/self/mountinfo`. Similar to
+  `$SYSTEMD_DEFAULT_MOUNT_RATE_LIMIT_BURST`, the interval limit maybe adjusted when
+  the default is not appropriate for a given system. The default value is 1 and the
+  default application time unit is second, and the time unit can beoverriden as usual
+  by specifying it explicitly, see the systemd.time(7) man page.
+
 `systemd-remount-fs`:
 
 * `$SYSTEMD_REMOUNT_ROOT_RW=1` — if set and no entry for the root directory
@@ -404,7 +411,7 @@ All tools:
   subvolumes if the backing filesystem supports them. If set to `0`, these
   lines will always create directories.
 
-`systemd-sysusers`
+`systemd-sysusers`:
 
 * `$SOURCE_DATE_EPOCH` — if unset, the field of the date of last password change
   in `/etc/shadow` will be the number of days from Jan 1, 1970 00:00 UTC until

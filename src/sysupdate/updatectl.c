@@ -1240,7 +1240,7 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "hH:M:", options, NULL)) >= 0) {
+        while ((c = getopt_long(argc, argv, "hH:", options, NULL)) >= 0) {
                 switch (c) {
 
                 case 'h':
@@ -1304,7 +1304,7 @@ static int run(int argc, char *argv[]) {
 
         r = bus_connect_transport(arg_transport, arg_host, RUNTIME_SCOPE_SYSTEM, &bus);
         if (r < 0)
-                return bus_log_connect_error(r, arg_transport);
+                return bus_log_connect_error(r, arg_transport, RUNTIME_SCOPE_SYSTEM);
 
         if (arg_transport == BUS_TRANSPORT_LOCAL)
                 polkit_agent_open();

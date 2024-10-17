@@ -12,7 +12,7 @@ export PAGER=
 at_exit() {
     set +e
 
-    machinectl status long-running >/dev/null && machinectl kill --signal=KILL long-running
+    machinectl status long-running &>/dev/null && machinectl kill --signal=KILL long-running
     mountpoint -q /var/lib/machines && timeout 10 sh -c "until umount /var/lib/machines; do sleep .5; done"
     [[ -n "${NSPAWN_FRAGMENT:-}" ]] && rm -f "/etc/systemd/nspawn/$NSPAWN_FRAGMENT" "/var/lib/machines/$NSPAWN_FRAGMENT"
     rm -f /run/systemd/nspawn/*.nspawn
@@ -39,6 +39,7 @@ cat >/var/lib/machines/long-running/sbin/init <<\EOF
 
 PID=0
 
+trap "touch /terminate; kill $PID" RTMIN+3
 trap "touch /poweroff" RTMIN+4
 trap "touch /reboot" INT
 trap "touch /trap" TRAP
@@ -59,11 +60,13 @@ EOF
 
 long_running_machine_start() {
     # shellcheck disable=SC2015
-    machinectl status long-running >/dev/null && return 0 || true
+    machinectl status long-running &>/dev/null && return 0 || true
+
+    # Ensure the service stopped.
+    systemctl stop systemd-nspawn@long-running.service 2>/dev/null || :
 
     rm -f /var/lib/machines/long-running/ready
-    # sometime `machinectl start` returns 1 and then do a success
-    machinectl start long-running || machinectl start long-running
+    machinectl start long-running
     # !!!! DO NOT REMOVE THIS TEST
     # The test makes sure that the long-running's init script has enough time to start and registered signal traps
     timeout 30 bash -c "until test -e /var/lib/machines/long-running/ready; do sleep .5; done"
@@ -115,7 +118,14 @@ timeout 10 bash -c "until test -e /var/lib/machines/long-running/poweroff; do sl
 rm -f /var/lib/machines/long-running/reboot
 machinectl reboot long-running
 timeout 10 bash -c "until test -e /var/lib/machines/long-running/reboot; do sleep .5; done"
-# Skip machinectl terminate for now, as it doesn't play well with our "init"
+# Test for 'machinectl terminate'
+rm -f /var/lib/machines/long-running/terminate
+machinectl terminate long-running
+timeout 10 bash -c "until test -e /var/lib/machines/long-running/terminate; do sleep .5; done"
+timeout 10 bash -c "while machinectl status long-running &>/dev/null; do sleep .5; done"
+# Restart container
+long_running_machine_start
+# Test for 'machinectl kill'
 rm -f /var/lib/machines/long-running/trap
 machinectl kill --signal=SIGTRAP --kill-whom=leader long-running
 timeout 10 bash -c "until test -e /var/lib/machines/long-running/trap; do sleep .5; done"
@@ -246,6 +256,11 @@ done
 
 long_running_machine_start
 
+varlinkctl introspect /run/systemd/machine/io.systemd.Machine io.systemd.Machine
+varlinkctl introspect /run/systemd/machine/io.systemd.Machine io.systemd.MachineImage
+varlinkctl introspect /run/systemd/machine/io.systemd.MachineImage io.systemd.Machine
+varlinkctl introspect /run/systemd/machine/io.systemd.MachineImage io.systemd.MachineImage
+
 # test io.systemd.Machine.List
 varlinkctl --more call /run/systemd/machine/io.systemd.Machine io.systemd.Machine.List '{}' | grep 'long-running'
 varlinkctl --more call /run/systemd/machine/io.systemd.Machine io.systemd.Machine.List '{}' | grep '.host'
@@ -253,11 +268,11 @@ varlinkctl call /run/systemd/machine/io.systemd.Machine io.systemd.Machine.List 
 
 pid=$(varlinkctl call /run/systemd/machine/io.systemd.Machine io.systemd.Machine.List '{"name":"long-running"}' | jq '.leader')
 varlinkctl call /run/systemd/machine/io.systemd.Machine io.systemd.Machine.List '{"name":"long-running"}' >/tmp/expected
-varlinkctl call /run/systemd/machine/io.systemd.Machine io.systemd.Machine.List "{\"pid\":$pid}" >/tmp/got
-diff -u /tmp/expected /tmp/got
-
-varlinkctl call /run/systemd/machine/io.systemd.Machine io.systemd.Machine.List "{\"name\":\"long-running\", \"pid\":$pid}"
+varlinkctl call /run/systemd/machine/io.systemd.Machine io.systemd.Machine.List "{\"pid\":$pid}" | diff /tmp/expected -
+varlinkctl call /run/systemd/machine/io.systemd.Machine io.systemd.Machine.List "{\"name\":\"long-running\", \"pid\":$pid}" | diff /tmp/expected -
 (! varlinkctl call /run/systemd/machine/io.systemd.Machine io.systemd.Machine.List "{\"name\":\"non-existent\", \"pid\":$pid}")
+(! varlinkctl call /run/systemd/machine/io.systemd.Machine io.systemd.Machine.List '{"name":""}')
+(! varlinkctl call /run/systemd/machine/io.systemd.Machine io.systemd.Machine.List '{"name":"ah@??.hmm"}')
 
 # test io.systemd.Machine.Kill
 # sending TRAP signal
@@ -265,14 +280,12 @@ rm -f /var/lib/machines/long-running/trap
 varlinkctl call /run/systemd/machine/io.systemd.Machine io.systemd.Machine.Kill '{"name":"long-running", "whom": "leader", "signal": 5}'
 timeout 30 bash -c "until test -e /var/lib/machines/long-running/trap; do sleep .5; done"
 
-# sending KILL signal
-varlinkctl call /run/systemd/machine/io.systemd.Machine io.systemd.Machine.Kill '{"name":"long-running", "signal": 9}'
-timeout 30 bash -c "while varlinkctl call /run/systemd/machine/io.systemd.Machine io.systemd.Machine.List '{\"name\":\"long-running\"}'; do sleep 0.5; done"
-
 # test io.systemd.Machine.Terminate
 long_running_machine_start
+rm -f /var/lib/machines/long-running/terminate
 varlinkctl call /run/systemd/machine/io.systemd.Machine io.systemd.Machine.Terminate '{"name":"long-running"}'
-timeout 120 bash -c "while varlinkctl call /run/systemd/machine/io.systemd.Machine io.systemd.Machine.List '{\"name\":\"long-running\"}'; do sleep 0.5; done"
+timeout 10 bash -c "until test -e /var/lib/machines/long-running/terminate; do sleep .5; done"
+timeout 30 bash -c "while varlinkctl call /run/systemd/machine/io.systemd.Machine io.systemd.Machine.List '{\"name\":\"long-running\"}'; do sleep 0.5; done"
 
 # test io.systemd.Machine.Register
 varlinkctl call /run/systemd/machine/io.systemd.Machine io.systemd.Machine.Register '{"name": "registered-container", "class": "container"}'
@@ -288,3 +301,18 @@ timeout 30 bash -c "until varlinkctl call /run/systemd/machine/io.systemd.Machin
 varlinkctl call /run/systemd/machine/io.systemd.Machine io.systemd.Machine.List '{"name":"registered-container"}' | jq '.sshAddress' | grep -q 'localhost'
 varlinkctl call /run/systemd/machine/io.systemd.Machine io.systemd.Machine.List '{"name":"registered-container"}' | jq '.sshPrivateKeyPath' | grep -q 'non-existent'
 varlinkctl call /run/systemd/machine/io.systemd.Machine io.systemd.Machine.Unregister '{"name": "registered-container"}'
+
+# test io.systemd.MachineImage.List
+varlinkctl --more call /run/systemd/machine/io.systemd.MachineImage io.systemd.MachineImage.List '{}' | grep 'long-running'
+varlinkctl --more call /run/systemd/machine/io.systemd.MachineImage io.systemd.MachineImage.List '{}' | grep '.host'
+varlinkctl call /run/systemd/machine/io.systemd.MachineImage io.systemd.MachineImage.List '{"name":"long-running"}'
+varlinkctl call /run/systemd/machine/io.systemd.MachineImage io.systemd.MachineImage.List '{"name":"long-running", "acquireMetadata": true}' | grep 'OSRelease'
+
+# test io.systemd.MachineImage.Update
+varlinkctl call /run/systemd/machine/io.systemd.MachineImage io.systemd.MachineImage.Update '{"name":"long-running", "newName": "long-running-renamed", "readOnly": true}'
+varlinkctl call /run/systemd/machine/io.systemd.MachineImage io.systemd.MachineImage.List '{"name":"long-running-renamed"}'
+varlinkctl call /run/systemd/machine/io.systemd.MachineImage io.systemd.MachineImage.List '{"name":"long-running-renamed"}' | jq '.readOnly' | grep 'true'
+
+varlinkctl call /run/systemd/machine/io.systemd.MachineImage io.systemd.MachineImage.Update '{"name":"long-running-renamed", "newName": "long-running", "readOnly": false}'
+varlinkctl call /run/systemd/machine/io.systemd.MachineImage io.systemd.MachineImage.List '{"name":"long-running"}'
+varlinkctl call /run/systemd/machine/io.systemd.MachineImage io.systemd.MachineImage.List '{"name":"long-running"}' | jq '.readOnly' | grep 'false'

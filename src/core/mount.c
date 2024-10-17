@@ -1884,7 +1884,7 @@ static int mount_load_proc_self_mountinfo(Manager *m, bool set_flags) {
                 if (!device || !path)
                         continue;
 
-                /* Just to achieve device name uniqueness. Note that the suppresion of the duplicate
+                /* Just to achieve device name uniqueness. Note that the suppression of the duplicate
                  * processing is merely an optimization, hence in case of OOM (unlikely) we'll just process
                  * it twice. */
                 if (set_put_strdup_full(&devices, &path_hash_ops_free, device) != 0)
@@ -1997,6 +1997,7 @@ static void mount_enumerate(Manager *m) {
         mnt_init_debug(0);
 
         if (!m->mount_monitor) {
+                usec_t mount_rate_limit_interval = 1 * USEC_PER_SEC;
                 unsigned mount_rate_limit_burst = 5;
                 int fd;
 
@@ -2038,14 +2039,21 @@ static void mount_enumerate(Manager *m) {
                 }
 
                 /* Let users override the default (5 in 1s), as it stalls the boot sequence on busy systems. */
-                const char *e = secure_getenv("SYSTEMD_DEFAULT_MOUNT_RATE_LIMIT_BURST");
+                const char *e = secure_getenv("SYSTEMD_DEFAULT_MOUNT_RATE_LIMIT_INTERVAL_SEC");
+                if (e) {
+                        r = parse_sec(e, &mount_rate_limit_interval);
+                        if (r < 0)
+                                log_debug_errno(r, "Invalid value in $SYSTEMD_DEFAULT_MOUNT_RATE_LIMIT_INTERVAL_SEC, ignoring: %s", e);
+                }
+
+                e = secure_getenv("SYSTEMD_DEFAULT_MOUNT_RATE_LIMIT_BURST");
                 if (e) {
                         r = safe_atou(e, &mount_rate_limit_burst);
                         if (r < 0)
-                                log_debug("Invalid value in $SYSTEMD_DEFAULT_MOUNT_RATE_LIMIT_BURST, ignoring: %s", e);
+                                log_debug_errno(r, "Invalid value in $SYSTEMD_DEFAULT_MOUNT_RATE_LIMIT_BURST, ignoring: %s", e);
                 }
 
-                r = sd_event_source_set_ratelimit(m->mount_event_source, 1 * USEC_PER_SEC, mount_rate_limit_burst);
+                r = sd_event_source_set_ratelimit(m->mount_event_source, mount_rate_limit_interval, mount_rate_limit_burst);
                 if (r < 0) {
                         log_error_errno(r, "Failed to enable rate limit for mount events: %m");
                         goto fail;

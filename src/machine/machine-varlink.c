@@ -45,25 +45,16 @@ static int machine_name(const char *name, sd_json_variant *variant, sd_json_disp
 static int machine_leader(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
         PidRef *leader = ASSERT_PTR(userdata);
         _cleanup_(pidref_done) PidRef temp = PIDREF_NULL;
-        uint64_t k;
         int r;
 
-        if (!sd_json_variant_is_unsigned(variant))
-                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not an integer.", strna(name));
+        r = json_dispatch_pidref(name, variant, flags, &temp);
+        if (r < 0)
+                return r;
 
-        k = sd_json_variant_unsigned(variant);
-        if (k > PID_T_MAX || !pid_is_valid(k))
-                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not a valid PID.", strna(name));
-
-        if (k == 1)
+        if (temp.pid == 1) /* refuse PID 1 */
                 return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not a valid leader PID.", strna(name));
 
-        r = pidref_set_pid(&temp, k);
-        if (r < 0)
-                return json_log(variant, flags, r, "Failed to pin process " PID_FMT ": %m", leader->pid);
-
         pidref_done(leader);
-
         *leader = TAKE_PIDREF(temp);
 
         return 0;
@@ -108,18 +99,18 @@ static int machine_ifindices(const char *name, sd_json_variant *variant, sd_json
 
 static int machine_cid(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
         unsigned cid, *c = ASSERT_PTR(userdata);
+        int r;
 
         assert(variant);
 
-        if (!sd_json_variant_is_unsigned(variant))
-                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not a string.", strna(name));
+        r = sd_json_dispatch_uint(name, variant, flags, &cid);
+        if (r < 0)
+                return r;
 
-        cid = sd_json_variant_unsigned(variant);
         if (!VSOCK_CID_IS_REGULAR(cid))
                 return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not a regular VSOCK CID.", strna(name));
 
         *c = cid;
-
         return 0;
 }
 
@@ -129,17 +120,17 @@ int vl_method_register(sd_varlink *link, sd_json_variant *parameters, sd_varlink
         int r;
 
         static const sd_json_dispatch_field dispatch_table[] = {
-                { "name",              SD_JSON_VARIANT_STRING,   machine_name,             offsetof(Machine, name),                 SD_JSON_MANDATORY },
-                { "id",                SD_JSON_VARIANT_STRING,   sd_json_dispatch_id128,   offsetof(Machine, id),                   0                 },
-                { "service",           SD_JSON_VARIANT_STRING,   sd_json_dispatch_string,  offsetof(Machine, service),              0                 },
-                { "class",             SD_JSON_VARIANT_STRING,   dispatch_machine_class,   offsetof(Machine, class),                SD_JSON_MANDATORY },
-                { "leader",            SD_JSON_VARIANT_UNSIGNED, machine_leader,           offsetof(Machine, leader),               0                 },
-                { "rootDirectory",     SD_JSON_VARIANT_STRING,   json_dispatch_path,       offsetof(Machine, root_directory),       0                 },
-                { "ifIndices",         SD_JSON_VARIANT_ARRAY,    machine_ifindices,        0,                                       0                 },
-                { "vSockCid",          SD_JSON_VARIANT_UNSIGNED, machine_cid,              offsetof(Machine, vsock_cid),            0                 },
-                { "sshAddress",        SD_JSON_VARIANT_STRING,   sd_json_dispatch_string,  offsetof(Machine, ssh_address),          SD_JSON_STRICT    },
-                { "sshPrivateKeyPath", SD_JSON_VARIANT_STRING,   json_dispatch_path,       offsetof(Machine, ssh_private_key_path), 0                 },
-                { "allocateUnit",      SD_JSON_VARIANT_BOOLEAN,  sd_json_dispatch_stdbool, offsetof(Machine, allocate_unit),        0                 },
+                { "name",              SD_JSON_VARIANT_STRING,        machine_name,             offsetof(Machine, name),                 SD_JSON_MANDATORY },
+                { "id",                SD_JSON_VARIANT_STRING,        sd_json_dispatch_id128,   offsetof(Machine, id),                   0                 },
+                { "service",           SD_JSON_VARIANT_STRING,        sd_json_dispatch_string,  offsetof(Machine, service),              0                 },
+                { "class",             SD_JSON_VARIANT_STRING,        dispatch_machine_class,   offsetof(Machine, class),                SD_JSON_MANDATORY },
+                { "leader",            _SD_JSON_VARIANT_TYPE_INVALID, machine_leader,           offsetof(Machine, leader),               SD_JSON_STRICT    },
+                { "rootDirectory",     SD_JSON_VARIANT_STRING,        json_dispatch_path,       offsetof(Machine, root_directory),       0                 },
+                { "ifIndices",         SD_JSON_VARIANT_ARRAY,         machine_ifindices,        0,                                       0                 },
+                { "vSockCid",          _SD_JSON_VARIANT_TYPE_INVALID, machine_cid,              offsetof(Machine, vsock_cid),            0                 },
+                { "sshAddress",        SD_JSON_VARIANT_STRING,        sd_json_dispatch_string,  offsetof(Machine, ssh_address),          SD_JSON_STRICT    },
+                { "sshPrivateKeyPath", SD_JSON_VARIANT_STRING,        json_dispatch_path,       offsetof(Machine, ssh_private_key_path), 0                 },
+                { "allocateUnit",      SD_JSON_VARIANT_BOOLEAN,       sd_json_dispatch_stdbool, offsetof(Machine, allocate_unit),        0                 },
                 VARLINK_DISPATCH_POLKIT_FIELD,
                 {}
         };
@@ -209,29 +200,25 @@ static int lookup_machine_by_name(sd_varlink *link, Manager *manager, const char
         return 0;
 }
 
-static int lookup_machine_by_pid(sd_varlink *link, Manager *manager, pid_t pid, Machine **ret_machine) {
+static int lookup_machine_by_pidref(sd_varlink *link, Manager *manager, const PidRef *pidref, Machine **ret_machine) {
+        _cleanup_(pidref_done) PidRef peer = PIDREF_NULL;
         Machine *machine;
         int r;
 
         assert(link);
         assert(manager);
         assert(ret_machine);
-        assert_cc(sizeof(pid_t) == sizeof(uint32_t));
 
-        if (pid == 0) {
-                int pidfd = sd_varlink_get_peer_pidfd(link);
-                if (pidfd < 0)
-                        return log_debug_errno(pidfd, "Failed to get peer pidfd: %m");
-
-                r = pidfd_get_pid(pidfd, &pid);
+        if (pidref_is_automatic(pidref)) {
+                r = varlink_get_peer_pidref(link, &peer);
                 if (r < 0)
-                        return log_debug_errno(r, "Failed to get pid from pidfd: %m");
-        }
+                        return log_debug_errno(r, "Failed to get peer pidref: %m");
 
-        if (pid <= 0)
+                pidref = &peer;
+        } else if (!pidref_is_set(pidref))
                 return -EINVAL;
 
-        r = manager_get_machine_by_pid(manager, pid, &machine);
+        r = manager_get_machine_by_pidref(manager, pidref, &machine);
         if (r < 0)
                 return r;
         if (!machine)
@@ -241,13 +228,15 @@ static int lookup_machine_by_pid(sd_varlink *link, Manager *manager, pid_t pid, 
         return 0;
 }
 
-int lookup_machine_by_name_or_pid(sd_varlink *link, Manager *manager, const char *machine_name, pid_t pid, Machine **ret_machine) {
+int lookup_machine_by_name_or_pidref(sd_varlink *link, Manager *manager, const char *machine_name, const PidRef *pidref, Machine **ret_machine) {
         Machine *machine = NULL, *pid_machine = NULL;
         int r;
 
         assert(link);
         assert(manager);
         assert(ret_machine);
+
+        /* This returns 0 on success, 1 on error and it is replied, and a negative errno otherwise. */
 
         if (machine_name) {
                 r = lookup_machine_by_name(link, manager, machine_name, &machine);
@@ -257,8 +246,8 @@ int lookup_machine_by_name_or_pid(sd_varlink *link, Manager *manager, const char
                         return r;
         }
 
-        if (pid >= 0) {
-                r = lookup_machine_by_pid(link, manager, pid, &pid_machine);
+        if (pidref_is_set(pidref) || pidref_is_automatic(pidref)) {
+                r = lookup_machine_by_pidref(link, manager, pidref, &pid_machine);
                 if (r == -EINVAL)
                         return sd_varlink_error_invalid_parameter_name(link, "pid");
                 if (r < 0)
@@ -266,8 +255,8 @@ int lookup_machine_by_name_or_pid(sd_varlink *link, Manager *manager, const char
         }
 
         if (machine && pid_machine && machine != pid_machine)
-                return log_debug_errno(SYNTHETIC_ERRNO(ESRCH), "Search by machine name '%s' and pid %d resulted in two different machines", machine_name, pid);
-        else if (machine)
+                return log_debug_errno(SYNTHETIC_ERRNO(ESRCH), "Search by machine name '%s' and pid " PID_FMT " resulted in two different machines", machine_name, pidref->pid);
+        if (machine)
                 *ret_machine = machine;
         else if (pid_machine)
                 *ret_machine = pid_machine;
@@ -321,24 +310,32 @@ int vl_method_terminate_internal(sd_varlink *link, sd_json_variant *parameters, 
         return sd_varlink_reply(link, NULL);
 }
 
-int vl_method_kill(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
-        struct params {
-                const char *machine_name;
-                pid_t pid;
-                const char *swhom;
-                int32_t signo;
-        };
+typedef struct MachineKillParameters {
+        const char *name;
+        PidRef pidref;
+        const char *swhom;
+        int32_t signo;
+} MachineKillParameters;
 
+static void machine_kill_paramaters_done(MachineKillParameters *p) {
+        assert(p);
+
+        pidref_done(&p->pidref);
+}
+
+int vl_method_kill(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
         static const sd_json_dispatch_field dispatch_table[] = {
-                VARLINK_DISPATCH_MACHINE_LOOKUP_FIELDS(struct params),
-                { "whom",   SD_JSON_VARIANT_STRING,         sd_json_dispatch_const_string, offsetof(struct params, swhom), 0 },
-                { "signal", _SD_JSON_VARIANT_TYPE_INVALID , sd_json_dispatch_int32,        offsetof(struct params, signo), SD_JSON_MANDATORY },
+                VARLINK_DISPATCH_MACHINE_LOOKUP_FIELDS(MachineKillParameters),
+                { "whom",   SD_JSON_VARIANT_STRING,         sd_json_dispatch_const_string, offsetof(MachineKillParameters, swhom), 0                 },
+                { "signal", _SD_JSON_VARIANT_TYPE_INVALID , sd_json_dispatch_signal,       offsetof(MachineKillParameters, signo), SD_JSON_MANDATORY },
                 VARLINK_DISPATCH_POLKIT_FIELD,
                 {}
         };
 
         Manager *manager = ASSERT_PTR(userdata);
-        struct params p = { .pid = -1 };
+        _cleanup_(machine_kill_paramaters_done) MachineKillParameters p = {
+                .pidref = PIDREF_NULL,
+        };
         KillWhom whom;
         int r;
 
@@ -350,10 +347,10 @@ int vl_method_kill(sd_varlink *link, sd_json_variant *parameters, sd_varlink_met
                 return r;
 
         Machine *machine;
-        r = lookup_machine_by_name_or_pid(link, manager, p.machine_name, p.pid, &machine);
+        r = lookup_machine_by_name_or_pidref(link, manager, p.name, &p.pidref, &machine);
         if (r == -ESRCH)
                 return sd_varlink_error(link, "io.systemd.Machine.NoSuchMachine", NULL);
-        if (r < 0)
+        if (r != 0)
                 return r;
 
         if (isempty(p.swhom))
@@ -363,9 +360,6 @@ int vl_method_kill(sd_varlink *link, sd_json_variant *parameters, sd_varlink_met
                 if (whom < 0)
                         return sd_varlink_error_invalid_parameter_name(link, "whom");
         }
-
-        if (!SIGNAL_VALID(p.signo))
-                return sd_varlink_error_invalid_parameter_name(link, "signal");
 
         r = varlink_verify_polkit_async(
                         link,

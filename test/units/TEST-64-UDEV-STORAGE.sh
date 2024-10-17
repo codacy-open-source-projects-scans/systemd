@@ -219,6 +219,7 @@ testcase_nvme_basic() {
     for i in "${expected_symlinks[@]}"; do
         udevadm wait --settle --timeout=30 "$i"
     done
+    test ! -e /dev/disk/by-id/nvme-QEMU_NVMe_Ctrl_deadbeef
 
     lsblk --noheadings | grep "^nvme"
     [[ "$(lsblk --noheadings | grep -c "^nvme")" -ge 20 ]]
@@ -227,7 +228,6 @@ testcase_nvme_basic() {
 testcase_nvme_subsystem() {
     local expected_symlinks=(
         # Controller(s)
-        /dev/disk/by-id/nvme-QEMU_NVMe_Ctrl_deadbeef
         /dev/disk/by-id/nvme-QEMU_NVMe_Ctrl_deadbeef_16
         /dev/disk/by-id/nvme-QEMU_NVMe_Ctrl_deadbeef_17
         # Shared namespaces
@@ -290,15 +290,21 @@ label: gpt
 name="first_partition", size=5M
 uuid="deadbeef-dead-dead-beef-000000000000", name="failover_part", size=5M
 EOF
+    # Partitioning triggers a synthesized event. Wait for the event being finished.
     udevadm settle
+
     udevadm lock --device /dev/disk/by-id/wwn-0xdeaddeadbeef0000-part2 \
             mkfs.ext4 -U "deadbeef-dead-dead-beef-111111111111" -L "failover_vol" /dev/disk/by-id/wwn-0xdeaddeadbeef0000-part2
+    # Making filesystem triggers a synthesized event. Wait for the event being finished.
+    udevadm settle
 
     modprobe -v dm_multipath
     systemctl start multipathd.service
     systemctl status multipathd.service
-    multipath -ll
+    # multipathd touches many devices on start. multipath command may fail if it is invoked before the
+    # initial setup finished. Let's wait for a while.
     udevadm settle
+    multipath -ll
     ls -l /dev/disk/by-id/
 
     for i in {0..15}; do

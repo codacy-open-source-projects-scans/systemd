@@ -868,6 +868,7 @@ global:
         sd_json_dispatch_uint32;
         sd_json_dispatch_uint64;
         sd_json_dispatch_uint8;
+        sd_json_dispatch_signal;
         sd_json_dispatch_unsupported;
         sd_json_dispatch_variant;
         sd_json_dispatch_variant_noref;
@@ -974,6 +975,7 @@ global:
         sd_varlink_error_errno;
         sd_varlink_error_invalid_parameter;
         sd_varlink_error_invalid_parameter_name;
+        sd_varlink_error_is_invalid_parameter;
         sd_varlink_error_to_errno;
         sd_varlink_errorb;
         sd_varlink_flush;

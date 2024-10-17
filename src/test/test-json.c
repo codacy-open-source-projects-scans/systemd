@@ -17,6 +17,7 @@
 #include "string-util.h"
 #include "strv.h"
 #include "tests.h"
+#include "tmpfile-util.h"
 
 static void test_tokenizer_one(const char *data, ...) {
         unsigned line = 0, column = 0;
@@ -1262,6 +1263,160 @@ TEST(parse_continue) {
 
         assert_se(isempty(p));
         assert_se(sd_json_parse_with_source_continue(&p, "piff", /* flags= */ 0, &x, &line, &column) == -EINVAL);
+}
+
+TEST(pidref) {
+        _cleanup_(pidref_done) PidRef myself = PIDREF_NULL, pid1 = PIDREF_NULL;
+
+        assert_se(pidref_set_pid(&myself, 0) >= 0);
+        assert_se(pidref_set_pid(&pid1, 1) >= 0);
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+        sd_id128_t randomized_boot_id;
+        assert_se(sd_id128_randomize(&randomized_boot_id) >= 0);
+        assert_se(sd_json_buildo(&v,
+                                 JSON_BUILD_PAIR_PIDREF("myself", &myself),
+                                 JSON_BUILD_PAIR_PIDREF("pid1", &pid1),
+                                 SD_JSON_BUILD_PAIR("remote", SD_JSON_BUILD_OBJECT(SD_JSON_BUILD_PAIR_UNSIGNED("pid", 1),
+                                                                                   SD_JSON_BUILD_PAIR_UNSIGNED("pidfdId", 4711),
+                                                                                   SD_JSON_BUILD_PAIR_ID128("bootId", randomized_boot_id))),
+                                 SD_JSON_BUILD_PAIR("automatic", SD_JSON_BUILD_OBJECT(SD_JSON_BUILD_PAIR_UNSIGNED("pid", 0)))) >= 0);
+
+        sd_json_variant_dump(v, SD_JSON_FORMAT_COLOR|SD_JSON_FORMAT_PRETTY, NULL, NULL);
+
+        struct {
+                PidRef myself, pid1, remote, automatic;
+        } data = {
+                .myself = PIDREF_NULL,
+                .pid1 = PIDREF_NULL,
+                .remote = PIDREF_NULL,
+                .automatic = PIDREF_NULL,
+        };
+
+        assert_se(sd_json_dispatch(
+                                  v,
+                                  (const sd_json_dispatch_field[]) {
+                                          { "myself",    _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_pidref, voffsetof(data, myself),    SD_JSON_STRICT },
+                                          { "pid1",      _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_pidref, voffsetof(data, pid1),      SD_JSON_STRICT },
+                                          { "remote",    _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_pidref, voffsetof(data, remote),    0              },
+                                          { "automatic", _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_pidref, voffsetof(data, automatic), SD_JSON_RELAX  },
+                                          {},
+                                  },
+                                  /* flags= */ 0,
+                                  &data) >= 0);
+
+        assert_se(pidref_equal(&myself, &data.myself));
+        assert_se(pidref_equal(&pid1, &data.pid1));
+
+        assert_se(!pidref_equal(&myself, &data.pid1));
+        assert_se(!pidref_equal(&pid1, &data.myself));
+        assert_se(!pidref_equal(&myself, &data.remote));
+        assert_se(!pidref_equal(&pid1, &data.remote));
+
+        assert_se((myself.fd_id > 0) == (data.myself.fd_id > 0));
+        assert_se((pid1.fd_id > 0) == (data.pid1.fd_id > 0));
+
+        assert_se(!pidref_is_set(&data.automatic));
+        assert_se(pidref_is_automatic(&data.automatic));
+        assert_se(pidref_is_set(&data.remote));
+        assert_se(pidref_is_remote(&data.remote));
+
+        pidref_done(&data.myself);
+        pidref_done(&data.pid1);
+        pidref_done(&data.remote);
+}
+
+TEST(devnum) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+        dev_t dev = makedev(123, 456), parsed;
+
+        ASSERT_OK(json_variant_new_devnum(&v, dev));
+        ASSERT_OK(sd_json_variant_dump(v, SD_JSON_FORMAT_PRETTY_AUTO | SD_JSON_FORMAT_COLOR_AUTO, NULL, NULL));
+        ASSERT_OK(json_dispatch_devnum("devnum", v, /* flags= */ 0, &parsed));
+        ASSERT_EQ(major(parsed), major(dev));
+        ASSERT_EQ(minor(parsed), minor(dev));
+        v = sd_json_variant_unref(v);
+
+        dev = makedev(1 << 12, 456);
+        ASSERT_OK(json_variant_new_devnum(&v, dev));
+        ASSERT_OK(sd_json_variant_dump(v, SD_JSON_FORMAT_PRETTY_AUTO | SD_JSON_FORMAT_COLOR_AUTO, NULL, NULL));
+        ASSERT_FAIL(json_dispatch_devnum("devnum", v, /* flags= */ 0, &parsed));
+        v = sd_json_variant_unref(v);
+
+        dev = makedev(123, 1 << 20);
+        ASSERT_OK(json_variant_new_devnum(&v, dev));
+        ASSERT_OK(sd_json_variant_dump(v, SD_JSON_FORMAT_PRETTY_AUTO | SD_JSON_FORMAT_COLOR_AUTO, NULL, NULL));
+        ASSERT_FAIL(json_dispatch_devnum("devnum", v, /* flags= */ 0, &parsed));
+}
+
+TEST(fd_info) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+        _cleanup_close_ int fd = -EBADF;
+
+        /* directories */
+        ASSERT_OK(json_variant_new_fd_info(&v, AT_FDCWD));
+        ASSERT_OK(sd_json_variant_dump(v, SD_JSON_FORMAT_PRETTY_AUTO | SD_JSON_FORMAT_COLOR_AUTO, NULL, NULL));
+        v = sd_json_variant_unref(v);
+
+        ASSERT_OK_ERRNO(fd = openat(AT_FDCWD, ".", O_CLOEXEC | O_DIRECTORY | O_PATH));
+        ASSERT_OK(json_variant_new_fd_info(&v, fd));
+        ASSERT_OK(sd_json_variant_dump(v, SD_JSON_FORMAT_PRETTY_AUTO | SD_JSON_FORMAT_COLOR_AUTO, NULL, NULL));
+        v = sd_json_variant_unref(v);
+        fd = safe_close(fd);
+
+        /* regular file */
+        ASSERT_OK(fd = open_tmpfile_unlinkable(NULL, O_RDWR));
+        ASSERT_OK(json_variant_new_fd_info(&v, fd));
+        ASSERT_OK(sd_json_variant_dump(v, SD_JSON_FORMAT_PRETTY_AUTO | SD_JSON_FORMAT_COLOR_AUTO, NULL, NULL));
+        v = sd_json_variant_unref(v);
+        fd = safe_close(fd);
+
+        fd = open("/sys/class/net/lo/uevent", O_CLOEXEC | O_PATH);
+        if (fd >= 0) {
+                ASSERT_OK(json_variant_new_fd_info(&v, fd));
+                ASSERT_OK(sd_json_variant_dump(v, SD_JSON_FORMAT_PRETTY_AUTO | SD_JSON_FORMAT_COLOR_AUTO, NULL, NULL));
+                v = sd_json_variant_unref(v);
+                fd = safe_close(fd);
+        }
+
+        /* block device */
+        fd = open("/dev/sda", O_CLOEXEC | O_PATH);
+        if (fd >= 0) {
+                ASSERT_OK(json_variant_new_fd_info(&v, fd));
+                ASSERT_OK(sd_json_variant_dump(v, SD_JSON_FORMAT_PRETTY_AUTO | SD_JSON_FORMAT_COLOR_AUTO, NULL, NULL));
+                v = sd_json_variant_unref(v);
+                fd = safe_close(fd);
+        }
+
+        /* stream */
+        ASSERT_OK(json_variant_new_fd_info(&v, fileno(stdout)));
+        ASSERT_OK(sd_json_variant_dump(v, SD_JSON_FORMAT_PRETTY_AUTO | SD_JSON_FORMAT_COLOR_AUTO, NULL, NULL));
+        v = sd_json_variant_unref(v);
+
+        /* socket */
+        ASSERT_OK_ERRNO(fd = socket(AF_INET, SOCK_DGRAM, 0));
+        ASSERT_OK(json_variant_new_fd_info(&v, fd));
+        ASSERT_OK(sd_json_variant_dump(v, SD_JSON_FORMAT_PRETTY_AUTO | SD_JSON_FORMAT_COLOR_AUTO, NULL, NULL));
+        v = sd_json_variant_unref(v);
+        fd = safe_close(fd);
+
+        /* pidfd */
+        ASSERT_OK(pidref_set_pid(&pidref, 0));
+        if (pidref.fd >= 0) {
+                ASSERT_OK(json_variant_new_fd_info(&v, pidref.fd));
+                ASSERT_OK(sd_json_variant_dump(v, SD_JSON_FORMAT_PRETTY_AUTO | SD_JSON_FORMAT_COLOR_AUTO, NULL, NULL));
+                v = sd_json_variant_unref(v);
+        }
+        pidref_done(&pidref);
+
+        ASSERT_OK(pidref_set_pid(&pidref, 1));
+        if (pidref.fd >= 0) {
+                ASSERT_OK(json_variant_new_fd_info(&v, pidref.fd));
+                ASSERT_OK(sd_json_variant_dump(v, SD_JSON_FORMAT_PRETTY_AUTO | SD_JSON_FORMAT_COLOR_AUTO, NULL, NULL));
+                v = sd_json_variant_unref(v);
+        }
+        pidref_done(&pidref);
 }
 
 DEFINE_TEST_MAIN(LOG_DEBUG);

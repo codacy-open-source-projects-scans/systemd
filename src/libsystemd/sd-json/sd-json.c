@@ -29,7 +29,9 @@
 #include "memory-util.h"
 #include "memstream-util.h"
 #include "path-util.h"
+#include "process-util.h"
 #include "set.h"
+#include "signal-util.h"
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
@@ -4194,6 +4196,62 @@ _public_ int sd_json_buildv(sd_json_variant **ret, va_list ap) {
                         break;
                 }
 
+                case _JSON_BUILD_PIDREF: {
+                        PidRef *pidref;
+
+                        if (!IN_SET(current->expect, EXPECT_TOPLEVEL, EXPECT_OBJECT_VALUE, EXPECT_ARRAY_ELEMENT)) {
+                                r = -EINVAL;
+                                goto finish;
+                        }
+
+                        pidref = va_arg(ap, PidRef*);
+
+                        if (current->n_suppress == 0) {
+                                r = json_variant_new_pidref(&add, pidref);
+                                if (r < 0)
+                                        goto finish;
+                        }
+
+                        n_subtract = 1;
+
+                        if (current->expect == EXPECT_TOPLEVEL)
+                                current->expect = EXPECT_END;
+                        else if (current->expect == EXPECT_OBJECT_VALUE)
+                                current->expect = EXPECT_OBJECT_KEY;
+                        else
+                                assert(current->expect == EXPECT_ARRAY_ELEMENT);
+
+                        break;
+                }
+
+                case _JSON_BUILD_DEVNUM: {
+                        dev_t devnum;
+
+                        if (!IN_SET(current->expect, EXPECT_TOPLEVEL, EXPECT_OBJECT_VALUE, EXPECT_ARRAY_ELEMENT)) {
+                                r = -EINVAL;
+                                goto finish;
+                        }
+
+                        devnum = va_arg(ap, dev_t);
+
+                        if (current->n_suppress == 0) {
+                                r = json_variant_new_devnum(&add, devnum);
+                                if (r < 0)
+                                        goto finish;
+                        }
+
+                        n_subtract = 1;
+
+                        if (current->expect == EXPECT_TOPLEVEL)
+                                current->expect = EXPECT_END;
+                        else if (current->expect == EXPECT_OBJECT_VALUE)
+                                current->expect = EXPECT_OBJECT_KEY;
+                        else
+                                assert(current->expect == EXPECT_ARRAY_ELEMENT);
+
+                        break;
+                }
+
                 case _JSON_BUILD_TRISTATE: {
                         int tristate;
 
@@ -4764,6 +4822,34 @@ _public_ int sd_json_buildv(sd_json_variant **ret, va_list ap) {
                         }
 
                         n_subtract = 2; /* we generated two item */
+
+                        current->expect = EXPECT_OBJECT_KEY;
+                        break;
+                }
+
+                case _JSON_BUILD_PAIR_PIDREF_NON_NULL: {
+                        PidRef *p;
+                        const char *n;
+
+                        if (current->expect != EXPECT_OBJECT_KEY) {
+                                r = -EINVAL;
+                                goto finish;
+                        }
+
+                        n = va_arg(ap, const char*);
+                        p = va_arg(ap, PidRef*);
+
+                        if (pidref_is_set(p) && current->n_suppress == 0) {
+                                r = sd_json_variant_new_string(&add, n);
+                                if (r < 0)
+                                        goto finish;
+
+                                r = json_variant_new_pidref(&add_more, p);
+                                if (r < 0)
+                                        goto finish;
+                        }
+
+                        n_subtract = 2; /* we generated two items */
 
                         current->expect = EXPECT_OBJECT_KEY;
                         break;
@@ -5524,6 +5610,29 @@ _public_ int sd_json_dispatch_id128(const char *name, sd_json_variant *variant, 
         if (r < 0)
                 return json_log(variant, flags, r, "JSON field '%s' is not a valid UID.", strna(name));
 
+        return 0;
+}
+
+_public_ int sd_json_dispatch_signal(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        int *signo = userdata;
+        uint32_t k;
+        int r;
+
+        assert_return(variant, -EINVAL);
+
+        if (sd_json_variant_is_null(variant)) {
+                *signo = SIGNO_INVALID;
+                return 0;
+        }
+
+        r = sd_json_dispatch_uint32(name, variant, flags, &k);
+        if (r < 0)
+                return r;
+
+        if (!SIGNAL_VALID(k))
+                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not a valid signal.", strna(name));
+
+        *signo = k;
         return 0;
 }
 
