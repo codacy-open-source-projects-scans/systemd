@@ -297,7 +297,7 @@ static int dhcp6_request_hostname(Link *link) {
         return 0;
 }
 
-static int dhcp6_lease_acquired(sd_dhcp6_client *client, Link *link) {
+static int dhcp6_lease_ip_acquired(sd_dhcp6_client *client, Link *link) {
         _cleanup_(sd_dhcp6_lease_unrefp) sd_dhcp6_lease *lease_old = NULL;
         sd_dhcp6_lease *lease;
         int r;
@@ -341,6 +341,22 @@ static int dhcp6_lease_acquired(sd_dhcp6_client *client, Link *link) {
                 link_set_state(link, LINK_STATE_CONFIGURING);
 
         link_check_ready(link);
+        return 0;
+}
+
+static int dhcp6_lease_information_acquired(sd_dhcp6_client *client, Link *link) {
+        sd_dhcp6_lease *lease;
+        int r;
+
+        assert(client);
+        assert(link);
+
+        r = sd_dhcp6_client_get_lease(client, &lease);
+        if (r < 0)
+                return log_link_error_errno(link, r, "Failed to get DHCPv6 lease: %m");
+
+        unref_and_replace_full(link->dhcp6_lease, lease, sd_dhcp6_lease_ref, sd_dhcp6_lease_unref);
+
         link_dirty(link);
         return 0;
 }
@@ -385,8 +401,11 @@ static void dhcp6_handler(sd_dhcp6_client *client, int event, void *userdata) {
                 break;
 
         case SD_DHCP6_CLIENT_EVENT_IP_ACQUIRE:
+                r = dhcp6_lease_ip_acquired(client, link);
+                break;
+
         case SD_DHCP6_CLIENT_EVENT_INFORMATION_REQUEST:
-                r = dhcp6_lease_acquired(client, link);
+                r = dhcp6_lease_information_acquired(client, link);
                 break;
 
         default:
@@ -639,6 +658,12 @@ static int dhcp6_configure(Link *link) {
                 r = sd_dhcp6_client_set_request_option(client, SD_DHCP6_OPTION_DOMAIN);
                 if (r < 0)
                         return log_link_debug_errno(link, r, "DHCPv6 CLIENT: Failed to request domains: %m");
+        }
+
+        if (link_get_use_dnr(link, NETWORK_CONFIG_SOURCE_DHCP6)) {
+                r = sd_dhcp6_client_set_request_option(client, SD_DHCP6_OPTION_V6_DNR);
+                if (r < 0)
+                        return log_link_debug_errno(link, r, "DHCPv6 CLIENT: Failed to request DNR: %m");
         }
 
         if (link->network->dhcp6_use_captive_portal > 0) {
