@@ -66,7 +66,7 @@ int logind_reboot(enum action a) {
         if (!actions[a])
                 return -EINVAL;
 
-        r = acquire_bus(BUS_FULL, &bus);
+        r = acquire_bus_full(BUS_FULL, /* graceful = */ true, &bus);
         if (r < 0)
                 return r;
 
@@ -151,7 +151,10 @@ int logind_check_inhibitors(enum action a) {
         if (arg_transport != BUS_TRANSPORT_LOCAL)
                 return 0;
 
-        r = acquire_bus(BUS_FULL, &bus);
+        r = acquire_bus_full(BUS_FULL, /* graceful = */ true, &bus);
+        if (r == -ECONNREFUSED && geteuid() == 0)
+                return 0; /* When D-Bus is not running, allow root to force a shutdown. E.g. when running at
+                           * the emergency console. */
         if (r < 0)
                 return r;
 
@@ -203,6 +206,10 @@ int logind_check_inhibitors(enum action a) {
         r = sd_bus_message_exit_container(reply);
         if (r < 0)
                 return bus_log_parse_error(r);
+
+        /* root respects inhibitors since v257 but keeps ignoring sessions by default */
+        if (arg_check_inhibitors < 0 && c == 0 && geteuid() == 0)
+                return 0;
 
         /* Check for current sessions */
         sd_get_sessions(&sessions);

@@ -2089,7 +2089,7 @@ static int mount_partition(
                                 (void) fs_grow(node, -EBADF, p);
 
                         if (userns_fd >= 0) {
-                                r = remount_idmap_fd(STRV_MAKE(p), userns_fd);
+                                r = remount_idmap_fd(STRV_MAKE(p), userns_fd, /* extra_mount_attr_set= */ 0);
                                 if (r < 0)
                                         return r;
                         }
@@ -3522,7 +3522,7 @@ int dissected_image_acquire_metadata(
                         r = detach_mount_namespace_userns(userns_fd);
                 if (r < 0) {
                         log_debug_errno(r, "Failed to detach mount namespace: %m");
-                        goto inner_fail;
+                        report_errno_and_exit(error_pipe[1], r);
                 }
 
                 r = dissected_image_mount(
@@ -3537,7 +3537,7 @@ int dissected_image_acquire_metadata(
                                 DISSECT_IMAGE_USR_NO_ROOT);
                 if (r < 0) {
                         log_debug_errno(r, "Failed to mount dissected image: %m");
-                        goto inner_fail;
+                        report_errno_and_exit(error_pipe[1], r);
                 }
 
                 for (unsigned k = 0; k < _META_MAX; k++) {
@@ -3609,7 +3609,7 @@ int dissected_image_acquire_metadata(
 
                                 r = loop_write(fds[2*k+1], &found, sizeof(found));
                                 if (r < 0)
-                                        goto inner_fail;
+                                        report_errno_and_exit(error_pipe[1], r);
 
                                 goto next;
                         }
@@ -3629,18 +3629,13 @@ int dissected_image_acquire_metadata(
 
                         r = copy_bytes(fd, fds[2*k+1], UINT64_MAX, 0);
                         if (r < 0)
-                                goto inner_fail;
+                                report_errno_and_exit(error_pipe[1], r);
 
                 next:
                         fds[2*k+1] = safe_close(fds[2*k+1]);
                 }
 
                 _exit(EXIT_SUCCESS);
-
-        inner_fail:
-                /* Let parent know the error */
-                (void) write(error_pipe[1], &r, sizeof(r));
-                _exit(EXIT_FAILURE);
         }
 
         error_pipe[1] = safe_close(error_pipe[1]);
@@ -4276,7 +4271,6 @@ int mountfsd_mount_image(
         _cleanup_close_ int image_fd = -EBADF;
         _cleanup_(sd_varlink_unrefp) sd_varlink *vl = NULL;
         _cleanup_free_ char *ps = NULL;
-        unsigned max_fd = UINT_MAX;
         const char *error_id;
         int r;
 
@@ -4370,9 +4364,6 @@ int mountfsd_mount_image(
                         return log_error_errno(r, "Failed to parse partition data: %m");
 
                 if (pp.fsmount_fd_idx != UINT_MAX) {
-                        if (max_fd == UINT_MAX || pp.fsmount_fd_idx > max_fd)
-                                max_fd = pp.fsmount_fd_idx;
-
                         fsmount_fd = sd_varlink_take_fd(vl, pp.fsmount_fd_idx);
                         if (fsmount_fd < 0)
                                 return fsmount_fd;

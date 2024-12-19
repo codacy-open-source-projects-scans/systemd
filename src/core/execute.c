@@ -210,6 +210,56 @@ bool exec_needs_ipc_namespace(const ExecContext *context) {
         return context->private_ipc || context->ipc_namespace_path;
 }
 
+static bool can_apply_cgroup_namespace(const ExecContext *context, const ExecParameters *params) {
+        return cg_all_unified() > 0 && ns_type_supported(NAMESPACE_CGROUP);
+}
+
+static bool needs_cgroup_namespace(ProtectControlGroups i) {
+        return IN_SET(i, PROTECT_CONTROL_GROUPS_PRIVATE, PROTECT_CONTROL_GROUPS_STRICT);
+}
+
+ProtectControlGroups exec_get_protect_control_groups(const ExecContext *context, const ExecParameters *params) {
+        assert(context);
+
+        /* If cgroup namespace is configured via ProtectControlGroups=private or strict but we can't actually
+         * use cgroup namespace, either from not having unified hierarchy or kernel support, we ignore the
+         * setting and do not unshare the namespace. ProtectControlGroups=private and strict get downgraded
+         * to no and yes respectively. This ensures that strict always gets a read-only mount of /sys/fs/cgroup.
+         *
+         * TODO: Remove fallback once cgroupv1 support is removed in v258. */
+        if (needs_cgroup_namespace(context->protect_control_groups) && !can_apply_cgroup_namespace(context, params)) {
+                if (context->protect_control_groups == PROTECT_CONTROL_GROUPS_PRIVATE)
+                        return PROTECT_CONTROL_GROUPS_NO;
+                if (context->protect_control_groups == PROTECT_CONTROL_GROUPS_STRICT)
+                        return PROTECT_CONTROL_GROUPS_YES;
+        }
+        return context->protect_control_groups;
+}
+
+bool exec_needs_cgroup_namespace(const ExecContext *context, const ExecParameters *params) {
+        assert(context);
+
+        return needs_cgroup_namespace(exec_get_protect_control_groups(context, params));
+}
+
+bool exec_needs_cgroup_mount(const ExecContext *context, const ExecParameters *params) {
+        assert(context);
+
+        return exec_get_protect_control_groups(context, params) != PROTECT_CONTROL_GROUPS_NO;
+}
+
+bool exec_is_cgroup_mount_read_only(const ExecContext *context, const ExecParameters *params) {
+        assert(context);
+
+        return IN_SET(exec_get_protect_control_groups(context, params), PROTECT_CONTROL_GROUPS_YES, PROTECT_CONTROL_GROUPS_STRICT);
+}
+
+bool exec_needs_pid_namespace(const ExecContext *context) {
+        assert(context);
+
+        return context->private_pids != PRIVATE_PIDS_NO && ns_type_supported(NAMESPACE_PID);
+}
+
 bool exec_needs_mount_namespace(
                 const ExecContext *context,
                 const ExecParameters *params,
@@ -259,10 +309,11 @@ bool exec_needs_mount_namespace(
             context->protect_kernel_tunables ||
             context->protect_kernel_modules ||
             context->protect_kernel_logs ||
-            context->protect_control_groups ||
+            exec_needs_cgroup_mount(context, params) ||
             context->protect_proc != PROTECT_PROC_DEFAULT ||
             context->proc_subset != PROC_SUBSET_ALL ||
-            exec_needs_ipc_namespace(context))
+            exec_needs_ipc_namespace(context) ||
+            exec_needs_pid_namespace(context))
                 return true;
 
         if (context->root_directory) {
@@ -287,7 +338,34 @@ bool exec_needs_mount_namespace(
         if (exec_context_get_effective_bind_log_sockets(context))
                 return true;
 
+        for (ExecDirectoryType t = 0; t < _EXEC_DIRECTORY_TYPE_MAX; t++)
+                FOREACH_ARRAY(i, context->directories[t].items, context->directories[t].n_items)
+                        if (FLAGS_SET(i->flags, EXEC_DIRECTORY_READ_ONLY))
+                                return true;
+
         return false;
+}
+
+const char* exec_get_private_notify_socket_path(const ExecContext *context, const ExecParameters *params, bool needs_sandboxing) {
+        assert(context);
+        assert(params);
+
+        if (!params->notify_socket)
+                return NULL;
+
+        if (!needs_sandboxing)
+                return NULL;
+
+        if (!context->root_directory && !context->root_image)
+                return NULL;
+
+        if (!exec_context_get_effective_mount_apivfs(context))
+                return NULL;
+
+        if (!FLAGS_SET(params->flags, EXEC_APPLY_CHROOT))
+                return NULL;
+
+        return "/run/host/notify";
 }
 
 bool exec_directory_is_private(const ExecContext *context, ExecDirectoryType type) {
@@ -296,7 +374,7 @@ bool exec_directory_is_private(const ExecContext *context, ExecDirectoryType typ
         if (!context->dynamic_user)
                 return false;
 
-        if (type == EXEC_DIRECTORY_CONFIGURATION)
+        if (!EXEC_DIRECTORY_TYPE_SHALL_CHOWN(type))
                 return false;
 
         if (type == EXEC_DIRECTORY_RUNTIME && context->runtime_directory_preserve_mode == EXEC_PRESERVE_NO)
@@ -438,8 +516,9 @@ int exec_spawn(
         if (r < 0)
                 return log_unit_error_errno(unit, r, "Failed to serialize parameters: %m");
 
-        if (fseeko(f, 0, SEEK_SET) < 0)
-                return log_unit_error_errno(unit, errno, "Failed to reseek on serialization stream: %m");
+        r = finish_serialization_file(f);
+        if (r < 0)
+                return log_unit_error_errno(unit, r, "Failed to finish serialization stream: %m");
 
         r = fd_cloexec(fileno(f), false);
         if (r < 0)
@@ -616,6 +695,7 @@ void exec_context_done(ExecContext *c) {
 
         c->syscall_filter = hashmap_free(c->syscall_filter);
         c->syscall_archs = set_free(c->syscall_archs);
+        c->syscall_log = hashmap_free(c->syscall_log);
         c->address_families = set_free(c->address_families);
 
         FOREACH_ARRAY(d, c->directories, _EXEC_DIRECTORY_TYPE_MAX)
@@ -644,6 +724,8 @@ void exec_context_done(ExecContext *c) {
         c->root_image_policy = image_policy_free(c->root_image_policy);
         c->mount_image_policy = image_policy_free(c->mount_image_policy);
         c->extension_image_policy = image_policy_free(c->extension_image_policy);
+
+        c->private_hostname = mfree(c->private_hostname);
 }
 
 int exec_context_destroy_runtime_directory(const ExecContext *c, const char *runtime_prefix) {
@@ -977,6 +1059,7 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
                 "%sProtectControlGroups: %s\n"
                 "%sPrivateNetwork: %s\n"
                 "%sPrivateUsers: %s\n"
+                "%sPrivatePIDs: %s\n"
                 "%sProtectHome: %s\n"
                 "%sProtectSystem: %s\n"
                 "%sMountAPIVFS: %s\n"
@@ -986,7 +1069,7 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
                 "%sRestrictRealtime: %s\n"
                 "%sRestrictSUIDSGID: %s\n"
                 "%sKeyringMode: %s\n"
-                "%sProtectHostname: %s\n"
+                "%sProtectHostname: %s%s%s\n"
                 "%sProtectProc: %s\n"
                 "%sProcSubset: %s\n",
                 prefix, c->umask,
@@ -1000,9 +1083,10 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
                 prefix, yes_no(c->protect_kernel_modules),
                 prefix, yes_no(c->protect_kernel_logs),
                 prefix, yes_no(c->protect_clock),
-                prefix, yes_no(c->protect_control_groups),
+                prefix, protect_control_groups_to_string(c->protect_control_groups),
                 prefix, yes_no(c->private_network),
                 prefix, private_users_to_string(c->private_users),
+                prefix, private_pids_to_string(c->private_pids),
                 prefix, protect_home_to_string(c->protect_home),
                 prefix, protect_system_to_string(c->protect_system),
                 prefix, yes_no(exec_context_get_effective_mount_apivfs(c)),
@@ -1012,7 +1096,7 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
                 prefix, yes_no(c->restrict_realtime),
                 prefix, yes_no(c->restrict_suid_sgid),
                 prefix, exec_keyring_mode_to_string(c->keyring_mode),
-                prefix, yes_no(c->protect_hostname),
+                prefix, protect_hostname_to_string(c->protect_hostname), c->private_hostname ? ":" : "", strempty(c->private_hostname),
                 prefix, protect_proc_to_string(c->protect_proc),
                 prefix, proc_subset_to_string(c->proc_subset));
 
@@ -1074,7 +1158,12 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
                 fprintf(f, "%s%sMode: %04o\n", prefix, exec_directory_type_to_string(dt), c->directories[dt].mode);
 
                 for (size_t i = 0; i < c->directories[dt].n_items; i++) {
-                        fprintf(f, "%s%s: %s\n", prefix, exec_directory_type_to_string(dt), c->directories[dt].items[i].path);
+                        fprintf(f,
+                                "%s%s: %s%s\n",
+                                prefix,
+                                exec_directory_type_to_string(dt),
+                                c->directories[dt].items[i].path,
+                                FLAGS_SET(c->directories[dt].items[i].flags, EXEC_DIRECTORY_READ_ONLY) ? " (ro)" : "");
 
                         STRV_FOREACH(d, c->directories[dt].items[i].symlinks)
                                 fprintf(f, "%s%s: %s:%s\n", prefix, exec_directory_type_symlink_to_string(dt), c->directories[dt].items[i].path, *d);
@@ -1595,7 +1684,7 @@ int exec_context_get_clean_directories(
                                 return r;
 
                         /* Also remove private directories unconditionally. */
-                        if (t != EXEC_DIRECTORY_CONFIGURATION) {
+                        if (EXEC_DIRECTORY_TYPE_SHALL_CHOWN(t)) {
                                 j = path_join(prefix[t], "private", i->path);
                                 if (!j)
                                         return -ENOMEM;
@@ -2687,7 +2776,7 @@ static ExecDirectoryItem *exec_directory_find(ExecDirectory *d, const char *path
         return NULL;
 }
 
-int exec_directory_add(ExecDirectory *d, const char *path, const char *symlink) {
+int exec_directory_add(ExecDirectory *d, const char *path, const char *symlink, ExecDirectoryFlags flags) {
         _cleanup_strv_free_ char **s = NULL;
         _cleanup_free_ char *p = NULL;
         ExecDirectoryItem *existing;
@@ -2701,6 +2790,8 @@ int exec_directory_add(ExecDirectory *d, const char *path, const char *symlink) 
                 r = strv_extend(&existing->symlinks, symlink);
                 if (r < 0)
                         return r;
+
+                existing->flags |= flags;
 
                 return 0; /* existing item is updated */
         }
@@ -2721,6 +2812,7 @@ int exec_directory_add(ExecDirectory *d, const char *path, const char *symlink) 
         d->items[d->n_items++] = (ExecDirectoryItem) {
                 .path = TAKE_PTR(p),
                 .symlinks = TAKE_PTR(s),
+                .flags = flags,
         };
 
         return 1; /* new item is added */
@@ -2738,7 +2830,7 @@ void exec_directory_sort(ExecDirectory *d) {
 
         /* Sort the exec directories to make always parent directories processed at first in
          * setup_exec_directory(), e.g., even if StateDirectory=foo/bar foo, we need to create foo at first,
-         * then foo/bar. Also, set .only_create flag if one of the parent directories is contained in the
+         * then foo/bar. Also, set the ONLY_CREATE flag if one of the parent directories is contained in the
          * list. See also comments in setup_exec_directory() and issue #24783. */
 
         if (d->n_items <= 1)
@@ -2749,7 +2841,7 @@ void exec_directory_sort(ExecDirectory *d) {
         for (size_t i = 1; i < d->n_items; i++)
                 for (size_t j = 0; j < i; j++)
                         if (path_startswith(d->items[i].path, d->items[j].path)) {
-                                d->items[i].only_create = true;
+                                d->items[i].flags |= EXEC_DIRECTORY_ONLY_CREATE;
                                 break;
                         }
 }

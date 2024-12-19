@@ -4,8 +4,8 @@
 msgid ""
 msgstr ""
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2024-08-23 15:33+0200\n"
-"PO-Revision-Date: 2024-08-24 10:36+0000\n"
+"POT-Creation-Date: 2024-11-28 18:16+0900\n"
+"PO-Revision-Date: 2024-11-29 12:38+0000\n"
 "Last-Translator: Temuri Doghonadze <temuri.doghonadze@gmail.com>\n"
 "Language-Team: Georgian <https://translate.fedoraproject.org/projects/"
 "systemd/main/ka/>\n"
@@ -14,7 +14,7 @@ msgstr ""
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=n != 1;\n"
-"X-Generator: Weblate 5.7\n"
+"X-Generator: Weblate 5.8.2\n"
 
 #: src/core/org.freedesktop.systemd1.policy.in:22
 msgid "Send passphrase back to system"
@@ -108,27 +108,35 @@ msgid "Authentication is required to update a user's home area."
 msgstr "სახლის ტერიტორიის განახლებისთვის საჭიროა ავთენტიკაცია."
 
 #: src/home/org.freedesktop.home1.policy:53
+msgid "Update your home area"
+msgstr "თქვენი სახლის ტერიტორიის განახლება"
+
+#: src/home/org.freedesktop.home1.policy:54
+msgid "Authentication is required to update your home area."
+msgstr "თქვენი სახლის ტერიტორიის განახლებისთვის საჭიროა ავთენტიკაცია."
+
+#: src/home/org.freedesktop.home1.policy:63
 msgid "Resize a home area"
 msgstr "სახლის ტერიტორიის ზომის შეცვლა"
 
-#: src/home/org.freedesktop.home1.policy:54
+#: src/home/org.freedesktop.home1.policy:64
 msgid "Authentication is required to resize a user's home area."
 msgstr "სახლის ტერიტორიის ზომის შეცვლისთვის საჭიროა ავთენტიკაცია."
 
-#: src/home/org.freedesktop.home1.policy:63
+#: src/home/org.freedesktop.home1.policy:73
 msgid "Change password of a home area"
 msgstr "სახლის ტერიტორიის პაროლის შეცვლა"
 
-#: src/home/org.freedesktop.home1.policy:64
+#: src/home/org.freedesktop.home1.policy:74
 msgid ""
 "Authentication is required to change the password of a user's home area."
 msgstr "სახლის ტერიტორიის პაროლის შეცვლისთვის საჭიროა ავთენტიკაცია."
 
-#: src/home/org.freedesktop.home1.policy:73
+#: src/home/org.freedesktop.home1.policy:83
 msgid "Activate a home area"
 msgstr "საწყისი ადგილის აქტივაცია"
 
-#: src/home/org.freedesktop.home1.policy:74
+#: src/home/org.freedesktop.home1.policy:84
 msgid "Authentication is required to activate a user's home area."
 msgstr "მომხმარებლის საწყისი ადგილის აქტივაციისთვის აუცილებელია ავთენტიკაცია."
 
@@ -1152,6 +1160,14 @@ msgstr "ძველი სისტემის განახლებებ�
 msgid "Authentication is required to cleanup old system updates."
 msgstr "ძველი სისტემური განახლებების გასუფთავებას ავთენტიკაცია სჭირდება."
 
+#: src/sysupdate/org.freedesktop.sysupdate1.policy:75
+msgid "Manage optional features"
+msgstr "არასავალდებულო ფუნქციების მართვა"
+
+#: src/sysupdate/org.freedesktop.sysupdate1.policy:76
+msgid "Authentication is required to manage optional features."
+msgstr "არასავალდებულო ფუნქციების მართვას ავთენტიკაცია სჭირდება."
+
 #: src/timedate/org.freedesktop.timedate1.policy:22
 msgid "Set system time"
 msgstr "სისტემური დროის დაყენება"
@@ -1189,40 +1205,40 @@ msgid ""
 "shall be enabled."
 msgstr "დროის ქსელური სინქრონიზაციის ჩართ/გამორთ-თვის საჭიროა ავთენტიკაცია."
 
-#: src/core/dbus-unit.c:353
+#: src/core/dbus-unit.c:370
 msgid "Authentication is required to start '$(unit)'."
 msgstr "'$(unit)'-ის გასაშვებად საჭიროა ავთენტიკაცია."
 
-#: src/core/dbus-unit.c:354
+#: src/core/dbus-unit.c:371
 msgid "Authentication is required to stop '$(unit)'."
 msgstr "'$(unit)'-ის გასაჩერებლად საჭიროა ავთენტიკაცია."
 
-#: src/core/dbus-unit.c:355
+#: src/core/dbus-unit.c:372
 msgid "Authentication is required to reload '$(unit)'."
 msgstr "'$(unit)'-ის გადასატვირთად საჭიროა ავთენტიკაცია."
 
-#: src/core/dbus-unit.c:356 src/core/dbus-unit.c:357
+#: src/core/dbus-unit.c:373 src/core/dbus-unit.c:374
 msgid "Authentication is required to restart '$(unit)'."
 msgstr "'$(unit)'-ის გადასატვირთად საჭიროა ავთენტიკაცია."
 
-#: src/core/dbus-unit.c:549
+#: src/core/dbus-unit.c:566
 msgid ""
 "Authentication is required to send a UNIX signal to the processes of "
 "'$(unit)'."
 msgstr ""
 "'$(unit)'-ის პროცესებისთვის UNIX სიგნალის გასაგზავნად საჭიროა ავთნტიკაცია."
 
-#: src/core/dbus-unit.c:577
+#: src/core/dbus-unit.c:594
 msgid "Authentication is required to reset the \"failed\" state of '$(unit)'."
 msgstr ""
 "'$(unit)'-ის შეცდომით გაშვების მდგომარეობის გასასუფთავებლად საჭიროა "
 "ავთენტიკაცია."
 
-#: src/core/dbus-unit.c:607
+#: src/core/dbus-unit.c:624
 msgid "Authentication is required to set properties on '$(unit)'."
 msgstr "'$(unit)'-ის თვისებების დასაყენებლად საჭიროა ავთენტიკაცია."
 
-#: src/core/dbus-unit.c:704
+#: src/core/dbus-unit.c:721
 msgid ""
 "Authentication is required to delete files and directories associated with "
 "'$(unit)'."
@@ -1230,7 +1246,7 @@ msgstr ""
 "'$(unit)'-თან ასოცირებული ფაილების და საქაღალდეების წასაშლელად საჭიროა "
 "ავთენტიკაცია."
 
-#: src/core/dbus-unit.c:741
+#: src/core/dbus-unit.c:758
 msgid ""
 "Authentication is required to freeze or thaw the processes of '$(unit)' unit."
 msgstr "'$(unit)'-ის პროცესების გასაყინად საჭიროა ავთენტიკაცია."

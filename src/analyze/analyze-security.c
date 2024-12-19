@@ -1724,16 +1724,16 @@ static int assess(const SecurityInfo *info,
         static const struct {
                 uint64_t exposure;
                 const char *name;
-                const char *color;
+                const char* (*color)(void);
                 SpecialGlyph smiley;
         } badness_table[] = {
-                { 100, "DANGEROUS", ANSI_HIGHLIGHT_RED,    SPECIAL_GLYPH_DEPRESSED_SMILEY        },
-                { 90,  "UNSAFE",    ANSI_HIGHLIGHT_RED,    SPECIAL_GLYPH_UNHAPPY_SMILEY          },
-                { 75,  "EXPOSED",   ANSI_HIGHLIGHT_YELLOW, SPECIAL_GLYPH_SLIGHTLY_UNHAPPY_SMILEY },
+                { 100, "DANGEROUS", ansi_highlight_red,    SPECIAL_GLYPH_DEPRESSED_SMILEY        },
+                { 90,  "UNSAFE",    ansi_highlight_red,    SPECIAL_GLYPH_UNHAPPY_SMILEY          },
+                { 75,  "EXPOSED",   ansi_highlight_yellow, SPECIAL_GLYPH_SLIGHTLY_UNHAPPY_SMILEY },
                 { 50,  "MEDIUM",    NULL,                  SPECIAL_GLYPH_NEUTRAL_SMILEY          },
-                { 10,  "OK",        ANSI_HIGHLIGHT_GREEN,  SPECIAL_GLYPH_SLIGHTLY_HAPPY_SMILEY   },
-                { 1,   "SAFE",      ANSI_HIGHLIGHT_GREEN,  SPECIAL_GLYPH_HAPPY_SMILEY            },
-                { 0,   "PERFECT",   ANSI_HIGHLIGHT_GREEN,  SPECIAL_GLYPH_ECSTATIC_SMILEY         },
+                { 10,  "OK",        ansi_highlight_green,  SPECIAL_GLYPH_SLIGHTLY_HAPPY_SMILEY   },
+                { 1,   "SAFE",      ansi_highlight_green,  SPECIAL_GLYPH_HAPPY_SMILEY            },
+                { 0,   "PERFECT",   ansi_highlight_green,  SPECIAL_GLYPH_ECSTATIC_SMILEY         },
         };
 
         uint64_t badness_sum = 0, weight_sum = 0, exposure;
@@ -1872,7 +1872,7 @@ static int assess(const SecurityInfo *info,
                                 return log_error_errno(r, "Failed to update cell in table: %m");
                 }
 
-                if (json_format_flags & SD_JSON_FORMAT_OFF) {
+                if (!sd_json_format_enabled(json_format_flags)) {
                         r = table_hide_column_from_display(details_table, (size_t) 2);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to set columns to display: %m");
@@ -1891,7 +1891,7 @@ static int assess(const SecurityInfo *info,
 
         assert(i < ELEMENTSOF(badness_table));
 
-        if (details_table && (json_format_flags & SD_JSON_FORMAT_OFF)) {
+        if (details_table && !sd_json_format_enabled(json_format_flags)) {
                 _cleanup_free_ char *clickable = NULL;
                 const char *name;
 
@@ -1911,7 +1911,7 @@ static int assess(const SecurityInfo *info,
                        ansi_highlight(),
                        name,
                        ansi_normal(),
-                       colors_enabled() ? strempty(badness_table[i].color) : "",
+                       badness_table[i].color ? badness_table[i].color() : "",
                        exposure / 10, exposure % 10,
                        badness_table[i].name,
                        ansi_normal(),
@@ -1938,7 +1938,7 @@ static int assess(const SecurityInfo *info,
                                    TABLE_STRING, buf,
                                    TABLE_SET_ALIGN_PERCENT, 100,
                                    TABLE_STRING, badness_table[i].name,
-                                   TABLE_SET_COLOR, strempty(badness_table[i].color),
+                                   TABLE_SET_COLOR, badness_table[i].color ? badness_table[i].color() : "",
                                    TABLE_STRING, special_glyph(badness_table[i].smiley));
                 if (r < 0)
                         return table_log_add_error(r);

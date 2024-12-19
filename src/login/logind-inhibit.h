@@ -22,7 +22,6 @@ typedef enum InhibitMode {
         INHIBIT_BLOCK,
         INHIBIT_BLOCK_WEAK,
         INHIBIT_DELAY,
-        INHIBIT_DELAY_WEAK,
         _INHIBIT_MODE_MAX,
         _INHIBIT_MODE_INVALID = -EINVAL,
 } InhibitMode;
@@ -67,8 +66,21 @@ int inhibitor_create_fifo(Inhibitor *i);
 
 bool inhibitor_is_orphan(Inhibitor *i);
 
-InhibitWhat manager_inhibit_what(Manager *m, bool block);
-bool manager_is_inhibited(Manager *m, InhibitWhat w, bool block, dual_timestamp *since, bool ignore_inactive, bool ignore_uid, uid_t uid, Inhibitor **offending);
+InhibitWhat manager_inhibit_what(Manager *m, InhibitMode mode);
+
+typedef enum ManagerIsInhibitedFlags {
+        MANAGER_IS_INHIBITED_CHECK_DELAY     = 1 << 0,  /* When set, we only check delay inhibitors.
+                                                         * Otherwise, we only check block inhibitors. */
+        MANAGER_IS_INHIBITED_IGNORE_INACTIVE = 1 << 1,  /* When set, ignore inactive sessions. */
+} ManagerIsInhibitedFlags;
+
+bool manager_is_inhibited(
+                Manager *m,
+                InhibitWhat w,
+                dual_timestamp *since,
+                ManagerIsInhibitedFlags flags,
+                uid_t uid_to_ignore,
+                Inhibitor **ret_offending);
 
 static inline bool inhibit_what_is_valid(InhibitWhat w) {
         return w > 0 && w < _INHIBIT_WHAT_MAX;

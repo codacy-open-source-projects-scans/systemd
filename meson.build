@@ -20,8 +20,8 @@ else
         project_minor_version = '0'
 endif
 
-libsystemd_version = '0.39.0'
-libudev_version = '1.7.9'
+libsystemd_version = '0.40.0'
+libudev_version = '1.7.10'
 
 conf = configuration_data()
 conf.set_quoted('PROJECT_URL', 'https://systemd.io/')
@@ -978,6 +978,16 @@ conf.set10('DEV_KVM_UACCESS', dev_kvm_mode != '0666')
 group_render_mode = get_option('group-render-mode')
 conf.set_quoted('GROUP_RENDER_MODE', group_render_mode)
 conf.set10('GROUP_RENDER_UACCESS', group_render_mode != '0666')
+tty_mode = get_option('tty-mode')
+# The setting is used as both octal integer and string through STRINGIFY().
+# Here, only check if the value starts with '06', and further check will be done in terminal-util.h.
+if not tty_mode.startswith('06')
+        error('Unexpected access mode "@0@" is specified for TTY/PTS device nodes, it must be "06xx".'.format(tty_mode))
+elif tty_mode != '0600' and tty_mode != '0620'
+        warning('Unexpected access mode "@0@" is specified for TTY/PTS device nodes, typically it should be "0600" or "0620", proceeding anyway.'.format(tty_mode))
+endif
+# Do not use set_quoted() here, so that the value is available as an integer.
+conf.set('TTY_MODE', tty_mode)
 
 kill_user_processes = get_option('default-kill-user-processes')
 conf.set10('KILL_USER_PROCESSES', kill_user_processes)
@@ -1522,7 +1532,7 @@ if dbus_interfaces_dir == '' or dbus_interfaces_dir == 'yes'
         endif
 endif
 
-dmi_arches = ['x86', 'x86_64', 'aarch64', 'arm', 'ia64', 'loongarch64', 'mips']
+dmi_arches = ['x86', 'x86_64', 'aarch64', 'arm', 'ia64', 'loongarch64', 'mips', 'riscv64']
 conf.set10('HAVE_DMI', host_machine.cpu_family() in dmi_arches)
 
 # We support one or the other. If gcrypt is available, we assume it's there to
@@ -1608,6 +1618,20 @@ have = get_option('sysupdate').require(
         conf.get('HAVE_LIBFDISK') == 1,
         error_message : 'fdisk and openssl required').allowed()
 conf.set10('ENABLE_SYSUPDATE', have)
+
+have2 = get_option('sysupdated')
+if have2 == 'enabled'
+        if have
+                have2 = true
+        else
+                error('sysupdated requires sysupdate to be enabled')
+        endif
+elif have2 == 'auto'
+        have2 = have and conf.get('BUILD_MODE_DEVELOPER') == 1
+else
+        have2 = false
+endif
+conf.set10('ENABLE_SYSUPDATED', have2)
 
 conf.set10('ENABLE_STORAGETM', get_option('storagetm'))
 
@@ -1789,15 +1813,16 @@ if conf.get('BPF_FRAMEWORK') == 1
         # C.f. https://mesonbuild.com/Reference-tables.html#cpu-families
         # and src/basic/missing_syscall_def.h.
         cpu_arch_defines = {
-                'ppc'     : ['-D__powerpc__', '-D__TARGET_ARCH_powerpc'],
-                'ppc64'   : ['-D__powerpc64__', '-D__TARGET_ARCH_powerpc', '-D_CALL_ELF=2'],
-                'riscv32' : ['-D__riscv', '-D__riscv_xlen=32', '-D__TARGET_ARCH_riscv'],
-                'riscv64' : ['-D__riscv', '-D__riscv_xlen=64', '-D__TARGET_ARCH_riscv'],
-                'x86'     : ['-D__i386__', '-D__TARGET_ARCH_x86'],
-                's390x'   : ['-D__s390__', '-D__s390x__', '-D__TARGET_ARCH_s390'],
+                'ppc'         : ['-D__powerpc__', '-D__TARGET_ARCH_powerpc'],
+                'ppc64'       : ['-D__powerpc64__', '-D__TARGET_ARCH_powerpc', '-D_CALL_ELF=2'],
+                'riscv32'     : ['-D__riscv', '-D__riscv_xlen=32', '-D__TARGET_ARCH_riscv'],
+                'riscv64'     : ['-D__riscv', '-D__riscv_xlen=64', '-D__TARGET_ARCH_riscv'],
+                'x86'         : ['-D__i386__', '-D__TARGET_ARCH_x86'],
+                's390x'       : ['-D__s390__', '-D__s390x__', '-D__TARGET_ARCH_s390'],
 
                 # For arm, assume hardware fp is available.
-                'arm'     : ['-D__arm__', '-D__ARM_PCS_VFP', '-D__TARGET_ARCH_arm'],
+                'arm'         : ['-D__arm__', '-D__ARM_PCS_VFP', '-D__TARGET_ARCH_arm'],
+                'loongarch64' : ['-D__loongarch__', '-D__loongarch_grlen=64', '-D__TARGET_ARCH_loongarch']
         }
 
         bpf_arch_flags = cpu_arch_defines.get(host_machine.cpu_family(),
@@ -2329,8 +2354,9 @@ subdir('src/ask-password')
 subdir('src/backlight')
 subdir('src/battery-check')
 subdir('src/binfmt')
+subdir('src/bless-boot')
 subdir('src/boot')
-subdir('src/boot/efi')
+subdir('src/bootctl')
 subdir('src/busctl')
 subdir('src/cgls')
 subdir('src/cgroups-agent')
@@ -2350,6 +2376,7 @@ subdir('src/fsck')
 subdir('src/fstab-generator')
 subdir('src/getty-generator')
 subdir('src/gpt-auto-generator')
+subdir('src/growfs')
 subdir('src/hibernate-resume')
 subdir('src/home')
 subdir('src/hostname')
@@ -2361,10 +2388,12 @@ subdir('src/integritysetup')
 subdir('src/journal')
 subdir('src/journal-remote')
 subdir('src/kernel-install')
+subdir('src/keyutil')
 subdir('src/locale')
 subdir('src/login')
 subdir('src/machine')
 subdir('src/machine-id-setup')
+subdir('src/measure')
 subdir('src/mountfsd')
 subdir('src/modules-load')
 subdir('src/mount')
@@ -2377,7 +2406,6 @@ subdir('src/nss-mymachines')
 subdir('src/nss-resolve')
 subdir('src/nss-systemd')
 subdir('src/oom')
-subdir('src/partition')
 subdir('src/path')
 subdir('src/pcrextend')
 subdir('src/pcrlock')
@@ -2387,12 +2415,14 @@ subdir('src/quotacheck')
 subdir('src/random-seed')
 subdir('src/rc-local-generator')
 subdir('src/remount-fs')
+subdir('src/repart')
 subdir('src/reply-password')
 subdir('src/resolve')
 subdir('src/rfkill')
 subdir('src/rpm')
 subdir('src/run')
 subdir('src/run-generator')
+subdir('src/sbsign')
 subdir('src/shutdown')
 subdir('src/sleep')
 subdir('src/socket-activate')
@@ -2654,6 +2684,14 @@ endif
 
 #####################################################################
 
+ukify_depends = []
+
+foreach executable : ['systemd-measure', 'systemd-sbsign', 'systemd-keyutil']
+        if executable in executables_by_name
+                ukify_depends += [executables_by_name[executable]]
+        endif
+endforeach
+
 ukify = custom_target(
         'ukify',
         input : 'src/ukify/ukify.py',
@@ -2661,6 +2699,7 @@ ukify = custom_target(
         command : [jinja2_cmdline, '@INPUT@', '@OUTPUT@'],
         install : want_ukify,
         install_mode : 'rwxr-xr-x',
+        depends : ukify_depends,
         install_dir : bindir)
 if want_ukify
         public_programs += ukify
@@ -2680,7 +2719,7 @@ endif
 
 mkosi_depends = public_programs
 
-foreach executable : ['systemd-journal-remote', 'systemd-measure']
+foreach executable : ['systemd-journal-remote', 'systemd-sbsign', 'systemd-keyutil']
         if executable in executables_by_name
                 mkosi_depends += [executables_by_name[executable]]
         endif
@@ -3001,6 +3040,7 @@ foreach tuple : [
         ['AUDIT'],
         ['AppArmor'],
         ['IMA'],
+        ['IPE'],
         ['PAM'],
         ['SECCOMP'],
         ['SELinux'],
@@ -3009,6 +3049,7 @@ foreach tuple : [
         ['elfutils'],
         ['gcrypt'],
         ['gnutls'],
+        ['libarchive'],
         ['libbpf'],
         ['libcryptsetup'],
         ['libcryptsetup-plugins'],
@@ -3054,7 +3095,9 @@ foreach tuple : [
         ['localed'],
         ['logind'],
         ['machined'],
+        ['mountfsd'],
         ['networkd'],
+        ['nsresourced'],
         ['nss-myhostname'],
         ['nss-mymachines'],
         ['nss-resolve'],
@@ -3070,6 +3113,7 @@ foreach tuple : [
         ['sysext'],
         ['systemd-analyze',        conf.get('ENABLE_ANALYZE') == 1],
         ['sysupdate'],
+        ['sysupdated'],
         ['sysusers'],
         ['storagetm'],
         ['timedated'],

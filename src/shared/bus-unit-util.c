@@ -266,7 +266,7 @@ static int bus_append_parse_size(sd_bus_message *m, const char *field, const cha
 }
 
 static int bus_append_exec_command(sd_bus_message *m, const char *field, const char *eq) {
-        bool explicit_path = false, done = false;
+        bool explicit_path = false, done = false, ambient_hack = false;
         _cleanup_strv_free_ char **l = NULL, **ex_opts = NULL;
         _cleanup_free_ char *path = NULL, *upgraded_name = NULL;
         ExecCommandFlags flags = 0;
@@ -304,7 +304,7 @@ static int bus_append_exec_command(sd_bus_message *m, const char *field, const c
                         break;
 
                 case '+':
-                        if (flags & (EXEC_COMMAND_FULLY_PRIVILEGED|EXEC_COMMAND_NO_SETUID|EXEC_COMMAND_AMBIENT_MAGIC))
+                        if ((flags & (EXEC_COMMAND_FULLY_PRIVILEGED|EXEC_COMMAND_NO_SETUID)) != 0 || ambient_hack)
                                 done = true;
                         else {
                                 flags |= EXEC_COMMAND_FULLY_PRIVILEGED;
@@ -313,12 +313,18 @@ static int bus_append_exec_command(sd_bus_message *m, const char *field, const c
                         break;
 
                 case '!':
-                        if (flags & (EXEC_COMMAND_FULLY_PRIVILEGED|EXEC_COMMAND_AMBIENT_MAGIC))
+                        if (FLAGS_SET(flags, EXEC_COMMAND_FULLY_PRIVILEGED) || ambient_hack)
                                 done = true;
                         else if (FLAGS_SET(flags, EXEC_COMMAND_NO_SETUID)) {
+                                /* Compatibility with the old !! ambient caps hack (removed in v258). Since
+                                 * we don't support that anymore and !! was a noop on non-supporting systems,
+                                 * we'll just turn off the EXEC_COMMAND_NO_SETUID flag again and be done with
+                                 * it. */
                                 flags &= ~EXEC_COMMAND_NO_SETUID;
-                                flags |= EXEC_COMMAND_AMBIENT_MAGIC;
                                 eq++;
+                                ambient_hack = true;
+
+                                log_notice("!! modifier for %s= fields is no longer supported and is now ignored.", field);
                         } else {
                                 flags |= EXEC_COMMAND_NO_SETUID;
                                 eq++;
@@ -331,7 +337,7 @@ static int bus_append_exec_command(sd_bus_message *m, const char *field, const c
                 }
         } while (!done);
 
-        if (!is_ex_prop && (flags & (EXEC_COMMAND_NO_ENV_EXPAND|EXEC_COMMAND_FULLY_PRIVILEGED|EXEC_COMMAND_NO_SETUID|EXEC_COMMAND_AMBIENT_MAGIC))) {
+        if (!is_ex_prop && (flags & (EXEC_COMMAND_NO_ENV_EXPAND|EXEC_COMMAND_FULLY_PRIVILEGED|EXEC_COMMAND_NO_SETUID))) {
                 /* Upgrade the ExecXYZ= property to ExecXYZEx= for convenience */
                 is_ex_prop = true;
                 upgraded_name = strjoin(field, "Ex");
@@ -1047,6 +1053,7 @@ static int bus_append_execute_property(sd_bus_message *m, const char *field, con
                               "ProtectHome",
                               "PrivateTmpEx",
                               "PrivateUsersEx",
+                              "ProtectControlGroupsEx",
                               "SELinuxContext",
                               "RootImage",
                               "RootVerity",
@@ -1060,7 +1067,8 @@ static int bus_append_execute_property(sd_bus_message *m, const char *field, con
                               "LogNamespace",
                               "RootImagePolicy",
                               "MountImagePolicy",
-                              "ExtensionImagePolicy"))
+                              "ExtensionImagePolicy",
+                              "PrivatePIDs"))
                 return bus_append_string(m, field, eq);
 
         if (STR_IN_SET(field, "IgnoreSIGPIPE",
@@ -2126,7 +2134,7 @@ static int bus_append_execute_property(sd_bus_message *m, const char *field, con
         }
 
         if (STR_IN_SET(field, "StateDirectory", "RuntimeDirectory", "CacheDirectory", "LogsDirectory")) {
-                _cleanup_strv_free_ char **symlinks = NULL, **sources = NULL;
+                _cleanup_strv_free_ char **symlinks = NULL, **symlinks_ro = NULL, **sources = NULL, **sources_ro = NULL;
                 const char *p = eq;
 
                 /* Adding new directories is supported from both *DirectorySymlink methods and the
@@ -2134,7 +2142,7 @@ static int bus_append_execute_property(sd_bus_message *m, const char *field, con
                  * tuple use the new method, else use the old one. */
 
                 for (;;) {
-                        _cleanup_free_ char *tuple = NULL, *source = NULL, *destination = NULL;
+                        _cleanup_free_ char *tuple = NULL, *source = NULL, *dest = NULL, *flags = NULL;
 
                         r = extract_first_word(&p, &tuple, NULL, EXTRACT_UNQUOTE);
                         if (r < 0)
@@ -2143,20 +2151,31 @@ static int bus_append_execute_property(sd_bus_message *m, const char *field, con
                                 break;
 
                         const char *t = tuple;
-                        r = extract_many_words(&t, ":", EXTRACT_UNQUOTE|EXTRACT_DONT_COALESCE_SEPARATORS, &source, &destination);
+                        r = extract_many_words(&t, ":", EXTRACT_UNQUOTE|EXTRACT_DONT_COALESCE_SEPARATORS, &source, &dest, &flags);
                         if (r <= 0)
                                 return log_error_errno(r ?: SYNTHETIC_ERRNO(EINVAL), "Failed to parse argument: %m");
 
                         path_simplify(source);
 
-                        if (isempty(destination)) {
+                        if (isempty(dest) && isempty(flags)) {
                                 r = strv_consume(&sources, TAKE_PTR(source));
                                 if (r < 0)
                                         return bus_log_create_error(r);
+                        } else if (isempty(flags)) {
+                                path_simplify(dest);
+                                r = strv_consume_pair(&symlinks, TAKE_PTR(source), TAKE_PTR(dest));
+                                if (r < 0)
+                                        return log_oom();
                         } else {
-                                path_simplify(destination);
+                                ExecDirectoryFlags exec_directory_flags = exec_directory_flags_from_string(flags);
+                                if (exec_directory_flags < 0 || (exec_directory_flags & ~_EXEC_DIRECTORY_FLAGS_PUBLIC) != 0)
+                                        return log_error_errno(r, "Failed to parse flags: %s", flags);
 
-                                r = strv_consume_pair(&symlinks, TAKE_PTR(source), TAKE_PTR(destination));
+                                if (!isempty(dest)) {
+                                        path_simplify(dest);
+                                        r = strv_consume_pair(&symlinks_ro, TAKE_PTR(source), TAKE_PTR(dest));
+                                } else
+                                        r = strv_consume(&sources_ro, TAKE_PTR(source));
                                 if (r < 0)
                                         return log_oom();
                         }
@@ -2191,7 +2210,7 @@ static int bus_append_execute_property(sd_bus_message *m, const char *field, con
                 /* For State and Runtime directories we support an optional destination parameter, which
                  * will be used to create a symlink to the source. But it is new so we cannot change the
                  * old DBUS signatures, so append a new message type. */
-                if (!strv_isempty(symlinks)) {
+                if (!strv_isempty(symlinks) || !strv_isempty(symlinks_ro) || !strv_isempty(sources_ro)) {
                         const char *symlink_field;
 
                         r = sd_bus_message_open_container(m, SD_BUS_TYPE_STRUCT, "sv");
@@ -2227,6 +2246,18 @@ static int bus_append_execute_property(sd_bus_message *m, const char *field, con
                                         return bus_log_create_error(r);
                         }
 
+                        STRV_FOREACH_PAIR(source, destination, symlinks_ro) {
+                                r = sd_bus_message_append(m, "(sst)", *source, *destination, (uint64_t) EXEC_DIRECTORY_READ_ONLY);
+                                if (r < 0)
+                                        return bus_log_create_error(r);
+                        }
+
+                        STRV_FOREACH(source, sources_ro) {
+                                r = sd_bus_message_append(m, "(sst)", *source, "", (uint64_t) EXEC_DIRECTORY_READ_ONLY);
+                                if (r < 0)
+                                        return bus_log_create_error(r);
+                        }
+
                         r = sd_bus_message_close_container(m);
                         if (r < 0)
                                 return bus_log_create_error(r);
@@ -2243,6 +2274,24 @@ static int bus_append_execute_property(sd_bus_message *m, const char *field, con
                 return 1;
         }
 
+        if (streq(field, "ProtectHostnameEx")) {
+                const char *colon = strchr(eq, ':');
+                if (colon) {
+                        if (isempty(colon + 1))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse argument: %s=%s", field, eq);
+
+                        _cleanup_free_ char *p = strndup(eq, colon - eq);
+                        if (!p)
+                                return -ENOMEM;
+
+                        r = sd_bus_message_append(m, "(sv)", field, "(ss)", p, colon + 1);
+                } else
+                        r = sd_bus_message_append(m, "(sv)", field, "(ss)", eq, NULL);
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                return 1;
+        }
         return 0;
 }
 
@@ -3076,4 +3125,14 @@ int unit_freezer_freeze(UnitFreezer *f) {
 
 int unit_freezer_thaw(UnitFreezer *f) {
         return unit_freezer_action(f, false);
+}
+
+ExecDirectoryFlags exec_directory_flags_from_string(const char *s) {
+        if (isempty(s))
+                return 0;
+
+        if (streq(s, "ro"))
+                return EXEC_DIRECTORY_READ_ONLY;
+
+        return _EXEC_DIRECTORY_FLAGS_INVALID;
 }

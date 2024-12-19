@@ -17,11 +17,13 @@
 #include "socket-util.h"
 #include "strv.h"
 #include "terminal-util.h"
+#include "uid-classification.h"
 #include "uid-range.h"
 #include "user-record-show.h"
 #include "user-util.h"
 #include "userdb.h"
 #include "verbs.h"
+#include "virt.h"
 
 static enum {
         OUTPUT_CLASSIC,
@@ -138,10 +140,16 @@ static int show_user(UserRecord *ur, Table *table) {
         return 0;
 }
 
+static bool test_show_mapped(void) {
+        /* Show mapped user range only in environments where user mapping is a thing. */
+        return running_in_userns() > 0;
+}
+
 static const struct {
         uid_t first, last;
         const char *name;
         UserDisposition disposition;
+        bool (*test)(void);
 } uid_range_table[] = {
         {
                 .first = 1,
@@ -156,8 +164,8 @@ static const struct {
                 .disposition = USER_DYNAMIC,
         },
         {
-                .first = CONTAINER_UID_BASE_MIN,
-                .last = CONTAINER_UID_BASE_MAX,
+                .first = CONTAINER_UID_MIN,
+                .last = CONTAINER_UID_MAX,
                 .name = "container",
                 .disposition = USER_CONTAINER,
         },
@@ -174,11 +182,12 @@ static const struct {
                 .last = MAP_UID_MAX,
                 .name = "mapped",
                 .disposition = USER_REGULAR,
+                .test = test_show_mapped,
         },
 };
 
 static int table_add_uid_boundaries(Table *table, const UIDRange *p) {
-        int r;
+        int r, n_added = 0;
 
         assert(table);
 
@@ -189,6 +198,9 @@ static int table_add_uid_boundaries(Table *table, const UIDRange *p) {
                         continue;
 
                 if (!uid_range_covers(p, i->first, i->last - i->first + 1))
+                        continue;
+
+                if (i->test && !i->test())
                         continue;
 
                 name = strjoin(special_glyph(SPECIAL_GLYPH_ARROW_DOWN),
@@ -248,9 +260,11 @@ static int table_add_uid_boundaries(Table *table, const UIDRange *p) {
                                 TABLE_INT, 1); /* sort after any other entry with the same UID */
                 if (r < 0)
                         return table_log_add_error(r);
+
+                n_added += 2;
         }
 
-        return ELEMENTSOF(uid_range_table) * 2;
+        return n_added;
 }
 
 static int add_unavailable_uid(Table *table, uid_t start, uid_t end) {
@@ -564,14 +578,20 @@ static int show_group(GroupRecord *gr, Table *table) {
 }
 
 static int table_add_gid_boundaries(Table *table, const UIDRange *p) {
-        int r;
+        int r, n_added = 0;
 
         assert(table);
 
         FOREACH_ELEMENT(i, uid_range_table) {
                 _cleanup_free_ char *name = NULL, *comment = NULL;
 
+                if (!FLAGS_SET(arg_disposition_mask, UINT64_C(1) << i->disposition))
+                        continue;
+
                 if (!uid_range_covers(p, i->first, i->last - i->first + 1))
+                        continue;
+
+                if (i->test && !i->test())
                         continue;
 
                 name = strjoin(special_glyph(SPECIAL_GLYPH_ARROW_DOWN),
@@ -625,9 +645,11 @@ static int table_add_gid_boundaries(Table *table, const UIDRange *p) {
                                 TABLE_INT, 1); /* sort after any other entry with the same GID */
                 if (r < 0)
                         return table_log_add_error(r);
+
+                n_added += 2;
         }
 
-        return ELEMENTSOF(uid_range_table) * 2;
+        return n_added;
 }
 
 static int add_unavailable_gid(Table *table, uid_t start, uid_t end) {
@@ -1013,7 +1035,7 @@ static int display_services(int argc, char *argv[], void *userdata) {
                 r = table_add_many(t,
                                    TABLE_STRING, de->d_name,
                                    TABLE_STRING, no ?: "yes",
-                                   TABLE_SET_COLOR, no ? ansi_highlight_red() : ansi_highlight_green());
+                                   TABLE_SET_COLOR, ansi_highlight_green_red(!no));
                 if (r < 0)
                         return table_log_add_error(r);
         }
@@ -1287,7 +1309,7 @@ static int parse_argv(int argc, char *argv[]) {
                         if (r <= 0)
                                 return r;
 
-                        arg_output = FLAGS_SET(arg_json_format_flags, SD_JSON_FORMAT_OFF) ? _OUTPUT_INVALID : OUTPUT_JSON;
+                        arg_output = sd_json_format_enabled(arg_json_format_flags) ? OUTPUT_JSON : _OUTPUT_INVALID;
                         break;
 
                 case 'j':

@@ -234,6 +234,9 @@ static int wireguard_set_interface(NetDev *netdev) {
         Wireguard *w = WIREGUARD(netdev);
         int r;
 
+        if (!netdev_is_managed(netdev))
+                return 0; /* Already detached, due to e.g. reloading .netdev files. */
+
         for (WireguardPeer *peer_start = w->peers; peer_start || !sent_once; ) {
                 uint16_t i = 0;
 
@@ -398,6 +401,9 @@ static int peer_resolve_endpoint(WireguardPeer *peer) {
         assert(peer->wireguard);
 
         netdev = NETDEV(peer->wireguard);
+
+        if (!netdev_is_managed(netdev))
+                return 0; /* Already detached, due to e.g. reloading .netdev files. */
 
         if (!peer->endpoint_host || !peer->endpoint_port)
                 /* Not necessary to resolve the endpoint. */
@@ -1192,7 +1198,7 @@ static int wireguard_verify(NetDev *netdev, const char *filename) {
         r = wireguard_read_key_file(w->private_key_file, w->private_key);
         if (r < 0)
                 return log_netdev_error_errno(netdev, r,
-                                              "Failed to read private key from %s. Ignoring network device.",
+                                              "Failed to read private key from '%s', ignoring network device: %m",
                                               w->private_key_file);
 
         if (eqzero(w->private_key)) {
@@ -1259,4 +1265,5 @@ const NetDevVTable wireguard_vtable = {
         .create_type = NETDEV_CREATE_INDEPENDENT,
         .config_verify = wireguard_verify,
         .iftype = ARPHRD_NONE,
+        .keep_existing = true,
 };

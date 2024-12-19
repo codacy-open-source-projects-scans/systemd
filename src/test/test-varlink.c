@@ -8,14 +8,15 @@
 #include "sd-json.h"
 #include "sd-varlink.h"
 
-#include "data-fd-util.h"
 #include "fd-util.h"
 #include "json-util.h"
+#include "memfd-util.h"
 #include "rm-rf.h"
 #include "strv.h"
 #include "tests.h"
 #include "tmpfile-util.h"
 #include "user-util.h"
+#include "varlink-util.h"
 
 /* Let's pick some high value, that is higher than the largest listen() backlog, but leaves enough room below
    the typical RLIMIT_NOFILE value of 1024 so that we can process both sides of each socket in our
@@ -33,14 +34,20 @@ static int method_something(sd_varlink *link, sd_json_variant *parameters, sd_va
         int r;
 
         a = sd_json_variant_by_key(parameters, "a");
-        if (!a)
-                return sd_varlink_error(link, "io.test.BadParameters", NULL);
+        if (!a) {
+                r = sd_varlink_error(link, "io.test.BadParameters", NULL);
+                assert_se(r == -EBADR);
+                return r;
+        }
 
         x = sd_json_variant_integer(a);
 
         b = sd_json_variant_by_key(parameters, "b");
-        if (!b)
-                return sd_varlink_error(link, "io.test.BadParameters", NULL);
+        if (!b) {
+                r = sd_varlink_error(link, "io.test.BadParameters", NULL);
+                assert_se(r == -EBADR);
+                return r;
+        }
 
         y = sd_json_variant_integer(b);
 
@@ -105,8 +112,11 @@ static int method_passfd(sd_varlink *link, sd_json_variant *parameters, sd_varli
         int r;
 
         a = sd_json_variant_by_key(parameters, "fd");
-        if (!a)
-                return sd_varlink_error(link, "io.test.BadParameters", NULL);
+        if (!a) {
+                r = sd_varlink_error_invalid_parameter_name(link, "fd");
+                assert_se(r == -EINVAL);
+                return r;
+        }
 
         ASSERT_STREQ(sd_json_variant_string(a), "whoop");
 
@@ -124,8 +134,8 @@ static int method_passfd(sd_varlink *link, sd_json_variant *parameters, sd_varli
         test_fd(yy, "bar", 3);
         test_fd(zz, "quux", 4);
 
-        _cleanup_close_ int vv = acquire_data_fd("miau");
-        _cleanup_close_ int ww = acquire_data_fd("wuff");
+        _cleanup_close_ int vv = memfd_new_and_seal_string("data", "miau");
+        _cleanup_close_ int ww = memfd_new_and_seal_string("data", "wuff");
 
         assert_se(vv >= 0);
         assert_se(ww >= 0);
@@ -242,8 +252,7 @@ static void *thread(void *arg) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *i = NULL;
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *wrong = NULL;
         sd_json_variant *o = NULL, *k = NULL, *j = NULL;
-        const char *error_id;
-        const char *e;
+        const char *error_id, *e;
         int x = 0;
 
         assert_se(sd_json_build(&i, SD_JSON_BUILD_OBJECT(SD_JSON_BUILD_PAIR("a", SD_JSON_BUILD_INTEGER(88)),
@@ -275,9 +284,9 @@ static void *thread(void *arg) {
         assert_se(sd_json_variant_integer(sd_json_variant_by_key(o, "sum")) == 88 + 99);
         assert_se(!e);
 
-        int fd1 = acquire_data_fd("foo");
-        int fd2 = acquire_data_fd("bar");
-        int fd3 = acquire_data_fd("quux");
+        int fd1 = memfd_new_and_seal_string("data", "foo");
+        int fd2 = memfd_new_and_seal_string("data", "bar");
+        int fd3 = memfd_new_and_seal_string("data", "quux");
 
         assert_se(fd1 >= 0);
         assert_se(fd2 >= 0);
@@ -288,6 +297,7 @@ static void *thread(void *arg) {
         assert_se(sd_varlink_push_fd(c, fd3) == 2);
 
         assert_se(sd_varlink_callb(c, "io.test.PassFD", &o, &e, SD_JSON_BUILD_OBJECT(SD_JSON_BUILD_PAIR("fd", SD_JSON_BUILD_STRING("whoop")))) >= 0);
+        assert_se(!e);
 
         int fd4 = sd_varlink_peek_fd(c, 0);
         int fd5 = sd_varlink_peek_fd(c, 1);
@@ -297,6 +307,9 @@ static void *thread(void *arg) {
 
         test_fd(fd4, "miau", 4);
         test_fd(fd5, "wuff", 4);
+
+        assert_se(sd_varlink_callb(c, "io.test.PassFD", &o, &e, SD_JSON_BUILD_OBJECT(SD_JSON_BUILD_PAIR("fdx", SD_JSON_BUILD_STRING("whoopx")))) >= 0);
+        ASSERT_TRUE(sd_varlink_error_is_invalid_parameter(e, o, "fd"));
 
         assert_se(sd_varlink_callb(c, "io.test.IDontExist", &o, &e, SD_JSON_BUILD_OBJECT(SD_JSON_BUILD_PAIR("x", SD_JSON_BUILD_REAL(5.5)))) >= 0);
         ASSERT_STREQ(sd_json_variant_string(sd_json_variant_by_key(o, "method")), "io.test.IDontExist");
@@ -347,7 +360,9 @@ TEST(chat) {
         assert_se(sd_event_source_set_priority(block_event, SD_EVENT_PRIORITY_IMPORTANT) >= 0);
         block_write_fd = TAKE_FD(block_fds[1]);
 
-        assert_se(sd_varlink_server_new(&s, SD_VARLINK_SERVER_ACCOUNT_UID) >= 0);
+        assert_se(varlink_server_new(&s, SD_VARLINK_SERVER_ACCOUNT_UID, NULL) >= 0);
+        assert_se(sd_varlink_server_set_info(s, "Vendor", "Product", "Version", "URL") >= 0);
+        assert_se(varlink_set_info_systemd(s) >= 0);
         assert_se(sd_varlink_server_set_description(s, "our-server") >= 0);
 
         assert_se(sd_varlink_server_bind_method(s, "io.test.PassFD", method_passfd) >= 0);

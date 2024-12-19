@@ -502,6 +502,7 @@ const SyscallFilterSet syscall_filter_sets[_SYSCALL_FILTER_SET_MAX] = {
                 "getdents\0"
                 "getdents64\0"
                 "getxattr\0"
+                "getxattrat\0"
                 "inotify_add_watch\0"
                 "inotify_init\0"
                 "inotify_init1\0"
@@ -511,6 +512,7 @@ const SyscallFilterSet syscall_filter_sets[_SYSCALL_FILTER_SET_MAX] = {
                 "linkat\0"
                 "listmount\0"
                 "listxattr\0"
+                "listxattrat\0"
                 "llistxattr\0"
                 "lremovexattr\0"
                 "lsetxattr\0"
@@ -531,11 +533,13 @@ const SyscallFilterSet syscall_filter_sets[_SYSCALL_FILTER_SET_MAX] = {
                 "readlink\0"
                 "readlinkat\0"
                 "removexattr\0"
+                "removexattrat\0"
                 "rename\0"
                 "renameat\0"
                 "renameat2\0"
                 "rmdir\0"
                 "setxattr\0"
+                "setxattrat\0"
                 "stat\0"
                 "stat64\0"
                 "statfs\0"
@@ -1734,14 +1738,13 @@ int seccomp_restrict_realtime_full(int error_code) {
 
         int r, max_policy = 0;
         uint32_t arch;
-        unsigned i;
 
         assert(error_code > 0);
 
         /* Determine the highest policy constant we want to allow */
-        for (i = 0; i < ELEMENTSOF(permitted_policies); i++)
-                if (permitted_policies[i] > max_policy)
-                        max_policy = permitted_policies[i];
+        FOREACH_ELEMENT(policy, permitted_policies)
+                if (*policy > max_policy)
+                        max_policy = *policy;
 
         SECCOMP_FOREACH_LOCAL_ARCH(arch) {
                 _cleanup_(seccomp_releasep) scmp_filter_ctx seccomp = NULL;
@@ -1759,8 +1762,8 @@ int seccomp_restrict_realtime_full(int error_code) {
                         bool good = false;
 
                         /* Check if this is in the allow list. */
-                        for (i = 0; i < ELEMENTSOF(permitted_policies); i++)
-                                if (permitted_policies[i] == p) {
+                        FOREACH_ELEMENT(policy, permitted_policies)
+                                if (*policy == p) {
                                         good = true;
                                         break;
                                 }

@@ -15,6 +15,7 @@ typedef struct Manager Manager;
 #include <stdio.h>
 #include <sys/capability.h>
 
+#include "bus-unit-util.h"
 #include "cgroup-util.h"
 #include "coredump-util.h"
 #include "cpu-set-util.h"
@@ -152,10 +153,17 @@ typedef enum ExecDirectoryType {
         _EXEC_DIRECTORY_TYPE_INVALID = -EINVAL,
 } ExecDirectoryType;
 
+static inline bool EXEC_DIRECTORY_TYPE_SHALL_CHOWN(ExecDirectoryType t) {
+        /* Returns true for the ExecDirectoryTypes that we shall chown()ing for the user to. We do this for
+         * all of them, except for configuration */
+        return t >= 0 && t < _EXEC_DIRECTORY_TYPE_MAX && t != EXEC_DIRECTORY_CONFIGURATION;
+}
+
 typedef struct ExecDirectoryItem {
         char *path;
         char **symlinks;
-        bool only_create;
+        ExecDirectoryFlags flags;
+        bool idmapped;
 } ExecDirectoryItem;
 
 typedef struct ExecDirectory {
@@ -324,10 +332,12 @@ struct ExecContext {
         bool protect_kernel_modules;
         bool protect_kernel_logs;
         bool protect_clock;
-        bool protect_control_groups;
+        ProtectControlGroups protect_control_groups;
         ProtectSystem protect_system;
         ProtectHome protect_home;
-        bool protect_hostname;
+        PrivatePIDs private_pids;
+        ProtectHostname protect_hostname;
+        char *private_hostname;
 
         bool dynamic_user;
         bool remove_ipc;
@@ -457,6 +467,7 @@ struct ExecParameters {
         char **files_env;
         int user_lookup_fd;
         int handoff_timestamp_fd;
+        int pidref_transport_fd;
 
         int bpf_restrict_fs_map_fd;
 
@@ -478,6 +489,7 @@ struct ExecParameters {
                 .bpf_restrict_fs_map_fd = -EBADF, \
                 .user_lookup_fd         = -EBADF, \
                 .handoff_timestamp_fd   = -EBADF, \
+                .pidref_transport_fd    = -EBADF, \
         }
 
 #include "unit.h"
@@ -579,7 +591,7 @@ void exec_params_deep_clear(ExecParameters *p);
 bool exec_context_get_cpu_affinity_from_numa(const ExecContext *c);
 
 void exec_directory_done(ExecDirectory *d);
-int exec_directory_add(ExecDirectory *d, const char *path, const char *symlink);
+int exec_directory_add(ExecDirectory *d, const char *path, const char *symlink, ExecDirectoryFlags flags);
 void exec_directory_sort(ExecDirectory *d);
 bool exec_directory_is_private(const ExecContext *context, ExecDirectoryType type);
 
@@ -615,6 +627,13 @@ ExecDirectoryType exec_resource_type_from_string(const char *s) _pure_;
 bool exec_needs_mount_namespace(const ExecContext *context, const ExecParameters *params, const ExecRuntime *runtime);
 bool exec_needs_network_namespace(const ExecContext *context);
 bool exec_needs_ipc_namespace(const ExecContext *context);
+bool exec_needs_pid_namespace(const ExecContext *context);
+
+ProtectControlGroups exec_get_protect_control_groups(const ExecContext *context, const ExecParameters *params);
+bool exec_needs_cgroup_namespace(const ExecContext *context, const ExecParameters *params);
+bool exec_needs_cgroup_mount(const ExecContext *context, const ExecParameters *params);
+bool exec_is_cgroup_mount_read_only(const ExecContext *context, const ExecParameters *params);
+const char* exec_get_private_notify_socket_path(const ExecContext *context, const ExecParameters *params, bool needs_sandboxing);
 
 /* These logging macros do the same logging as those in unit.h, but using ExecContext and ExecParameters
  * instead of the unit object, so that it can be used in the sd-executor context (where the unit object is

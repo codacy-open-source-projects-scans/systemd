@@ -93,7 +93,7 @@ static const MountPoint mount_table[] = {
 #endif
         { "tmpfs",       "/dev/shm",                  "tmpfs",      "mode=01777",                               MS_NOSUID|MS_NODEV|MS_STRICTATIME,
           NULL,          MNT_FATAL|MNT_IN_CONTAINER },
-        { "devpts",      "/dev/pts",                  "devpts",     "mode=0620,gid=" STRINGIFY(TTY_GID),        MS_NOSUID|MS_NOEXEC,
+        { "devpts",      "/dev/pts",                  "devpts",     "mode=" STRINGIFY(TTY_MODE) ",gid=" STRINGIFY(TTY_GID), MS_NOSUID|MS_NOEXEC,
           NULL,          MNT_IN_CONTAINER           },
 #if ENABLE_SMACK
         { "tmpfs",       "/run",                      "tmpfs",      "mode=0755,smackfsroot=*" TMPFS_LIMITS_RUN, MS_NOSUID|MS_NODEV|MS_STRICTATIME,
@@ -512,11 +512,27 @@ int mount_cgroup_legacy_controllers(bool loaded_policy) {
         _cleanup_set_free_ Set *controllers = NULL;
         int r;
 
+        /* Before we actually start deleting cgroup v1 code, make it harder to boot in cgroupv1 mode first.
+         * See also #30852. */
+
+        if (detect_container() <= 0) { /* If in container, we have to follow host's cgroup hierarchy. Only
+                                        * do the deprecation checks below if we're not in a container. */
+                if (cg_is_legacy_force_enabled())
+                        log_warning("Legacy support for cgroup v1 enabled via SYSTEMD_CGROUP_ENABLE_LEGACY_FORCE=1.");
+                else if (cg_is_legacy_enabled()) {
+                        log_full(LOG_CRIT,
+                                 "Legacy cgroup v1 configured. This will stop being supported soon.\n"
+                                 "Will proceed with cgroup v2 after 30 s.\n"
+                                 "Set systemd.unified_cgroup_hierarchy=1 to switch to cgroup v2 "
+                                 "or set SYSTEMD_CGROUP_ENABLE_LEGACY_FORCE=1 to reenable v1 temporarily.");
+                        (void) usleep_safe(30 * USEC_PER_SEC);
+
+                        return 0;
+                }
+        }
+
         if (!cg_is_legacy_wanted())
                 return 0;
-
-        if (!cg_is_legacy_force_enabled())
-                return -ERFKILL;
 
         FOREACH_ELEMENT(mp, cgroupv1_mount_table) {
                 r = mount_one(mp, loaded_policy);

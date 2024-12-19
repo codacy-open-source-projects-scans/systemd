@@ -23,6 +23,7 @@
 #include "stat-util.h"
 #include "user-util.h"
 #include "varlink-io.systemd.MountFileSystem.h"
+#include "varlink-util.h"
 
 #define ITERATIONS_MAX 64U
 #define RUNTIME_MAX_USEC (5 * USEC_PER_MINUTE)
@@ -276,17 +277,12 @@ static int vl_method_mount_image(
         Hashmap **polkit_registry = ASSERT_PTR(userdata);
         _cleanup_free_ char *ps = NULL;
         bool image_is_trusted = false;
-        uid_t peer_uid;
         int r;
 
         assert(link);
         assert(parameters);
 
         sd_json_variant_sensitive(parameters); /* might contain passwords */
-
-        r = sd_varlink_get_peer_uid(link, &peer_uid);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to get client UID: %m");
 
         r = sd_varlink_dispatch(link, parameters, dispatch_table, &p);
         if (r != 0)
@@ -527,17 +523,13 @@ static int vl_method_mount_image(
 
         loop_device_relinquish(loop);
 
-        r = sd_varlink_replybo(
+        return sd_varlink_replybo(
                         link,
                         SD_JSON_BUILD_PAIR("partitions", SD_JSON_BUILD_VARIANT(aj)),
                         SD_JSON_BUILD_PAIR("imagePolicy", SD_JSON_BUILD_STRING(ps)),
                         SD_JSON_BUILD_PAIR("imageSize", SD_JSON_BUILD_INTEGER(di->image_size)),
                         SD_JSON_BUILD_PAIR("sectorSize", SD_JSON_BUILD_INTEGER(di->sector_size)),
                         SD_JSON_BUILD_PAIR_CONDITION(!sd_id128_is_null(di->image_uuid), "imageUuid", SD_JSON_BUILD_UUID(di->image_uuid)));
-        if (r < 0)
-                return r;
-
-        return r;
 }
 
 static int process_connection(sd_varlink_server *server, int _fd) {
@@ -604,7 +596,7 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return log_error_errno(r, "Failed to turn off non-blocking mode for listening socket: %m");
 
-        r = sd_varlink_server_new(&server, SD_VARLINK_SERVER_INHERIT_USERDATA);
+        r = varlink_server_new(&server, SD_VARLINK_SERVER_INHERIT_USERDATA, NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate server: %m");
 

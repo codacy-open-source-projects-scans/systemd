@@ -480,17 +480,17 @@ finish:
         return 0;
 }
 
-void dns_name_hash_func(const char *p, struct siphash *state) {
+void dns_name_hash_func(const char *name, struct siphash *state) {
         int r;
 
-        assert(p);
+        assert(name);
 
-        for (;;) {
+        for (const char *p = name;;) {
                 char label[DNS_LABEL_MAX+1];
 
                 r = dns_label_unescape(&p, label, sizeof label, 0);
                 if (r < 0)
-                        break;
+                        return string_hash_func(p, state); /* fallback for invalid DNS names */
                 if (r == 0)
                         break;
 
@@ -516,13 +516,13 @@ int dns_name_compare_func(const char *a, const char *b) {
         for (;;) {
                 char la[DNS_LABEL_MAX+1], lb[DNS_LABEL_MAX+1];
 
-                if (x == NULL && y == NULL)
+                if (!x && !y)
                         return 0;
 
                 r = dns_label_unescape_suffix(a, &x, la, sizeof(la));
                 q = dns_label_unescape_suffix(b, &y, lb, sizeof(lb));
                 if (r < 0 || q < 0)
-                        return CMP(r, q);
+                        return strcmp(a, b); /* if not valid DNS labels, then let's compare the whole strings as is */
 
                 r = ascii_strcasecmp_nn(la, r, lb, q);
                 if (r != 0)
@@ -760,7 +760,7 @@ int dns_name_address(const char *p, int *ret_family, union in_addr_union *ret_ad
         if (r > 0) {
                 uint8_t a[4];
 
-                for (size_t i = 0; i < ELEMENTSOF(a); i++) {
+                FOREACH_ELEMENT(i, a) {
                         char label[DNS_LABEL_MAX+1];
 
                         r = dns_label_unescape(&p, label, sizeof label, 0);
@@ -771,7 +771,7 @@ int dns_name_address(const char *p, int *ret_family, union in_addr_union *ret_ad
                         if (r > 3)
                                 return -EINVAL;
 
-                        r = safe_atou8(label, &a[i]);
+                        r = safe_atou8(label, i);
                         if (r < 0)
                                 return r;
                 }

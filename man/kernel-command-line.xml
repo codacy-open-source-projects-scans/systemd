@@ -421,7 +421,7 @@
         <term><varname>rd.systemd.verity=</varname></term>
         <term><varname>systemd.verity_root_data=</varname></term>
         <term><varname>systemd.verity_root_hash=</varname></term>
-        <term><varname>systemd.verity.root_options=</varname></term>
+        <term><varname>systemd.verity_root_options=</varname></term>
         <term><varname>usrhash=</varname></term>
         <term><varname>systemd.verity_usr_data=</varname></term>
         <term><varname>systemd.verity_usr_hash=</varname></term>
@@ -461,7 +461,6 @@
 
       <varlistentry>
         <term><varname>systemd.image_policy=</varname></term>
-        <term><varname>rd.systemd.image_policy=</varname></term>
 
         <listitem><para>When GPT-based partition auto-discovery is used, configures the image dissection
         policy string to apply, as per

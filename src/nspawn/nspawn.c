@@ -290,7 +290,7 @@ static int handle_arg_console(const char *arg) {
         else if (streq(arg, "passive"))
                 arg_console_mode = CONSOLE_PASSIVE;
         else if (streq(arg, "pipe")) {
-                if (isatty_safe(STDIN_FILENO) && isatty(STDOUT_FILENO))
+                if (isatty_safe(STDIN_FILENO) && isatty_safe(STDOUT_FILENO))
                         log_full(arg_quiet ? LOG_DEBUG : LOG_NOTICE,
                                  "Console mode 'pipe' selected, but standard input/output are connected to an interactive TTY. "
                                  "Most likely you want to use 'interactive' console mode for proper interactivity and shell job control. "
@@ -298,7 +298,7 @@ static int handle_arg_console(const char *arg) {
 
                 arg_console_mode = CONSOLE_PIPE;
         } else if (streq(arg, "autopipe")) {
-                if (isatty_safe(STDIN_FILENO) && isatty(STDOUT_FILENO))
+                if (isatty_safe(STDIN_FILENO) && isatty_safe(STDOUT_FILENO))
                         arg_console_mode = CONSOLE_INTERACTIVE;
                 else
                         arg_console_mode = CONSOLE_PIPE;
@@ -477,7 +477,8 @@ static int custom_mount_check_all(void) {
                 if (path_equal(m->destination, "/") && arg_userns_mode != USER_NAMESPACE_NO) {
                         if (arg_userns_ownership != USER_NAMESPACE_OWNERSHIP_OFF)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                                       "--private-users-ownership=own may not be combined with custom root mounts.");
+                                                       "--private-users-ownership=%s may not be combined with custom root mounts.",
+                                                       user_namespace_ownership_to_string(arg_userns_ownership));
                         if (arg_uid_shift == UID_INVALID)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "--private-users with automatic UID shift may not be combined with custom root mounts.");
@@ -2211,7 +2212,8 @@ static bool should_enable_fuse(void) {
                 else if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
                         log_debug_errno(r, "Disabling FUSE: Kernel does not support the fsopen() family of syscalls: %m");
                 else
-                        log_warning_errno(r, "Disabling FUSE: Failed to determine FUSE version: %m");
+                        log_full_errno(ERRNO_IS_NEG_PRIVILEGE(r) ? LOG_DEBUG : LOG_WARNING, r,
+                                       "Disabling FUSE: Failed to determine FUSE version: %m");
                 return false;
         }
 
@@ -2226,97 +2228,143 @@ static bool should_enable_fuse(void) {
         return true;
 }
 
+static int bind_mount_devnode(const char *from, const char *to) {
+        int r;
+
+        assert(from);
+        assert(to);
+
+        r = touch(to);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to touch %s: %m", to);
+
+        r = mount_nofollow_verbose(LOG_DEBUG, from, to, NULL, MS_BIND, NULL);
+        if (r < 0) {
+                (void) unlink(to);
+                return log_error_errno(r, "Failed to bind mount %s to %s: %m", from, to);
+        }
+
+        return 0;
+}
+
+static int copy_devnode_one(const char *dest, const char *node, bool ignore_mknod_failure) {
+        int r;
+
+        assert(dest);
+        assert(!isempty(node));
+
+        BLOCK_WITH_UMASK(0000);
+
+        _cleanup_free_ char *from = path_join("/dev/", node);
+        if (!from)
+                return log_oom();
+
+        _cleanup_free_ char *to = path_join(dest, from);
+        if (!to)
+                return log_oom();
+
+        struct stat st;
+        if (stat(from, &st) < 0) {
+                if (errno != ENOENT)
+                        return log_error_errno(errno, "Failed to stat %s: %m", from);
+
+                log_debug_errno(errno, "Device node %s does not exist, ignoring.", from);
+                return 0;
+        }
+        if (!S_ISCHR(st.st_mode) && !S_ISBLK(st.st_mode))
+                return log_error_errno(SYNTHETIC_ERRNO(ESTALE), "%s is not a device node.", from);
+
+        /* Create the parent directory of the device node. Here, we assume that the path has at most one
+         * subdirectory under /dev/, e.g. /dev/net/tun. */
+        _cleanup_free_ char *parent = NULL;
+        r = path_extract_directory(from, &parent);
+        if (r < 0)
+                return log_error_errno(r, "Failed to extract directory from %s: %m", from);
+        r = userns_mkdir(dest, parent, 0755, 0, 0);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create directory %s: %m", parent);
+
+        if (mknod(to, st.st_mode, st.st_rdev) < 0) {
+                r = -errno; /* Save the original error code. */
+                /* Explicitly warn the user when /dev/ is already populated. */
+                if (r == -EEXIST)
+                        log_notice("%s/dev/ is pre-mounted and pre-populated. If a pre-mounted /dev/ is provided it needs to be an unpopulated file system.", dest);
+                /* If arg_uid_shift != 0, then we cannot fall back to use bind mount. */
+                if (arg_uid_shift != 0) {
+                        if (ignore_mknod_failure) {
+                                log_debug_errno(r, "Failed to mknod(%s), ignoring: %m", to);
+                                return 0;
+                        }
+                        return log_error_errno(r, "Failed to mknod(%s): %m", to);
+                }
+
+                /* Some systems abusively restrict mknod but allow bind mounts. */
+                if (bind_mount_devnode(from, to) < 0) {
+                        /* use the original error code. */
+                        if (ignore_mknod_failure) {
+                                log_debug_errno(r, "Both mknod() and bind mount %s failed, ignoring: %m", to);
+                                return 0;
+                        }
+                        return log_error_errno(r, "Both mknod() and bind mount %s failed: %m", to);
+                }
+        } else {
+                /* mknod() succeeds, chown() it if necessary. */
+                r = userns_lchown(to, 0, 0);
+                if (r < 0)
+                        return log_error_errno(r, "chown() of device node %s failed: %m", to);
+        }
+
+        _cleanup_free_ char *dn = path_join("/dev", S_ISCHR(st.st_mode) ? "char" : "block");
+        if (!dn)
+                return log_oom();
+
+        r = userns_mkdir(dest, dn, 0755, 0, 0);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create '%s': %m", dn);
+
+        _cleanup_free_ char *sl = NULL;
+        if (asprintf(&sl, "%s/%u:%u", dn, major(st.st_rdev), minor(st.st_rdev)) < 0)
+                return log_oom();
+
+        _cleanup_free_ char *prefixed = path_join(dest, sl);
+        if (!prefixed)
+                return log_oom();
+
+        _cleanup_free_ char *t = path_join("..", node);
+        if (!t)
+                return log_oom();
+
+        if (symlink(t, prefixed) < 0)
+                log_debug_errno(errno, "Failed to symlink '%s' to '%s', ignoring: %m", t, prefixed);
+
+        return 0;
+}
+
 static int copy_devnodes(const char *dest, bool enable_fuse) {
-        _cleanup_strv_free_ char **devnodes = NULL;
         int r = 0;
 
         assert(dest);
 
-        devnodes = strv_new("null",
-                            "zero",
-                            "full",
-                            "random",
-                            "urandom",
-                            "tty",
-                            STRV_IFNOTNULL(enable_fuse ? "fuse" : NULL),
-                            "net/tun");
-        if (!devnodes)
-                return log_oom();
-
-        BLOCK_WITH_UMASK(0000);
-
-        /* Create /dev/net, so that we can create /dev/net/tun in it */
-        if (userns_mkdir(dest, "/dev/net", 0755, 0, 0) < 0)
-                return log_error_errno(r, "Failed to create /dev/net directory: %m");
-
-        STRV_FOREACH(d, devnodes) {
-                _cleanup_free_ char *from = NULL, *to = NULL;
-                struct stat st;
-
-                from = path_join("/dev/", *d);
-                if (!from)
-                        return log_oom();
-
-                to = path_join(dest, from);
-                if (!to)
-                        return log_oom();
-
-                if (stat(from, &st) < 0) {
-
-                        if (errno != ENOENT)
-                                return log_error_errno(errno, "Failed to stat %s: %m", from);
-
-                } else if (!S_ISCHR(st.st_mode) && !S_ISBLK(st.st_mode))
-                        return log_error_errno(SYNTHETIC_ERRNO(EIO),
-                                               "%s is not a char or block device, cannot copy.", from);
-                else {
-                        _cleanup_free_ char *sl = NULL, *prefixed = NULL, *dn = NULL, *t = NULL;
-
-                        if (mknod(to, st.st_mode, st.st_rdev) < 0) {
-                                /* Explicitly warn the user when /dev is already populated. */
-                                if (errno == EEXIST)
-                                        log_notice("%s/dev/ is pre-mounted and pre-populated. If a pre-mounted /dev/ is provided it needs to be an unpopulated file system.", dest);
-                                if (!ERRNO_IS_PRIVILEGE(errno) || arg_uid_shift != 0)
-                                        return log_error_errno(errno, "mknod(%s) failed: %m", to);
-
-                                /* Some systems abusively restrict mknod but allow bind mounts. */
-                                r = touch(to);
-                                if (r < 0)
-                                        return log_error_errno(r, "touch (%s) failed: %m", to);
-                                r = mount_nofollow_verbose(LOG_DEBUG, from, to, NULL, MS_BIND, NULL);
-                                if (r < 0)
-                                        return log_error_errno(r, "Both mknod and bind mount (%s) failed: %m", to);
-                        } else {
-                                r = userns_lchown(to, 0, 0);
-                                if (r < 0)
-                                        return log_error_errno(r, "chown() of device node %s failed: %m", to);
-                        }
-
-                        dn = path_join("/dev", S_ISCHR(st.st_mode) ? "char" : "block");
-                        if (!dn)
-                                return log_oom();
-
-                        r = userns_mkdir(dest, dn, 0755, 0, 0);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to create '%s': %m", dn);
-
-                        if (asprintf(&sl, "%s/%u:%u", dn, major(st.st_rdev), minor(st.st_rdev)) < 0)
-                                return log_oom();
-
-                        prefixed = path_join(dest, sl);
-                        if (!prefixed)
-                                return log_oom();
-
-                        t = path_join("..", *d);
-                        if (!t)
-                                return log_oom();
-
-                        if (symlink(t, prefixed) < 0)
-                                log_debug_errno(errno, "Failed to symlink '%s' to '%s': %m", t, prefixed);
-                }
+        FOREACH_STRING(node, "null", "zero", "full", "random", "urandom", "tty") {
+                r = copy_devnode_one(dest, node, /* ignore_mknod_failure = */ false);
+                if (r < 0)
+                        return r;
         }
 
-        return r;
+        if (enable_fuse) {
+                r = copy_devnode_one(dest, "fuse", /* ignore_mknod_failure = */ false);
+                if (r < 0)
+                        return r;
+        }
+
+        /* We unconditionally try to create /dev/net/tun, but let's ignore failure if --private-network is
+         * unspecified. The failure can be triggered when e.g. DevicePolicy= is set, but DeviceAllow= does
+         * not contains the device node, and --private-users=pick is specified. */
+        r = copy_devnode_one(dest, "net/tun", /* ignore_mknod_failure = */ !arg_private_network);
+        if (r < 0)
+                return r;
+
+        return 0;
 }
 
 static int make_extra_nodes(const char *dest) {
@@ -2351,13 +2399,13 @@ static int setup_pts(const char *dest) {
 #if HAVE_SELINUX
         if (arg_selinux_apifs_context)
                 (void) asprintf(&options,
-                                "newinstance,ptmxmode=0666,mode=620,gid=" GID_FMT ",context=\"%s\"",
+                                "newinstance,ptmxmode=0666,mode=" STRINGIFY(TTY_MODE) ",gid=" GID_FMT ",context=\"%s\"",
                                 arg_uid_shift + TTY_GID,
                                 arg_selinux_apifs_context);
         else
 #endif
                 (void) asprintf(&options,
-                                "newinstance,ptmxmode=0666,mode=620,gid=" GID_FMT,
+                                "newinstance,ptmxmode=0666,mode=" STRINGIFY(TTY_MODE) ",gid=" GID_FMT,
                                 arg_uid_shift + TTY_GID);
 
         if (!options)
@@ -2763,7 +2811,7 @@ static int drop_capabilities(uid_t uid) {
                 if (q.permitted == UINT64_MAX)
                         q.permitted = uid == 0 ? q.bounding : arg_caps_ambient;
 
-                if (q.ambient == UINT64_MAX && ambient_capabilities_supported())
+                if (q.ambient == UINT64_MAX)
                         q.ambient = arg_caps_ambient;
 
                 if (capability_quintet_mangle(&q))
@@ -2775,7 +2823,7 @@ static int drop_capabilities(uid_t uid) {
                         .effective = uid == 0 ? arg_caps_retain : 0,
                         .inheritable = uid == 0 ? arg_caps_retain : arg_caps_ambient,
                         .permitted = uid == 0 ? arg_caps_retain : arg_caps_ambient,
-                        .ambient = ambient_capabilities_supported() ? arg_caps_ambient : UINT64_MAX,
+                        .ambient = arg_caps_ambient,
                 };
 
                 /* If we're not using OCI, proceed with mangled capabilities (so we don't error out)
@@ -3288,17 +3336,15 @@ static int patch_sysctl(void) {
 
         STRV_FOREACH_PAIR(k, v, arg_sysctl) {
                 bool good = false;
-                size_t i;
 
-                for (i = 0; i < ELEMENTSOF(safe_sysctl); i++) {
-
-                        if (!FLAGS_SET(flags, safe_sysctl[i].clone_flags))
+                FOREACH_ELEMENT(i, safe_sysctl) {
+                        if (!FLAGS_SET(flags, i->clone_flags))
                                 continue;
 
-                        if (safe_sysctl[i].prefix)
-                                good = startswith(*k, safe_sysctl[i].key);
+                        if (i->prefix)
+                                good = startswith(*k, i->key);
                         else
-                                good = streq(*k, safe_sysctl[i].key);
+                                good = streq(*k, i->key);
 
                         if (good)
                                 break;
@@ -4607,7 +4653,7 @@ static int nspawn_dispatch_notify_fd(sd_event_source *source, int fd, uint32_t r
 
         ucred = CMSG_FIND_DATA(&msghdr, SOL_SOCKET, SCM_CREDENTIALS, struct ucred);
         if (!ucred || ucred->pid != inner_child_pid) {
-                log_debug("Received notify message without valid credentials. Ignoring.");
+                log_debug("Received notify message from process that is not the payload's PID 1. Ignoring.");
                 return 0;
         }
 
@@ -5108,15 +5154,15 @@ static int load_oci_bundle(void) {
 }
 
 static int run_container(
-               DissectedImage *dissected_image,
-               int userns_fd,
-               FDSet *fds,
-               char veth_name[IFNAMSIZ],
-               bool *veth_created,
-               struct ExposeArgs *expose_args,
-               int *master,
-               pid_t *pid,
-               int *ret) {
+                DissectedImage *dissected_image,
+                int userns_fd,
+                FDSet *fds,
+                char veth_name[IFNAMSIZ],
+                bool *veth_created,
+                struct ExposeArgs *expose_args,
+                int *master,
+                pid_t *pid,
+                int *ret) {
 
         static const struct sigaction sa = {
                 .sa_handler = nop_signal_handler,
@@ -5694,16 +5740,6 @@ static int run_container(
         if (r < 0)
                 return log_error_errno(r, "Failed to run event loop: %m");
 
-        if (forward) {
-                char last_char = 0;
-
-                (void) pty_forward_get_last_char(forward, &last_char);
-                forward = pty_forward_free(forward);
-
-                if (!arg_quiet && last_char != '\n')
-                        putc('\n', stdout);
-        }
-
         /* Kill if it is not dead yet anyway */
         if (!arg_register && !arg_keep_unit && bus)
                 terminate_scope(bus, arg_machine);
@@ -5726,7 +5762,7 @@ static int run_container(
         r = wait_for_container(TAKE_PID(*pid), &container_status);
 
         /* Tell machined that we are gone. */
-        if (bus)
+        if (arg_register && bus)
                 (void) unregister_machine(bus, arg_machine);
 
         if (r < 0)
@@ -5981,7 +6017,7 @@ static int run(int argc, char *argv[]) {
         umask(0022);
 
         if (arg_console_mode < 0)
-                arg_console_mode = isatty_safe(STDIN_FILENO) && isatty(STDOUT_FILENO) ?
+                arg_console_mode = isatty_safe(STDIN_FILENO) && isatty_safe(STDOUT_FILENO) ?
                                    CONSOLE_INTERACTIVE : CONSOLE_READ_ONLY;
 
         if (arg_console_mode == CONSOLE_PIPE) /* if we pass STDERR on to the container, don't add our own logs into it too */
@@ -6154,9 +6190,12 @@ static int run(int argc, char *argv[]) {
                                 goto finish;
                         }
 
-                        if (access_nofollow(p, F_OK) < 0) {
-                                r = log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                                    "Directory %s doesn't look like it has an OS tree (/usr/ directory is missing). Refusing.", arg_directory);
+                        r = access_nofollow(p, F_OK);
+                        if (r == -ENOENT) {
+                                log_error_errno(r, "Directory %s doesn't look like it has an OS tree (/usr/ directory is missing). Refusing.", arg_directory);
+                                goto finish;
+                        } else if (r < 0) {
+                                log_error_errno(r, "Unable to determine if %s looks like it has an OS tree (i.e. whether /usr/ exists): %m", arg_directory);
                                 goto finish;
                         }
                 }

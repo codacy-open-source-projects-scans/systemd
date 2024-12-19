@@ -1141,7 +1141,7 @@
 
         <para>Both settings take a time span with the default unit of seconds, but other units may be
         specified, see
-        <citerefentry><refentrytitle>systemd.time</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
+        <citerefentry><refentrytitle>systemd.time</refentrytitle><manvolnum>7</manvolnum></citerefentry>.
         The default is <literal>infinity</literal> (job timeouts disabled), except for device units where
         <varname>JobRunningTimeoutSec=</varname> defaults to <varname>DefaultDeviceTimeoutSec=</varname>.
         </para>
@@ -1185,7 +1185,7 @@
 
         <para><replaceable>interval</replaceable> is a time span with the default unit of seconds, but other
         units may be specified, see
-        <citerefentry><refentrytitle>systemd.time</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
+        <citerefentry><refentrytitle>systemd.time</refentrytitle><manvolnum>7</manvolnum></citerefentry>.
         The special value <literal>infinity</literal> can be used to limit the total number of start
         attempts, even if they happen at large time intervals.
         Defaults to <varname>DefaultStartLimitIntervalSec=</varname> in manager configuration file, and may
@@ -1990,6 +1990,16 @@
         </varlistentry>
 
         <varlistentry>
+          <term><varname>ConditionKernelModuleLoaded=</varname></term>
+
+          <listitem><para>Test whether the specified kernel module has been loaded and is already fully
+          initialized.</para>
+
+          <xi:include href="version-info.xml" xpointer="v258"/>
+          </listitem>
+        </varlistentry>
+
+        <varlistentry>
           <term><varname>AssertArchitecture=</varname></term>
           <term><varname>AssertVirtualization=</varname></term>
           <term><varname>AssertHost=</varname></term>
@@ -2022,6 +2032,7 @@
           <term><varname>AssertMemoryPressure=</varname></term>
           <term><varname>AssertCPUPressure=</varname></term>
           <term><varname>AssertIOPressure=</varname></term>
+          <term><varname>AssertKernelModuleLoaded=</varname></term>
 
           <listitem><para>Similar to the <varname>ConditionArchitecture=</varname>,
           <varname>ConditionVirtualization=</varname>, …, condition settings described above, these settings
@@ -2626,7 +2637,7 @@ Description=My failure handler for %i
 Type=oneshot
 # Perform some special action for when %i exits unexpectedly.
 ExecStart=/usr/sbin/myfailurehandler %i
-     </programlisting>
+</programlisting>
 
      <para>We can then add an instance of
      <filename index='false'>failure-handler@.service</filename> as an
@@ -2637,7 +2648,7 @@ ExecStart=/usr/sbin/myfailurehandler %i
 
     <programlisting>[Unit]
 OnFailure=failure-handler@%N.service
-    </programlisting>
+</programlisting>
 
     <para>Now, after running <command>systemctl daemon-reload</command> all
     services will have acquired an <varname>OnFailure=</varname> dependency on
@@ -2655,7 +2666,7 @@ OnFailure=failure-handler@%N.service
 <command>mkdir /etc/systemd/system/failure-handler@.service.d/</command>
 <command>ln -s /dev/null /etc/systemd/system/failure-handler@.service.d/10-all.conf</command>
 <command>systemctl daemon-reload</command>
-    </programlisting>
+</programlisting>
 
     <para>This ensures that if a <filename index='false'>failure-handler@.service</filename> instance fails it will not trigger an instance named
     <filename index='false'>failure-handler@failure-handler.service</filename>.</para>

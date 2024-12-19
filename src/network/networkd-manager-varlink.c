@@ -12,6 +12,7 @@
 #include "networkd-manager-varlink.h"
 #include "stat-util.h"
 #include "varlink-io.systemd.Network.h"
+#include "varlink-util.h"
 
 static int vl_method_get_states(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
         Manager *m = ASSERT_PTR(userdata);
@@ -69,8 +70,8 @@ typedef struct InterfaceInfo {
 
 static int dispatch_interface(sd_varlink *vlink, sd_json_variant *parameters, Manager *manager, Link **ret) {
         static const sd_json_dispatch_field dispatch_table[] = {
-                { "InterfaceIndex", _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_int,          offsetof(InterfaceInfo, ifindex), 0 },
-                { "InterfaceName",  SD_JSON_VARIANT_STRING,        sd_json_dispatch_const_string, offsetof(InterfaceInfo, ifname),  0 },
+                { "InterfaceIndex", _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_ifindex,         offsetof(InterfaceInfo, ifindex), SD_JSON_RELAX },
+                { "InterfaceName",  SD_JSON_VARIANT_STRING,        sd_json_dispatch_const_string, offsetof(InterfaceInfo, ifname),  0             },
                 {}
         };
 
@@ -270,11 +271,9 @@ int manager_connect_varlink(Manager *m) {
         if (m->varlink_server)
                 return 0;
 
-        r = sd_varlink_server_new(&s, SD_VARLINK_SERVER_ACCOUNT_UID|SD_VARLINK_SERVER_INHERIT_USERDATA);
+        r = varlink_server_new(&s, SD_VARLINK_SERVER_ACCOUNT_UID|SD_VARLINK_SERVER_INHERIT_USERDATA, m);
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate varlink server object: %m");
-
-        sd_varlink_server_set_userdata(s, m);
 
         (void) sd_varlink_server_set_description(s, "varlink-api-network");
 

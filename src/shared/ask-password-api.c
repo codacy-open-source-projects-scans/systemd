@@ -22,6 +22,7 @@
 #include "ansi-color.h"
 #include "ask-password-api.h"
 #include "creds-util.h"
+#include "env-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "format-util.h"
@@ -43,6 +44,7 @@
 #include "random-util.h"
 #include "signal-util.h"
 #include "socket-util.h"
+#include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
 #include "terminal-util.h"
@@ -52,6 +54,17 @@
 #include "utf8.h"
 
 #define KEYRING_TIMEOUT_USEC ((5 * USEC_PER_MINUTE) / 2)
+
+static const char* keyring_table[] = {
+        [-KEY_SPEC_THREAD_KEYRING]       = "thread",
+        [-KEY_SPEC_PROCESS_KEYRING]      = "process",
+        [-KEY_SPEC_SESSION_KEYRING]      = "session",
+        [-KEY_SPEC_USER_KEYRING]         = "user",
+        [-KEY_SPEC_USER_SESSION_KEYRING] = "user-session",
+        [-KEY_SPEC_GROUP_KEYRING]        = "group",
+};
+
+DEFINE_PRIVATE_STRING_TABLE_LOOKUP_FROM_STRING(keyring, int);
 
 static int lookup_key(const char *keyname, key_serial_t *ret) {
         key_serial_t serial;
@@ -113,6 +126,58 @@ static int touch_ask_password_directory(AskPasswordFlags flags) {
         return 1; /* did something */
 }
 
+static usec_t keyring_cache_timeout(void) {
+        static usec_t saved_timeout = KEYRING_TIMEOUT_USEC;
+        static bool saved_timeout_set = false;
+        int r;
+
+        if (saved_timeout_set)
+                return saved_timeout;
+
+        const char *e = secure_getenv("SYSTEMD_ASK_PASSWORD_KEYRING_TIMEOUT_SEC");
+        if (e) {
+                r = parse_sec(e, &saved_timeout);
+                if (r < 0)
+                        log_debug_errno(r, "Invalid value in $SYSTEMD_ASK_PASSWORD_KEYRING_TIMEOUT_SEC, ignoring: %s", e);
+        }
+
+        saved_timeout_set = true;
+
+        return saved_timeout;
+}
+
+static key_serial_t keyring_cache_type(void) {
+        static key_serial_t saved_keyring = KEY_SPEC_USER_KEYRING;
+        static bool saved_keyring_set = false;
+        int r;
+
+        if (saved_keyring_set)
+                return saved_keyring;
+
+        const char *e = secure_getenv("SYSTEMD_ASK_PASSWORD_KEYRING_TYPE");
+        if (e) {
+                key_serial_t keyring;
+
+                r = safe_atoi32(e, &keyring);
+                if (r >= 0)
+                        if (keyring < 0)
+                                log_debug_errno(keyring, "Invalid value in $SYSTEMD_ASK_PASSWORD_KEYRING_TYPE, ignoring: %s", e);
+                        else
+                                saved_keyring = keyring;
+                else {
+                        keyring = keyring_from_string(e);
+                        if (keyring < 0)
+                                log_debug_errno(keyring, "Invalid value in $SYSTEMD_ASK_PASSWORD_KEYRING_TYPE, ignoring: %s", e);
+                        else
+                                saved_keyring = -keyring;
+                }
+        }
+
+        saved_keyring_set = true;
+
+        return saved_keyring;
+}
+
 static int add_to_keyring(const char *keyname, AskPasswordFlags flags, char **passwords) {
         _cleanup_strv_free_erase_ char **l = NULL;
         _cleanup_(erase_and_freep) char *p = NULL;
@@ -122,7 +187,7 @@ static int add_to_keyring(const char *keyname, AskPasswordFlags flags, char **pa
 
         assert(keyname);
 
-        if (!FLAGS_SET(flags, ASK_PASSWORD_PUSH_CACHE))
+        if (!FLAGS_SET(flags, ASK_PASSWORD_PUSH_CACHE) || keyring_cache_timeout() == 0)
                 return 0;
         if (strv_isempty(passwords))
                 return 0;
@@ -147,13 +212,14 @@ static int add_to_keyring(const char *keyname, AskPasswordFlags flags, char **pa
          * have multiple passwords. */
         n = LESS_BY(n, (size_t) 1);
 
-        serial = add_key("user", keyname, p, n, KEY_SPEC_USER_KEYRING);
+        serial = add_key("user", keyname, p, n, keyring_cache_type());
         if (serial == -1)
                 return -errno;
 
-        if (keyctl(KEYCTL_SET_TIMEOUT,
-                   (unsigned long) serial,
-                   (unsigned long) DIV_ROUND_UP(KEYRING_TIMEOUT_USEC, USEC_PER_SEC), 0, 0) < 0)
+        if (keyring_cache_timeout() != USEC_INFINITY &&
+                keyctl(KEYCTL_SET_TIMEOUT,
+                       (unsigned long) serial,
+                       (unsigned long) DIV_ROUND_UP(keyring_cache_timeout(), USEC_PER_SEC), 0, 0) < 0)
                 log_debug_errno(errno, "Failed to adjust kernel keyring key timeout: %m");
 
         /* Tell everyone to check the keyring */

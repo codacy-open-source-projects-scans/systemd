@@ -142,6 +142,15 @@ static int request_new(
         assert(manager);
         assert(process);
 
+        /* Note, requests will be processed only when the manager is in MANAGER_RUNNING. If a new operation
+         * is requested when the manager is in MANAGER_TERMINATING or MANAGER_RESTARTING, the request will be
+         * successfully queued but will never be processed. Then, here why we refuse new requests when the
+         * manager is in MANAGER_STOPPED? This is because we cannot call link_ref() in that case, as this may
+         * be called during link_free(), that means the reference counter of the link is already 0 and
+         * calling link_ref() below triggers assertion. */
+        if (manager->state == MANAGER_STOPPED)
+                return -EBUSY;
+
         req = new(Request, 1);
         if (!req)
                 return -ENOMEM;
@@ -193,6 +202,7 @@ int netdev_queue_request(
         int r;
 
         assert(netdev);
+        assert(netdev->manager);
 
         r = request_new(netdev->manager, NULL, REQUEST_TYPE_NETDEV_INDEPENDENT,
                         netdev, (mfree_func_t) netdev_unref,
@@ -425,6 +435,12 @@ int remove_request_add(
         assert(netlink);
         assert(message);
 
+        /* Unlike request_new(), remove requests will be also processed when the manager is in
+         * MANAGER_TERMINATING or MANAGER_RESTARTING. When the manager is in MANAGER_STOPPED, we cannot
+         * queue new remove requests anymore with the same reason explained in request_new(). */
+        if (manager->state == MANAGER_STOPPED)
+                return 0; /* ignored */
+
         req = new(RemoveRequest, 1);
         if (!req)
                 return -ENOMEM;
@@ -446,7 +462,7 @@ int remove_request_add(
         req->unref_func = unref_func;
 
         TAKE_PTR(req);
-        return 0;
+        return 1; /* queued */
 }
 
 int manager_process_remove_requests(Manager *manager) {

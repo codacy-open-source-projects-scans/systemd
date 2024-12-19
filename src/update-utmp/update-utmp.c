@@ -53,6 +53,12 @@ static int get_startup_monotonic_time(Context *c, usec_t *ret) {
         assert(c);
         assert(ret);
 
+        if (!c->bus) {
+                r = bus_connect_system_systemd(&c->bus);
+                if (r < 0)
+                        return log_warning_errno(r, "Failed to get D-Bus connection, ignoring: %m");
+        }
+
         r = bus_get_property_trivial(
                         c->bus,
                         bus_systemd_mgr,
@@ -64,6 +70,8 @@ static int get_startup_monotonic_time(Context *c, usec_t *ret) {
 
         return 0;
 }
+
+#define MAX_ATTEMPTS 64u
 
 static int get_current_runlevel(Context *c) {
         static const struct {
@@ -84,17 +92,21 @@ static int get_current_runlevel(Context *c) {
         for (unsigned n_attempts = 0;;) {
                 if (n_attempts++ > 0) {
                         /* systemd might have dropped off momentarily, let's not make this an error,
-                        * and wait some random time. Let's pick a random time in the range 0ms…250ms,
+                        * and wait some random time. Let's pick a random time in the range 100ms…2000ms,
                         * linearly scaled by the number of failed attempts. */
                         c->bus = sd_bus_flush_close_unref(c->bus);
 
-                        usec_t usec = random_u64_range(UINT64_C(10) * USEC_PER_MSEC +
-                                                UINT64_C(240) * USEC_PER_MSEC * n_attempts/64);
+                        usec_t usec =
+                                UINT64_C(100) * USEC_PER_MSEC +
+                                random_u64_range(UINT64_C(1900) * USEC_PER_MSEC * n_attempts / MAX_ATTEMPTS);
                         (void) usleep_safe(usec);
+                }
 
+                if (!c->bus) {
                         r = bus_connect_system_systemd(&c->bus);
                         if (r == -ECONNREFUSED && n_attempts < 64) {
-                                log_debug_errno(r, "Failed to reconnect to system bus, retrying after a slight delay: %m");
+                                log_debug_errno(r, "Failed to %s to system bus, retrying after a slight delay: %m",
+                                                n_attempts <= 1 ? "connect" : "reconnect");
                                 continue;
                         }
                         if (r < 0)
@@ -121,7 +133,7 @@ static int get_current_runlevel(Context *c) {
                              sd_bus_error_has_names(&error,
                                                     SD_BUS_ERROR_NO_REPLY,
                                                     SD_BUS_ERROR_DISCONNECTED)) &&
-                            n_attempts < 64) {
+                            n_attempts < MAX_ATTEMPTS) {
                                 log_debug_errno(r, "Failed to get state of %s, retrying after a slight delay: %s",
                                                 e->special, bus_error_message(&error, r));
                                 break;
@@ -248,7 +260,6 @@ static int run(int argc, char *argv[]) {
                 .audit_fd = -EBADF,
 #endif
         };
-        int r;
 
         log_setup();
 
@@ -261,9 +272,6 @@ static int run(int argc, char *argv[]) {
                 log_full_errno(IN_SET(errno, EAFNOSUPPORT, EPROTONOSUPPORT) ? LOG_DEBUG : LOG_WARNING,
                                errno, "Failed to connect to audit log, ignoring: %m");
 #endif
-        r = bus_connect_system_systemd(&c.bus);
-        if (r < 0)
-                return log_error_errno(r, "Failed to get D-Bus connection: %m");
 
         return dispatch_verb(argc, argv, verbs, &c);
 }

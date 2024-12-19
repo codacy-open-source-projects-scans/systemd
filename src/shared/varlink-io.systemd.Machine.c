@@ -95,12 +95,70 @@ static SD_VARLINK_DEFINE_METHOD_FULL(
                 SD_VARLINK_FIELD_COMMENT("Return the base UID/GID of the machine"),
                 SD_VARLINK_DEFINE_OUTPUT(UIDShift, SD_VARLINK_INT, SD_VARLINK_NULLABLE));
 
+static SD_VARLINK_DEFINE_ENUM_TYPE(
+                MachineOpenMode,
+                SD_VARLINK_FIELD_COMMENT("This mode allocates a pseudo TTY in the container and returns a file descriptor and its path. This is equivalent to transitioning into the container and invoking posix_openpt(3)."),
+                SD_VARLINK_DEFINE_ENUM_VALUE(tty),
+                SD_VARLINK_FIELD_COMMENT("This mode allocates a pseudo TTY in the container and ensures that a getty login prompt of the container is running on the other end. It returns the file descriptor of the PTY and the PTY path. This is useful for acquiring a pty with a login prompt from the container."),
+                SD_VARLINK_DEFINE_ENUM_VALUE(login),
+                SD_VARLINK_FIELD_COMMENT("This mode allocates a pseudo TTY in the container, as the specified user, and invokes the executable at the specified path with a list of arguments (starting from argv[0]) and an environment block. It then returns the file descriptor of the PTY and the PTY path."),
+                SD_VARLINK_DEFINE_ENUM_VALUE(shell));
+
+static SD_VARLINK_DEFINE_METHOD(
+                Open,
+                VARLINK_DEFINE_MACHINE_LOOKUP_AND_POLKIT_INPUT_FIELDS,
+                SD_VARLINK_FIELD_COMMENT("There are three possible values: 'tty', 'login', and 'shell'. Please see description for each of the modes."),
+                SD_VARLINK_DEFINE_INPUT_BY_TYPE(mode, MachineOpenMode, 0),
+                SD_VARLINK_FIELD_COMMENT("See description of mode='shell'. Valid only when mode='shell'"),
+                SD_VARLINK_DEFINE_INPUT(user, SD_VARLINK_STRING, SD_VARLINK_NULLABLE),
+                SD_VARLINK_FIELD_COMMENT("See description of mode='shell'. Valid only when mode='shell'"),
+                SD_VARLINK_DEFINE_INPUT(path, SD_VARLINK_STRING, SD_VARLINK_NULLABLE),
+                SD_VARLINK_FIELD_COMMENT("See description of mode='shell'. Valid only when mode='shell'"),
+                SD_VARLINK_DEFINE_INPUT(args, SD_VARLINK_STRING, SD_VARLINK_NULLABLE|SD_VARLINK_ARRAY),
+                SD_VARLINK_FIELD_COMMENT("See description of mode='shell'. Valid only when mode='shell'"),
+                SD_VARLINK_DEFINE_INPUT(environment, SD_VARLINK_STRING, SD_VARLINK_NULLABLE|SD_VARLINK_ARRAY),
+                SD_VARLINK_FIELD_COMMENT("File descriptor of the allocated pseudo TTY"),
+                SD_VARLINK_DEFINE_OUTPUT(ptyFileDescriptor, SD_VARLINK_INT, 0),
+                SD_VARLINK_FIELD_COMMENT("Path to the allocated pseudo TTY"),
+                SD_VARLINK_DEFINE_OUTPUT(ptyPath, SD_VARLINK_STRING, 0));
+
+static SD_VARLINK_DEFINE_METHOD(
+                MapFrom,
+                VARLINK_DEFINE_MACHINE_LOOKUP_AND_POLKIT_INPUT_FIELDS,
+                SD_VARLINK_FIELD_COMMENT("UID in the machine to map to host UID"),
+                SD_VARLINK_DEFINE_INPUT(uid, SD_VARLINK_INT, SD_VARLINK_NULLABLE),
+                SD_VARLINK_FIELD_COMMENT("GID in the machine to map to host GID"),
+                SD_VARLINK_DEFINE_INPUT(gid, SD_VARLINK_INT, SD_VARLINK_NULLABLE),
+                SD_VARLINK_FIELD_COMMENT("Mapped UID"),
+                SD_VARLINK_DEFINE_OUTPUT(uid, SD_VARLINK_INT, SD_VARLINK_NULLABLE),
+                SD_VARLINK_FIELD_COMMENT("Mapped GID"),
+                SD_VARLINK_DEFINE_OUTPUT(gid, SD_VARLINK_INT, SD_VARLINK_NULLABLE));
+
+static SD_VARLINK_DEFINE_METHOD(
+                MapTo,
+                SD_VARLINK_FIELD_COMMENT("Host UID to map to machine UID"),
+                SD_VARLINK_DEFINE_INPUT(uid, SD_VARLINK_INT, SD_VARLINK_NULLABLE),
+                SD_VARLINK_FIELD_COMMENT("Host GID to map to machine GID"),
+                SD_VARLINK_DEFINE_INPUT(gid, SD_VARLINK_INT, SD_VARLINK_NULLABLE),
+                SD_VARLINK_FIELD_COMMENT("Mapped UID"),
+                SD_VARLINK_DEFINE_OUTPUT(uid, SD_VARLINK_INT, SD_VARLINK_NULLABLE),
+                SD_VARLINK_FIELD_COMMENT("Mapped GID"),
+                SD_VARLINK_DEFINE_OUTPUT(gid, SD_VARLINK_INT, SD_VARLINK_NULLABLE),
+                SD_VARLINK_FIELD_COMMENT("Machine's name which owns mapped UID/GID"),
+                SD_VARLINK_DEFINE_OUTPUT(machineName, SD_VARLINK_STRING, SD_VARLINK_NULLABLE));
+
 static SD_VARLINK_DEFINE_ERROR(NoSuchMachine);
 static SD_VARLINK_DEFINE_ERROR(MachineExists);
 static SD_VARLINK_DEFINE_ERROR(NoPrivateNetworking);
 static SD_VARLINK_DEFINE_ERROR(NoOSReleaseInformation);
 static SD_VARLINK_DEFINE_ERROR(NoUIDShift);
 static SD_VARLINK_DEFINE_ERROR(NotAvailable);
+static SD_VARLINK_DEFINE_ERROR(NotSupported);
+static SD_VARLINK_DEFINE_ERROR(NoIPC);
+static SD_VARLINK_DEFINE_ERROR(NoSuchUser);
+static SD_VARLINK_DEFINE_ERROR(NoSuchGroup);
+static SD_VARLINK_DEFINE_ERROR(UserInHostRange);
+static SD_VARLINK_DEFINE_ERROR(GroupInHostRange);
 
 SD_VARLINK_DEFINE_INTERFACE(
                 io_systemd_Machine,
@@ -121,6 +179,14 @@ SD_VARLINK_DEFINE_INTERFACE(
                 &vl_method_Kill,
                 SD_VARLINK_SYMBOL_COMMENT("List running machines"),
                 &vl_method_List,
+                SD_VARLINK_SYMBOL_COMMENT("A enum field which defines way to open TTY for a machine"),
+                &vl_type_MachineOpenMode,
+                SD_VARLINK_SYMBOL_COMMENT("Allocates a pseudo TTY in the container in various modes"),
+                &vl_method_Open,
+                SD_VARLINK_SYMBOL_COMMENT("Maps given machine's UID/GID to host's UID/GID"),
+                &vl_method_MapFrom,
+                SD_VARLINK_SYMBOL_COMMENT("Maps given host's UID/GID to a machine and corresponding UID/GID"),
+                &vl_method_MapTo,
                 SD_VARLINK_SYMBOL_COMMENT("No matching machine currently running"),
                 &vl_error_NoSuchMachine,
                 &vl_error_MachineExists,
@@ -131,4 +197,16 @@ SD_VARLINK_DEFINE_INTERFACE(
                 SD_VARLINK_SYMBOL_COMMENT("Machine uses a complex UID/GID mapping, cannot determine shift"),
                 &vl_error_NoUIDShift,
                 SD_VARLINK_SYMBOL_COMMENT("Requested information is not available"),
-                &vl_error_NotAvailable);
+                &vl_error_NotAvailable,
+                SD_VARLINK_SYMBOL_COMMENT("Requested operation is not supported"),
+                &vl_error_NotSupported,
+                SD_VARLINK_SYMBOL_COMMENT("There is no IPC service (such as system bus or varlink) in the container"),
+                &vl_error_NoIPC,
+                SD_VARLINK_SYMBOL_COMMENT("No such user"),
+                &vl_error_NoSuchUser,
+                SD_VARLINK_SYMBOL_COMMENT("No such group"),
+                &vl_error_NoSuchGroup,
+                SD_VARLINK_SYMBOL_COMMENT("User belongs to host UID range"),
+                &vl_error_UserInHostRange,
+                SD_VARLINK_SYMBOL_COMMENT("Group belongs to host GID range"),
+                &vl_error_GroupInHostRange);

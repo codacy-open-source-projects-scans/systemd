@@ -32,14 +32,14 @@
 #include "socket-netlink.h"
 
 typedef enum KeepConfiguration {
-        KEEP_CONFIGURATION_NO            = 0,
-        KEEP_CONFIGURATION_DHCP_ON_START = 1 << 0,
-        KEEP_CONFIGURATION_DHCP_ON_STOP  = 1 << 1,
-        KEEP_CONFIGURATION_DHCP          = KEEP_CONFIGURATION_DHCP_ON_START | KEEP_CONFIGURATION_DHCP_ON_STOP,
-        KEEP_CONFIGURATION_STATIC        = 1 << 2,
-        KEEP_CONFIGURATION_YES           = KEEP_CONFIGURATION_DHCP | KEEP_CONFIGURATION_STATIC,
+        KEEP_CONFIGURATION_NO               = 0,
+        KEEP_CONFIGURATION_DYNAMIC_ON_START = 1 << 0,
+        KEEP_CONFIGURATION_DYNAMIC_ON_STOP  = 1 << 1,
+        KEEP_CONFIGURATION_DYNAMIC          = KEEP_CONFIGURATION_DYNAMIC_ON_START | KEEP_CONFIGURATION_DYNAMIC_ON_STOP,
+        KEEP_CONFIGURATION_STATIC           = 1 << 2,
+        KEEP_CONFIGURATION_YES              = KEEP_CONFIGURATION_DYNAMIC | KEEP_CONFIGURATION_STATIC,
         _KEEP_CONFIGURATION_MAX,
-        _KEEP_CONFIGURATION_INVALID = -EINVAL,
+        _KEEP_CONFIGURATION_INVALID         = -EINVAL,
 } KeepConfiguration;
 
 typedef enum ActivationPolicy {
@@ -340,8 +340,10 @@ struct Network {
         uint32_t ipv6_mtu;
         IPv6PrivacyExtensions ipv6_privacy_extensions;
         IPReversePathFilter ipv4_rp_filter;
+        IPv4ForceIgmpVersion ipv4_force_igmp_version;
         int ipv6_proxy_ndp;
         Set *ipv6_proxy_ndp_addresses;
+        int mpls_input;
 
         /* NDisc support */
         int ndisc;
@@ -419,7 +421,7 @@ Network *network_ref(Network *network);
 Network *network_unref(Network *network);
 DEFINE_TRIVIAL_CLEANUP_FUNC(Network*, network_unref);
 
-int network_load(Manager *manager, OrderedHashmap **networks);
+int network_load(Manager *manager, OrderedHashmap **ret);
 int network_reload(Manager *manager);
 int network_load_one(Manager *manager, OrderedHashmap **networks, const char *filename);
 int network_verify(Network *network);

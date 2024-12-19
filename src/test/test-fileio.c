@@ -311,26 +311,22 @@ TEST(merge_env_file_invalid) {
         assert_se(strv_isempty(a));
 }
 
-TEST(executable_is_script) {
+TEST(script_get_shebang_interpreter) {
         _cleanup_(unlink_tempfilep) char t[] = "/tmp/test-fileio-XXXXXX";
         _cleanup_fclose_ FILE *f = NULL;
         char *command;
-        int r;
 
         assert_se(fmkostemp_safe(t, "w", &f) == 0);
         fputs("#! /bin/script -a -b \ngoo goo", f);
         fflush(f);
 
-        r = executable_is_script(t, &command);
-        assert_se(r > 0);
+        ASSERT_OK(script_get_shebang_interpreter(t, &command));
         ASSERT_STREQ(command, "/bin/script");
         free(command);
 
-        r = executable_is_script("/bin/sh", &command);
-        assert_se(r == 0);
+        ASSERT_ERROR(script_get_shebang_interpreter("/bin/sh", NULL), EMEDIUMTYPE);
 
-        r = executable_is_script("/usr/bin/yum", &command);
-        if (r > 0) {
+        if (script_get_shebang_interpreter("/usr/bin/yum", &command) >= 0) {
                 assert_se(startswith(command, "/"));
                 free(command);
         }
@@ -892,14 +888,14 @@ TEST(read_line4) {
 
         int r;
 
-        for (size_t i = 0; i < ELEMENTSOF(eof_endings); i++) {
+        FOREACH_ELEMENT(ending, eof_endings) {
                 _cleanup_fclose_ FILE *f = NULL;
                 _cleanup_free_ char *s = NULL;
 
-                assert_se(f = fmemopen_unlocked((void*) eof_endings[i].string, eof_endings[i].length, "r"));
+                assert_se(f = fmemopen_unlocked((void*) ending->string, ending->length, "r"));
 
                 r = read_line(f, SIZE_MAX, &s);
-                assert_se((size_t) r == eof_endings[i].length);
+                assert_se((size_t) r == ending->length);
                 ASSERT_STREQ(s, "foo");
 
                 assert_se(read_line(f, SIZE_MAX, NULL) == 0); /* Ensure we hit EOF */

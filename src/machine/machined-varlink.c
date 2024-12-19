@@ -17,6 +17,7 @@
 #include "varlink-io.systemd.Machine.h"
 #include "varlink-io.systemd.MachineImage.h"
 #include "varlink-io.systemd.UserDatabase.h"
+#include "varlink-util.h"
 
 typedef struct LookupParameters {
         const char *user_name;
@@ -392,56 +393,49 @@ static int vl_method_get_memberships(sd_varlink *link, sd_json_variant *paramete
 }
 
 static int json_build_local_addresses(const struct local_address *addresses, size_t n_addresses, sd_json_variant **ret) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *array = NULL;
         int r;
 
-        if (n_addresses == 0)
-                return 0;
-
-        assert(addresses);
+        assert(addresses || n_addresses == 0);
         assert(ret);
 
         FOREACH_ARRAY(a, addresses, n_addresses) {
-                _cleanup_(sd_json_variant_unrefp) sd_json_variant *entry = NULL;
-                r = sd_json_buildo(
-                                &entry,
+                r = sd_json_variant_append_arraybo(
+                                &array,
                                 JSON_BUILD_PAIR_UNSIGNED_NON_ZERO("ifindex", a->ifindex),
                                 SD_JSON_BUILD_PAIR_INTEGER("family", a->family),
                                 SD_JSON_BUILD_PAIR_BYTE_ARRAY("address", &a->address.bytes, FAMILY_ADDRESS_SIZE(a->family)));
                 if (r < 0)
                         return r;
-
-                r = sd_json_variant_append_array(ret, entry);
-                if (r < 0)
-                        return r;
         }
 
+        *ret = TAKE_PTR(array);
         return 0;
 }
 
 static int list_machine_one_and_maybe_read_metadata(sd_varlink *link, Machine *m, bool more, AcquireMetadata am) {
-        _cleanup_(sd_json_variant_unrefp) sd_json_variant *addr_array = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL, *addr_array = NULL;
         _cleanup_strv_free_ char **os_release = NULL;
         uid_t shift = UID_INVALID;
-        int r, n = 0;
+        int r;
 
         assert(link);
         assert(m);
 
-        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
-
         if (should_acquire_metadata(am)) {
                 _cleanup_free_ struct local_address *addresses = NULL;
-                n = machine_get_addresses(m, &addresses);
-                if (n < 0 && am == ACQUIRE_METADATA_GRACEFUL)
-                        log_debug_errno(n, "Failed to get address (graceful mode), ignoring: %m");
-                else if (n == -ENONET)
+
+                r = machine_get_addresses(m, &addresses);
+                if (r < 0 && am == ACQUIRE_METADATA_GRACEFUL)
+                        log_debug_errno(r, "Failed to get address (graceful mode), ignoring: %m");
+                else if (r == -ENONET)
                         return sd_varlink_error(link, "io.systemd.Machine.NoPrivateNetworking", NULL);
-                else if (ERRNO_IS_NEG_NOT_SUPPORTED(n))
+                else if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
                         return sd_varlink_error(link, "io.systemd.Machine.NotAvailable", NULL);
-                else if (n < 0)
-                        return log_debug_errno(n, "Failed to get addresses: %m");
+                else if (r < 0)
+                        return log_debug_errno(r, "Failed to get addresses: %m");
                 else {
-                        r = json_build_local_addresses(addresses, n, &addr_array);
+                        r = json_build_local_addresses(addresses, r, &addr_array);
                         if (r < 0)
                                 return r;
                 }
@@ -477,11 +471,11 @@ static int list_machine_one_and_maybe_read_metadata(sd_varlink *link, Machine *m
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("unit", m->unit),
                         SD_JSON_BUILD_PAIR_CONDITION(pidref_is_set(&m->leader), "leader", JSON_BUILD_PIDREF(&m->leader)),
                         SD_JSON_BUILD_PAIR_CONDITION(dual_timestamp_is_set(&m->timestamp), "timestamp", JSON_BUILD_DUAL_TIMESTAMP(&m->timestamp)),
-                        SD_JSON_BUILD_PAIR_CONDITION(m->vsock_cid != VMADDR_CID_ANY, "vSockCid", SD_JSON_BUILD_UNSIGNED(m->vsock_cid)),
+                        JSON_BUILD_PAIR_UNSIGNED_NOT_EQUAL("vSockCid", m->vsock_cid, VMADDR_CID_ANY),
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("sshAddress", m->ssh_address),
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("sshPrivateKeyPath", m->ssh_private_key_path),
-                        SD_JSON_BUILD_PAIR_CONDITION(n > 0, "addresses", SD_JSON_BUILD_VARIANT(addr_array)),
-                        SD_JSON_BUILD_PAIR_CONDITION(!strv_isempty(os_release), "OSRelease", JSON_BUILD_STRV_ENV_PAIR(os_release)),
+                        JSON_BUILD_PAIR_VARIANT_NON_NULL("addresses", addr_array),
+                        JSON_BUILD_PAIR_STRV_ENV_PAIR_NON_EMPTY("OSRelease", os_release),
                         JSON_BUILD_PAIR_UNSIGNED_NOT_EQUAL("UIDShift", shift, UID_INVALID));
         if (r < 0)
                 return r;
@@ -517,7 +511,6 @@ static int vl_method_list(sd_varlink *link, sd_json_variant *parameters, sd_varl
         Manager *m = ASSERT_PTR(userdata);
         _cleanup_(machine_lookup_parameters_done) MachineLookupParameters p = {
                 .pidref = PIDREF_NULL,
-                .acquire_metadata = ACQUIRE_METADATA_NO,
         };
 
         Machine *machine;
@@ -534,7 +527,7 @@ static int vl_method_list(sd_varlink *link, sd_json_variant *parameters, sd_varl
                 r = lookup_machine_by_name_or_pidref(link, m, p.name, &p.pidref, &machine);
                 if (r == -ESRCH)
                         return sd_varlink_error(link, "io.systemd.Machine.NoSuchMachine", NULL);
-                if (r != 0)
+                if (r < 0)
                         return r;
 
                 return list_machine_one_and_maybe_read_metadata(link, machine, /* more = */ false, p.acquire_metadata);
@@ -584,7 +577,7 @@ static int lookup_machine_and_call_method(sd_varlink *link, sd_json_variant *par
         r = lookup_machine_by_name_or_pidref(link, manager, p.name, &p.pidref, &machine);
         if (r == -ESRCH)
                 return sd_varlink_error(link, "io.systemd.Machine.NoSuchMachine", NULL);
-        if (r != 0)
+        if (r < 0)
                 return r;
 
         return method(link, parameters, flags, machine);
@@ -635,8 +628,8 @@ static int list_image_one_and_maybe_read_metadata(sd_varlink *link, Image *image
                                 &v,
                                 JSON_BUILD_PAIR_STRING_NON_EMPTY("hostname", image->hostname),
                                 SD_JSON_BUILD_PAIR_CONDITION(!sd_id128_is_null(image->machine_id), "machineId", SD_JSON_BUILD_ID128(image->machine_id)),
-                                SD_JSON_BUILD_PAIR_CONDITION(!strv_isempty(image->machine_info), "machineInfo", JSON_BUILD_STRV_ENV_PAIR(image->machine_info)),
-                                SD_JSON_BUILD_PAIR_CONDITION(!strv_isempty(image->os_release), "OSRelease", JSON_BUILD_STRV_ENV_PAIR(image->os_release)));
+                                JSON_BUILD_PAIR_STRV_ENV_PAIR_NON_EMPTY("machineInfo", image->machine_info),
+                                JSON_BUILD_PAIR_STRV_ENV_PAIR_NON_EMPTY("OSRelease", image->os_release));
                 if (r < 0)
                         return r;
         }
@@ -651,7 +644,7 @@ static int vl_method_list_images(sd_varlink *link, sd_json_variant *parameters, 
         struct params {
                 const char *image_name;
                 AcquireMetadata acquire_metadata;
-        } p = { .acquire_metadata = ACQUIRE_METADATA_NO };
+        } p = {};
         int r;
 
         static const sd_json_dispatch_field dispatch_table[] = {
@@ -720,11 +713,9 @@ static int manager_varlink_init_userdb(Manager *m) {
         if (m->varlink_userdb_server)
                 return 0;
 
-        r = sd_varlink_server_new(&s, SD_VARLINK_SERVER_ACCOUNT_UID|SD_VARLINK_SERVER_INHERIT_USERDATA);
+        r = varlink_server_new(&s, SD_VARLINK_SERVER_ACCOUNT_UID|SD_VARLINK_SERVER_INHERIT_USERDATA, m);
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate varlink server object: %m");
-
-        sd_varlink_server_set_userdata(s, m);
 
         r = sd_varlink_server_add_interface(s, &vl_interface_io_systemd_UserDatabase);
         if (r < 0)
@@ -761,11 +752,9 @@ static int manager_varlink_init_machine(Manager *m) {
         if (m->varlink_machine_server)
                 return 0;
 
-        r = sd_varlink_server_new(&s, SD_VARLINK_SERVER_ACCOUNT_UID|SD_VARLINK_SERVER_INHERIT_USERDATA);
+        r = varlink_server_new(&s, SD_VARLINK_SERVER_ACCOUNT_UID|SD_VARLINK_SERVER_INHERIT_USERDATA, m);
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate varlink server object: %m");
-
-        sd_varlink_server_set_userdata(s, m);
 
         r = sd_varlink_server_add_interface_many(
                         s,
@@ -781,8 +770,13 @@ static int manager_varlink_init_machine(Manager *m) {
                         "io.systemd.Machine.Unregister",  vl_method_unregister,
                         "io.systemd.Machine.Terminate",   vl_method_terminate,
                         "io.systemd.Machine.Kill",        vl_method_kill,
+                        "io.systemd.Machine.Open",        vl_method_open,
+                        "io.systemd.Machine.MapFrom",     vl_method_map_from,
+                        "io.systemd.Machine.MapTo",       vl_method_map_to,
                         "io.systemd.MachineImage.List",   vl_method_list_images,
-                        "io.systemd.MachineImage.Update", vl_method_update_image);
+                        "io.systemd.MachineImage.Update", vl_method_update_image,
+                        "io.systemd.MachineImage.Clone",  vl_method_clone_image,
+                        "io.systemd.MachineImage.Remove", vl_method_remove_image);
         if (r < 0)
                 return log_error_errno(r, "Failed to register varlink methods: %m");
 

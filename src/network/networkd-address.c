@@ -1096,7 +1096,7 @@ const char* format_lifetime(char *buf, size_t l, usec_t lifetime_usec) {
         return buf;
 }
 
-static void log_address_debug(const Address *address, const char *str, const Link *link) {
+void log_address_debug(const Address *address, const char *str, const Link *link) {
         _cleanup_free_ char *state = NULL, *flags_str = NULL, *scope_str = NULL;
 
         assert(address);
@@ -1127,6 +1127,23 @@ static void log_address_debug(const Address *address, const char *str, const Lin
                        strna(flags_str), strna(scope_str),
                        address->family == AF_INET ? ", label: " : "",
                        address->family == AF_INET ? strna(address->label) : "");
+}
+
+static void address_forget(Link *link, Address *address, bool removed_by_us, const char *msg) {
+        assert(link);
+        assert(address);
+        assert(msg);
+
+        Request *req;
+        if (address_get_request(link, address, &req) >= 0)
+                address_enter_removed(req->userdata);
+
+        if (!address->link && address_get(link, address, &address) < 0)
+                return;
+
+        address_enter_removed(address);
+        log_address_debug(address, msg, link);
+        (void) address_drop(address, removed_by_us);
 }
 
 static int address_set_netlink_message(const Address *address, sd_netlink_message *m, Link *link) {
@@ -1181,16 +1198,8 @@ static int address_remove_handler(sd_netlink *rtnl, sd_netlink_message *m, Remov
                                             (r == -EADDRNOTAVAIL || !address->link) ? LOG_DEBUG : LOG_WARNING,
                                             r, "Could not drop address");
 
-                if (address->link) {
-                        /* If the address cannot be removed, then assume the address is already removed. */
-                        log_address_debug(address, "Forgetting", link);
-
-                        Request *req;
-                        if (address_get_request(link, address, &req) >= 0)
-                                address_enter_removed(req->userdata);
-
-                        (void) address_drop(address, /* removed_by_us = */ true);
-                }
+                /* If the address cannot be removed, then assume the address is already removed. */
+                address_forget(link, address, /* removed_by_us = */ true, "Forgetting");
         }
 
         return 1;
@@ -1270,14 +1279,18 @@ bool link_address_is_dynamic(const Link *link, const Address *address) {
         if (address->lifetime_preferred_usec != USEC_INFINITY)
                 return true;
 
-        /* Even when the address is leased from a DHCP server, networkd assign the address
-         * without lifetime when KeepConfiguration=dhcp. So, let's check that we have
+        /* There is no way to drtermine if the IPv6 address is dynamic when the lifetime is infinity. */
+        if (address->family != AF_INET)
+                return false;
+
+        /* Even if an IPv4 address is leased from a DHCP server with a finite lifetime, networkd assign the
+         * address without lifetime when KeepConfiguration=dynamic. So, let's check that we have
          * corresponding routes with RTPROT_DHCP. */
         SET_FOREACH(route, link->manager->routes) {
                 if (route->source != NETWORK_CONFIG_SOURCE_FOREIGN)
                         continue;
 
-                /* The route is not assigned yet, or already removed. Ignoring. */
+                /* The route is not assigned yet, or already being removed. Ignoring. */
                 if (!route_exists(route))
                         continue;
 
@@ -1380,7 +1393,7 @@ int link_drop_ipv6ll_addresses(Link *link) {
         return 0;
 }
 
-int link_drop_foreign_addresses(Link *link) {
+int link_drop_unmanaged_addresses(Link *link) {
         Address *address;
         int r = 0;
 
@@ -1397,18 +1410,22 @@ int link_drop_foreign_addresses(Link *link) {
                 if (link->flags & IFF_LOOPBACK && in_addr_is_localhost_one(address->family, &address->in_addr) > 0)
                         continue;
 
-                /* Ignore addresses we configured. */
-                if (address->source != NETWORK_CONFIG_SOURCE_FOREIGN)
-                        continue;
-
                 /* Ignore addresses not assigned yet or already removing. */
                 if (!address_exists(address))
                         continue;
 
-                /* link_address_is_dynamic() is slightly heavy. Let's call the function only when KeepConfiguration= is set. */
-                if (IN_SET(link->network->keep_configuration, KEEP_CONFIGURATION_DHCP, KEEP_CONFIGURATION_STATIC) &&
-                    link_address_is_dynamic(link, address) == (link->network->keep_configuration == KEEP_CONFIGURATION_DHCP))
-                        continue;
+                if (address->source == NETWORK_CONFIG_SOURCE_FOREIGN) {
+                        if (link->network->keep_configuration == KEEP_CONFIGURATION_YES)
+                                continue;
+
+                        /* link_address_is_dynamic() is slightly heavy. Let's call the function only when
+                         * KeepConfiguration=dynamic or static. */
+                        if (IN_SET(link->network->keep_configuration, KEEP_CONFIGURATION_DYNAMIC, KEEP_CONFIGURATION_STATIC) &&
+                            link_address_is_dynamic(link, address) == (link->network->keep_configuration == KEEP_CONFIGURATION_DYNAMIC))
+                                continue;
+
+                } else if (address->source != NETWORK_CONFIG_SOURCE_STATIC)
+                        continue; /* Ignore dynamically configurad addresses. */
 
                 address_mark(address);
         }
@@ -1458,15 +1475,6 @@ int link_drop_static_addresses(Link *link) {
         }
 
         return r;
-}
-
-void link_foreignize_addresses(Link *link) {
-        Address *address;
-
-        assert(link);
-
-        SET_FOREACH(address, link->addresses)
-                address->source = NETWORK_CONFIG_SOURCE_FOREIGN;
 }
 
 int address_configure_handler_internal(sd_netlink *rtnl, sd_netlink_message *m, Link *link, const char *error_msg) {
@@ -1776,14 +1784,7 @@ int link_request_static_addresses(Link *link) {
 }
 
 int manager_rtnl_process_address(sd_netlink *rtnl, sd_netlink_message *message, Manager *m) {
-        _cleanup_(address_unrefp) Address *tmp = NULL;
-        struct ifa_cacheinfo cinfo;
-        Link *link;
-        uint16_t type;
-        Address *address = NULL;
-        Request *req = NULL;
-        bool is_new = false, update_dhcp4;
-        int ifindex, r;
+        int r;
 
         assert(rtnl);
         assert(message);
@@ -1797,6 +1798,7 @@ int manager_rtnl_process_address(sd_netlink *rtnl, sd_netlink_message *message, 
                 return 0;
         }
 
+        uint16_t type;
         r = sd_netlink_message_get_type(message, &type);
         if (r < 0) {
                 log_warning_errno(r, "rtnl: could not get message type, ignoring: %m");
@@ -1806,6 +1808,7 @@ int manager_rtnl_process_address(sd_netlink *rtnl, sd_netlink_message *message, 
                 return 0;
         }
 
+        int ifindex;
         r = sd_rtnl_message_addr_get_ifindex(message, &ifindex);
         if (r < 0) {
                 log_warning_errno(r, "rtnl: could not get ifindex from message, ignoring: %m");
@@ -1815,6 +1818,7 @@ int manager_rtnl_process_address(sd_netlink *rtnl, sd_netlink_message *message, 
                 return 0;
         }
 
+        Link *link;
         r = link_get_by_index(m, ifindex, &link);
         if (r < 0) {
                 /* when enumerating we might be out of sync, but we will get the address again, so just
@@ -1824,6 +1828,7 @@ int manager_rtnl_process_address(sd_netlink *rtnl, sd_netlink_message *message, 
                 return 0;
         }
 
+        _cleanup_(address_unrefp) Address *tmp = NULL;
         r = address_new(&tmp);
         if (r < 0)
                 return log_oom();
@@ -1891,28 +1896,22 @@ int manager_rtnl_process_address(sd_netlink *rtnl, sd_netlink_message *message, 
                 assert_not_reached();
         }
 
-        update_dhcp4 = tmp->family == AF_INET6;
-
-        /* Then, find the managed Address and Request objects corresponding to the received address. */
+        /* Then, find the managed Address object corresponding to the received address. */
+        Address *address = NULL;
         (void) address_get(link, tmp, &address);
-        (void) address_get_request(link, tmp, &req);
 
         if (type == RTM_DELADDR) {
-                if (address) {
-                        bool removed_by_us = FLAGS_SET(address->state, NETWORK_CONFIG_STATE_REMOVING);
-
-                        address_enter_removed(address);
-                        log_address_debug(address, "Forgetting removed", link);
-                        (void) address_drop(address, removed_by_us);
-                } else
+                if (address)
+                        address_forget(link, address,
+                                       /* removed_by_us = */ FLAGS_SET(address->state, NETWORK_CONFIG_STATE_REMOVING),
+                                       "Forgetting removed");
+                else
                         log_address_debug(tmp, "Kernel removed unknown", link);
-
-                if (req)
-                        address_enter_removed(req->userdata);
 
                 goto finalize;
         }
 
+        bool is_new = false;
         if (!address) {
                 /* If we did not know the address, then save it. */
                 r = address_attach(link, tmp);
@@ -1932,6 +1931,8 @@ int manager_rtnl_process_address(sd_netlink *rtnl, sd_netlink_message *message, 
         }
 
         /* Also update information that cannot be obtained through netlink notification. */
+        Request *req = NULL;
+        (void) address_get_request(link, tmp, &req);
         if (req && req->waiting_reply) {
                 Address *a = ASSERT_PTR(req->userdata);
 
@@ -1979,6 +1980,7 @@ int manager_rtnl_process_address(sd_netlink *rtnl, sd_netlink_message *message, 
         } else if (r < 0)
                 log_link_debug_errno(link, r, "rtnl: failed to read IFA_FLAGS attribute, ignoring: %m");
 
+        struct ifa_cacheinfo cinfo;
         r = sd_netlink_message_read_cache_info(message, IFA_CACHEINFO, &cinfo);
         if (r >= 0)
                 address_set_lifetime(m, address, &cinfo);
@@ -2001,7 +2003,7 @@ int manager_rtnl_process_address(sd_netlink *rtnl, sd_netlink_message *message, 
                 link_enter_failed(link);
 
 finalize:
-        if (update_dhcp4) {
+        if (tmp->family == AF_INET6) {
                 r = dhcp4_update_ipv6_connectivity(link);
                 if (r < 0) {
                         log_link_warning_errno(link, r, "Failed to notify IPv6 connectivity to DHCPv4 client: %m");

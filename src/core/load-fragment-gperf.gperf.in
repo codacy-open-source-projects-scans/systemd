@@ -125,7 +125,7 @@
 {{type}}.ProtectKernelModules,                config_parse_bool,                                  0,                                  offsetof({{type}}, exec_context.protect_kernel_modules)
 {{type}}.ProtectKernelLogs,                   config_parse_bool,                                  0,                                  offsetof({{type}}, exec_context.protect_kernel_logs)
 {{type}}.ProtectClock,                        config_parse_bool,                                  0,                                  offsetof({{type}}, exec_context.protect_clock)
-{{type}}.ProtectControlGroups,                config_parse_bool,                                  0,                                  offsetof({{type}}, exec_context.protect_control_groups)
+{{type}}.ProtectControlGroups,                config_parse_protect_control_groups,                0,                                  offsetof({{type}}, exec_context.protect_control_groups)
 {{type}}.NetworkNamespacePath,                config_parse_unit_path_printf,                      0,                                  offsetof({{type}}, exec_context.network_namespace_path)
 {{type}}.IPCNamespacePath,                    config_parse_unit_path_printf,                      0,                                  offsetof({{type}}, exec_context.ipc_namespace_path)
 {{type}}.LogNamespace,                        config_parse_log_namespace,                         0,                                  offsetof({{type}}, exec_context)
@@ -133,6 +133,7 @@
 {{type}}.PrivateUsers,                        config_parse_private_users,                         0,                                  offsetof({{type}}, exec_context.private_users)
 {{type}}.PrivateMounts,                       config_parse_tristate,                              0,                                  offsetof({{type}}, exec_context.private_mounts)
 {{type}}.PrivateIPC,                          config_parse_bool,                                  0,                                  offsetof({{type}}, exec_context.private_ipc)
+{{type}}.PrivatePIDs,                         config_parse_private_pids,                          0,                                  offsetof({{type}}, exec_context.private_pids)
 {{type}}.ProtectSystem,                       config_parse_protect_system,                        0,                                  offsetof({{type}}, exec_context.protect_system)
 {{type}}.ProtectHome,                         config_parse_protect_home,                          0,                                  offsetof({{type}}, exec_context.protect_home)
 {{type}}.MountFlags,                          config_parse_exec_mount_propagation_flag,           0,                                  offsetof({{type}}, exec_context.mount_propagation_flag)
@@ -179,7 +180,7 @@
 {% else %}
 {{type}}.SmackProcessLabel,                   config_parse_warn_compat,                           DISABLED_CONFIGURATION,             0
 {% endif %}
-{{type}}.ProtectHostname,                     config_parse_bool,                                  0,                                  offsetof({{type}}, exec_context.protect_hostname)
+{{type}}.ProtectHostname,                     config_parse_protect_hostname,                      0,                                  offsetof({{type}}, exec_context)
 {{type}}.MemoryKSM,                           config_parse_tristate,                              0,                                  offsetof({{type}}, exec_context.memory_ksm)
 {%- endmacro -%}
 
@@ -373,6 +374,7 @@ Unit.ConditionOSRelease,                      config_parse_unit_condition_string
 Unit.ConditionMemoryPressure,                 config_parse_unit_condition_string,                 CONDITION_MEMORY_PRESSURE,          offsetof(Unit, conditions)
 Unit.ConditionCPUPressure,                    config_parse_unit_condition_string,                 CONDITION_CPU_PRESSURE,             offsetof(Unit, conditions)
 Unit.ConditionIOPressure,                     config_parse_unit_condition_string,                 CONDITION_IO_PRESSURE,              offsetof(Unit, conditions)
+Unit.ConditionKernelModuleLoaded,             config_parse_unit_condition_string,                 CONDITION_KERNEL_MODULE_LOADED,     offsetof(Unit, conditions)
 Unit.AssertPathExists,                        config_parse_unit_condition_path,                   CONDITION_PATH_EXISTS,              offsetof(Unit, asserts)
 Unit.AssertPathExistsGlob,                    config_parse_unit_condition_path,                   CONDITION_PATH_EXISTS_GLOB,         offsetof(Unit, asserts)
 Unit.AssertPathIsDirectory,                   config_parse_unit_condition_path,                   CONDITION_PATH_IS_DIRECTORY,        offsetof(Unit, asserts)
@@ -405,6 +407,7 @@ Unit.AssertOSRelease,                         config_parse_unit_condition_string
 Unit.AssertMemoryPressure,                    config_parse_unit_condition_string,                 CONDITION_MEMORY_PRESSURE,          offsetof(Unit, asserts)
 Unit.AssertCPUPressure,                       config_parse_unit_condition_string,                 CONDITION_CPU_PRESSURE,             offsetof(Unit, asserts)
 Unit.AssertIOPressure,                        config_parse_unit_condition_string,                 CONDITION_IO_PRESSURE,              offsetof(Unit, asserts)
+Unit.AssertKernelModuleLoaded,                config_parse_unit_condition_string,                 CONDITION_KERNEL_MODULE_LOADED,     offsetof(Unit, asserts)
 Unit.CollectMode,                             config_parse_collect_mode,                          0,                                  offsetof(Unit, collect_mode)
 Service.PIDFile,                              config_parse_pid_file,                              0,                                  offsetof(Service, pid_file)
 Service.ExecCondition,                        config_parse_exec,                                  SERVICE_EXEC_CONDITION,             offsetof(Service, exec_command)

@@ -47,6 +47,7 @@
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
+#include "transaction.h"
 #include "unit-name.h"
 #include "unit.h"
 #include "utf8.h"
@@ -709,6 +710,9 @@ static int service_verify(Service *s) {
         if (s->type == SERVICE_DBUS && !s->bus_name)
                 return log_unit_error_errno(UNIT(s), SYNTHETIC_ERRNO(ENOEXEC), "Service is of type D-Bus but no D-Bus service name has been specified. Refusing.");
 
+        if (s->type == SERVICE_FORKING && exec_needs_pid_namespace(&s->exec_context))
+                return log_unit_error_errno(UNIT(s), SYNTHETIC_ERRNO(ENOEXEC), "Service of Type=forking does not support PrivatePIDs=yes. Refusing.");
+
         if (s->usb_function_descriptors && !s->usb_function_strings)
                 log_unit_warning(UNIT(s), "Service has USBFunctionDescriptors= setting, but no USBFunctionStrings=. Ignoring.");
 
@@ -1337,7 +1341,7 @@ static void service_set_state(Service *s, ServiceState state) {
                         }
 
                 if (start_only)
-                        unit_destroy_runtime_data(u, &s->exec_context);
+                        unit_destroy_runtime_data(u, &s->exec_context, /* destroy_runtime_dir = */ false);
         }
 
         if (old_state != state)
@@ -1644,13 +1648,7 @@ static Service *service_get_triggering_service(Service *s) {
          * or OnSuccess= then we return NULL. This is since we don't know from which
          * one to propagate the exit status. */
 
-        UNIT_FOREACH_DEPENDENCY(other, UNIT(s), UNIT_ATOM_ON_FAILURE_OF) {
-                if (candidate)
-                        goto have_other;
-                candidate = other;
-        }
-
-        UNIT_FOREACH_DEPENDENCY(other, UNIT(s), UNIT_ATOM_ON_SUCCESS_OF) {
+        UNIT_FOREACH_DEPENDENCY(other, UNIT(s), UNIT_ATOM_ON_SUCCESS_OF|UNIT_ATOM_ON_FAILURE_OF) {
                 if (candidate)
                         goto have_other;
                 candidate = other;
@@ -1771,14 +1769,11 @@ static int service_spawn_internal(
         if (r < 0)
                 return r;
 
-        our_env = new0(char*, 14);
+        our_env = new0(char*, 13);
         if (!our_env)
                 return -ENOMEM;
 
         if (service_exec_needs_notify_socket(s, exec_params.flags)) {
-                if (asprintf(our_env + n_env++, "NOTIFY_SOCKET=%s", UNIT(s)->manager->notify_socket) < 0)
-                        return -ENOMEM;
-
                 exec_params.notify_socket = UNIT(s)->manager->notify_socket;
 
                 if (s->n_fd_store_max > 0)
@@ -1875,7 +1870,7 @@ static int service_spawn_internal(
                 }
         }
 
-        if (s->restart_mode == SERVICE_RESTART_MODE_DEBUG && UNIT(s)->debug_invocation) {
+        if (UNIT(s)->debug_invocation) {
                 char *t = strdup("DEBUG_INVOCATION=1");
                 if (!t)
                         return -ENOMEM;
@@ -2159,7 +2154,7 @@ static void service_enter_dead(Service *s, ServiceResult f, bool allow_restart) 
         s->exec_runtime = exec_runtime_destroy(s->exec_runtime);
 
         /* Also, remove the runtime directory */
-        unit_destroy_runtime_data(UNIT(s), &s->exec_context);
+        unit_destroy_runtime_data(UNIT(s), &s->exec_context, /* destroy_runtime_dir = */ true);
 
         /* Also get rid of the fd store, if that's configured. */
         if (s->fd_store_preserve_mode == EXEC_PRESERVE_NO)
@@ -2645,13 +2640,23 @@ static void service_enter_restart(Service *s, bool shortcut) {
                 return;
         }
 
-        /* Any units that are bound to this service must also be restarted. We use JOB_START for ourselves
-         * but then set JOB_RESTART_DEPENDENCIES which will enqueue JOB_RESTART for those dependency jobs. */
-        r = manager_add_job(UNIT(s)->manager, JOB_START, UNIT(s), JOB_RESTART_DEPENDENCIES, NULL, &error, NULL);
+        /* Any units that are bound to this service must also be restarted, unless RestartMode=direct.
+         * We use JOB_START for ourselves but then set JOB_RESTART_DEPENDENCIES which will enqueue JOB_RESTART
+         * for those dependency jobs in the former case, plain JOB_REPLACE when RestartMode=direct.
+         *
+         * Also, when RestartMode=direct is used, the service being restarted don't enter the inactive/failed state,
+         * i.e. unit_process_job -> job_finish_and_invalidate is never called, and the previous job might still
+         * be running (especially for Type=oneshot services).
+         * We need to refuse late merge and re-enqueue the anchor job. */
+        r = manager_add_job_full(UNIT(s)->manager,
+                                 JOB_START, UNIT(s),
+                                 s->restart_mode == SERVICE_RESTART_MODE_DIRECT ? JOB_REPLACE : JOB_RESTART_DEPENDENCIES,
+                                 TRANSACTION_REENQUEUE_ANCHOR,
+                                 /* affected_jobs = */ NULL,
+                                 &error, /* ret = */ NULL);
         if (r < 0) {
                 log_unit_warning(UNIT(s), "Failed to schedule restart job: %s", bus_error_message(&error, r));
-                service_enter_dead(s, SERVICE_FAILURE_RESOURCES, /* allow_restart= */ false);
-                return;
+                return service_enter_dead(s, SERVICE_FAILURE_RESOURCES, /* allow_restart= */ false);
         }
 
         /* Count the jobs we enqueue for restarting. This counter is maintained as long as the unit isn't
@@ -3412,14 +3417,12 @@ static int service_deserialize_item(Unit *u, const char *key, const char *value,
                         return 0;
                 }
 
-                r = service_add_fd_store(s, fd, fdn, do_poll);
+                r = service_add_fd_store(s, TAKE_FD(fd), fdn, do_poll);
                 if (r < 0) {
                         log_unit_debug_errno(u, r,
                                              "Failed to store deserialized fd '%s', ignoring: %m", fdn);
                         return 0;
                 }
-
-                TAKE_FD(fd);
         } else if (streq(key, "extra-fd")) {
                 _cleanup_free_ char *fdv = NULL, *fdn = NULL;
                 _cleanup_close_ int fd = -EBADF;
@@ -4540,6 +4543,72 @@ static bool service_notify_message_authorized(Service *s, PidRef *pid) {
         }
 }
 
+static int service_notify_message_parse_new_pid(
+                Unit *u,
+                char * const *tags,
+                FDSet *fds,
+                PidRef *ret) {
+
+        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+        const char *e;
+        int r;
+
+        assert(u);
+        assert(ret);
+
+        /* MAINPIDFD=1 always takes precedence */
+        if (strv_contains(tags, "MAINPIDFD=1")) {
+                unsigned n_fds = fdset_size(fds);
+                if (n_fds != 1)
+                        return log_unit_warning_errno(u, SYNTHETIC_ERRNO(EINVAL),
+                                                      "Got MAINPIDFD=1 with %s fd, ignoring.", n_fds == 0 ? "no" : "more than one");
+
+                r = pidref_set_pidfd_consume(&pidref, ASSERT_FD(fdset_steal_first(fds)));
+                if (r < 0)
+                        return log_unit_warning_errno(u, r, "Failed to create reference to received new main pidfd: %m");
+
+                goto finish;
+        }
+
+        e = strv_find_startswith(tags, "MAINPID=");
+        if (!e) {
+                *ret = PIDREF_NULL;
+                return 0;
+        }
+
+        r = pidref_set_pidstr(&pidref, e);
+        if (r < 0)
+                return log_unit_warning_errno(u, r, "Failed to parse MAINPID=%s field in notification message, ignoring: %m", e);
+
+        e = strv_find_startswith(tags, "MAINPIDFDID=");
+        if (!e)
+                goto finish;
+
+        uint64_t pidfd_id;
+
+        r = safe_atou64(e, &pidfd_id);
+        if (r < 0)
+                return log_unit_warning_errno(u, r, "Failed to parse MAINPIDFDID= in notification message, refusing: %s", e);
+
+        r = pidref_acquire_pidfd_id(&pidref);
+        if (r < 0) {
+                if (!ERRNO_IS_NEG_NOT_SUPPORTED(r))
+                        log_unit_warning_errno(u, r,
+                                               "Failed to acquire pidfd id of process " PID_FMT ", not validating MAINPIDFDID=%" PRIu64 ": %m",
+                                               pidref.pid, pidfd_id);
+                goto finish;
+        }
+
+        if (pidref.fd_id != pidfd_id)
+                return log_unit_warning_errno(u, SYNTHETIC_ERRNO(ESRCH),
+                                              "PIDFD ID of process " PID_FMT " (%" PRIu64 ") mismatches with received MAINPIDFDID=%" PRIu64 ", not changing main PID.",
+                                              pidref.pid, pidref.fd_id, pidfd_id);
+
+finish:
+        *ret = TAKE_PIDREF(pidref);
+        return 1;
+}
+
 static void service_notify_message(
                 Unit *u,
                 PidRef *pidref,
@@ -4565,38 +4634,34 @@ static void service_notify_message(
         bool notify_dbus = false;
         const char *e;
 
-        /* Interpret MAINPID= */
-        e = strv_find_startswith(tags, "MAINPID=");
-        if (e && IN_SET(s->state, SERVICE_START, SERVICE_START_POST, SERVICE_RUNNING,
-                        SERVICE_RELOAD, SERVICE_RELOAD_SIGNAL, SERVICE_RELOAD_NOTIFY,
-                        SERVICE_STOP, SERVICE_STOP_SIGTERM)) {
+        /* Interpret MAINPID= (+ MAINPIDFDID=) / MAINPIDFD=1 */
+        _cleanup_(pidref_done) PidRef new_main_pid = PIDREF_NULL;
 
-                _cleanup_(pidref_done) PidRef new_main_pid = PIDREF_NULL;
+        r = service_notify_message_parse_new_pid(u, tags, fds, &new_main_pid);
+        if (r > 0 &&
+            IN_SET(s->state, SERVICE_START, SERVICE_START_POST, SERVICE_RUNNING,
+                             SERVICE_RELOAD, SERVICE_RELOAD_SIGNAL, SERVICE_RELOAD_NOTIFY,
+                             SERVICE_STOP, SERVICE_STOP_SIGTERM) &&
+            (!s->main_pid_known || !pidref_equal(&new_main_pid, &s->main_pid))) {
 
-                r = pidref_set_pidstr(&new_main_pid, e);
-                if (r < 0)
-                        log_unit_warning_errno(u, r, "Failed to parse MAINPID=%s field in notification message, ignoring: %m", e);
-                else if (!s->main_pid_known || !pidref_equal(&new_main_pid, &s->main_pid)) {
+                r = service_is_suitable_main_pid(s, &new_main_pid, LOG_WARNING);
+                if (r == 0) {
+                        /* The new main PID is a bit suspicious, which is OK if the sender is privileged. */
 
-                        r = service_is_suitable_main_pid(s, &new_main_pid, LOG_WARNING);
-                        if (r == 0) {
-                                /* The new main PID is a bit suspicious, which is OK if the sender is privileged. */
+                        if (ucred->uid == 0) {
+                                log_unit_debug(u, "New main PID "PID_FMT" does not belong to service, but we'll accept it as the request to change it came from a privileged process.", new_main_pid.pid);
+                                r = 1;
+                        } else
+                                log_unit_warning(u, "New main PID "PID_FMT" does not belong to service, refusing.", new_main_pid.pid);
+                }
+                if (r > 0) {
+                        (void) service_set_main_pidref(s, TAKE_PIDREF(new_main_pid), /* start_timestamp = */ NULL);
 
-                                if (ucred->uid == 0) {
-                                        log_unit_debug(u, "New main PID "PID_FMT" does not belong to service, but we'll accept it as the request to change it came from a privileged process.", new_main_pid.pid);
-                                        r = 1;
-                                } else
-                                        log_unit_warning(u, "New main PID "PID_FMT" does not belong to service, refusing.", new_main_pid.pid);
-                        }
-                        if (r > 0) {
-                                (void) service_set_main_pidref(s, TAKE_PIDREF(new_main_pid), /* start_timestamp = */ NULL);
+                        r = unit_watch_pidref(UNIT(s), &s->main_pid, /* exclusive= */ false);
+                        if (r < 0)
+                                log_unit_warning_errno(UNIT(s), r, "Failed to watch new main PID "PID_FMT" for service: %m", s->main_pid.pid);
 
-                                r = unit_watch_pidref(UNIT(s), &s->main_pid, /* exclusive= */ false);
-                                if (r < 0)
-                                        log_unit_warning_errno(UNIT(s), r, "Failed to watch new main PID "PID_FMT" for service: %m", s->main_pid.pid);
-
-                                notify_dbus = true;
-                        }
+                        notify_dbus = true;
                 }
         }
 
@@ -4660,7 +4725,7 @@ static void service_notify_message(
                     monotonic_usec != USEC_INFINITY &&
                     monotonic_usec >= s->reload_begin_usec)
                         /* Note, we don't call service_enter_reload_by_notify() here, because we
-                         * don't need reload propagation nor do we want to restart the time-out. */
+                         * don't need reload propagation nor do we want to restart the timeout. */
                         service_set_state(s, SERVICE_RELOAD_NOTIFY);
 
                 if (s->state == SERVICE_RUNNING)
@@ -4835,6 +4900,35 @@ static void service_handoff_timestamp(
         unit_add_to_dbus_queue(u);
 }
 
+static void service_notify_pidref(Unit *u, PidRef *parent_pidref, PidRef *child_pidref) {
+        Service *s = ASSERT_PTR(SERVICE(u));
+        int r;
+
+        assert(pidref_is_set(parent_pidref));
+        assert(pidref_is_set(child_pidref));
+
+        if (pidref_equal(&s->main_pid, parent_pidref)) {
+                r = service_set_main_pidref(s, TAKE_PIDREF(*child_pidref), /* start_timestamp = */ NULL);
+                if (r < 0)
+                        return (void) log_unit_warning_errno(u, r, "Failed to set new main pid: %m");
+
+                /* Since the child process is PID 1 in a new PID namespace, it must be exclusive to this unit. */
+                r = unit_watch_pidref(u, &s->main_pid, /* exclusive= */ true);
+                if (r < 0)
+                        log_unit_warning_errno(u, r, "Failed to watch new main PID " PID_FMT ": %m", s->main_pid.pid);
+        } else if (pidref_equal(&s->control_pid, parent_pidref)) {
+                service_unwatch_control_pid(s);
+                s->control_pid = TAKE_PIDREF(*child_pidref);
+
+                r = unit_watch_pidref(u, &s->control_pid, /* exclusive= */ true);
+                if (r < 0)
+                        log_unit_warning_errno(u, r, "Failed to watch new control PID " PID_FMT ": %m", s->control_pid.pid);
+        } else
+                return (void) log_unit_debug(u, "Parent process " PID_FMT " does not match main or control processes, ignoring.", parent_pidref->pid);
+
+        unit_add_to_dbus_queue(u);
+}
+
 static int service_get_timeout(Unit *u, usec_t *timeout) {
         Service *s = ASSERT_PTR(SERVICE(u));
         uint64_t t;
@@ -4893,7 +4987,7 @@ static int bus_name_pid_lookup_callback(sd_bus_message *reply, void *userdata, s
         e = sd_bus_message_get_error(reply);
         if (e) {
                 r = sd_bus_error_get_errno(e);
-                log_warning_errno(r, "GetConnectionUnixProcessID() failed: %s", bus_error_message(e, r));
+                log_unit_warning_errno(UNIT(s), r, "GetConnectionUnixProcessID() failed: %s", bus_error_message(e, r));
                 return 1;
         }
 
@@ -4905,7 +4999,7 @@ static int bus_name_pid_lookup_callback(sd_bus_message *reply, void *userdata, s
 
         r = pidref_set_pid(&pidref, pid);
         if (r < 0) {
-                log_debug_errno(r, "GetConnectionUnixProcessID() returned invalid PID: %m");
+                log_unit_debug_errno(UNIT(s), r, "GetConnectionUnixProcessID() returned invalid PID: %m");
                 return 1;
         }
 
@@ -4952,7 +5046,7 @@ static void service_bus_name_owner_change(Unit *u, const char *new_owner) {
                                 "s",
                                 s->bus_name);
                 if (r < 0)
-                        log_debug_errno(r, "Failed to request owner PID of service name, ignoring: %m");
+                        log_unit_debug_errno(u, r, "Failed to request owner PID of service name, ignoring: %m");
         }
 }
 
@@ -5565,6 +5659,7 @@ const UnitVTable service_vtable = {
         .notify_cgroup_oom = service_notify_cgroup_oom_event,
         .notify_message = service_notify_message,
         .notify_handoff_timestamp = service_handoff_timestamp,
+        .notify_pidref = service_notify_pidref,
 
         .main_pid = service_main_pid,
         .control_pid = service_control_pid,

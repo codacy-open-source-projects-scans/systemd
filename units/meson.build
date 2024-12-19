@@ -288,6 +288,11 @@ units = [
           'conditions' : ['ENABLE_SYSEXT'],
         },
         {
+          'file' : 'systemd-confext-initrd.service',
+          'conditions' : ['ENABLE_INITRD', 'ENABLE_SYSEXT'],
+          'symlinks' : ['initrd.target.wants/'],
+        },
+        {
           'file' : 'systemd-coredump.socket',
           'conditions' : ['ENABLE_COREDUMP'],
           'symlinks' : ['sockets.target.wants/'],
@@ -620,6 +625,11 @@ units = [
           'conditions' : ['ENABLE_SYSEXT'],
         },
         {
+          'file' : 'systemd-sysext-initrd.service',
+          'conditions' : ['ENABLE_INITRD', 'ENABLE_SYSEXT'],
+          'symlinks' : ['initrd.target.wants/'],
+        },
+        {
           'file' : 'systemd-sysext.socket',
           'conditions' : ['ENABLE_SYSEXT'],
           'symlinks' : ['sockets.target.wants/'],
@@ -641,13 +651,13 @@ units = [
           'conditions' : ['ENABLE_SYSUPDATE'],
         },
         {
-          'file' : 'systemd-sysupdated.service.in',
-          'conditions' : ['ENABLE_SYSUPDATE'],
-          'symlinks' : ['dbus-org.freedesktop.sysupdate1.service'],
-        },
-        {
           'file' : 'systemd-sysupdate.timer',
           'conditions' : ['ENABLE_SYSUPDATE'],
+        },
+        {
+          'file' : 'systemd-sysupdated.service.in',
+          'conditions' : ['ENABLE_SYSUPDATED'],
+          'symlinks' : ['dbus-org.freedesktop.sysupdate1.service'],
         },
         {
           'file' : 'systemd-sysusers.service',

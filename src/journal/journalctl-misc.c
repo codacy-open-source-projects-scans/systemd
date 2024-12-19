@@ -246,11 +246,11 @@ int action_list_invocations(void) {
 
         assert(arg_action == ACTION_LIST_INVOCATIONS);
 
-        r = acquire_unit("--list-invocations", &unit, &type);
+        r = acquire_journal(&j);
         if (r < 0)
                 return r;
 
-        r = acquire_journal(&j);
+        r = acquire_unit(j, "--list-invocations", &unit, &type);
         if (r < 0)
                 return r;
 
@@ -333,7 +333,7 @@ int action_list_namespaces(void) {
                 }
         }
 
-        if (table_isempty(table) && FLAGS_SET(arg_json_format_flags, SD_JSON_FORMAT_OFF)) {
+        if (table_isempty(table) && !sd_json_format_enabled(arg_json_format_flags)) {
                 if (!arg_quiet)
                         log_notice("No namespaces found.");
         } else {

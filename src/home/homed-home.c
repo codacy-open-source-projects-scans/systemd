@@ -13,7 +13,6 @@
 #include "build-path.h"
 #include "bus-common-errors.h"
 #include "bus-locator.h"
-#include "data-fd-util.h"
 #include "env-util.h"
 #include "errno-list.h"
 #include "errno-util.h"
@@ -1266,13 +1265,13 @@ static int home_start_work(
         if (r < 0)
                 return r;
 
-        stdin_fd = acquire_data_fd(formatted);
+        stdin_fd = memfd_new_and_seal_string("request", formatted);
         if (stdin_fd < 0)
                 return stdin_fd;
 
         log_debug("Sending to worker: %s", formatted);
 
-        stdout_fd = memfd_create_wrapper("homework-stdout", MFD_CLOEXEC | MFD_NOEXEC_SEAL);
+        stdout_fd = memfd_new("homework-stdout");
         if (stdout_fd < 0)
                 return stdout_fd;
 
@@ -1725,15 +1724,6 @@ static int home_update_internal(
                         return r;
 
                 secret = saved_secret;
-        }
-
-        if (blobs) {
-                const char *failed = NULL;
-                r = user_record_ensure_blob_manifest(hr, blobs, &failed);
-                if (r == -EINVAL)
-                        return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Provided blob files do not correspond to blob manifest.");
-                if (r < 0)
-                        return sd_bus_error_set_errnof(error, r, "Failed to generate hash for blob %s: %m", strnull(failed));
         }
 
         r = manager_verify_user_record(h->manager, hr);

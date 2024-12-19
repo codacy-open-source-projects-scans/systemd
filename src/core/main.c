@@ -34,12 +34,12 @@
 #include "clock-warp.h"
 #include "conf-parser.h"
 #include "confidential-virt.h"
+#include "constants.h"
 #include "copy.h"
 #include "cpu-set-util.h"
 #include "crash-handler.h"
 #include "dbus-manager.h"
 #include "dbus.h"
-#include "constants.h"
 #include "dev-setup.h"
 #include "efi-random.h"
 #include "efivars.h"
@@ -87,6 +87,7 @@
 #include "seccomp-util.h"
 #include "selinux-setup.h"
 #include "selinux-util.h"
+#include "serialize.h"
 #include "signal-util.h"
 #include "smack-setup.h"
 #include "special.h"
@@ -1233,13 +1234,13 @@ static int prepare_reexecute(
         assert(ret_f);
         assert(ret_fds);
 
-        r = manager_open_serialization(m, &f);
-        if (r < 0)
-                return log_error_errno(r, "Failed to create serialization file: %m");
-
         /* Make sure nothing is really destructed when we shut down */
         m->n_reloading++;
         bus_manager_send_reloading(m, true);
+
+        r = manager_open_serialization(m, &f);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create serialization file: %m");
 
         fds = fdset_new();
         if (!fds)
@@ -1249,8 +1250,9 @@ static int prepare_reexecute(
         if (r < 0)
                 return r;
 
-        if (fseeko(f, 0, SEEK_SET) < 0)
-                return log_error_errno(errno, "Failed to rewind serialization fd: %m");
+        r = finish_serialization_file(f);
+        if (r < 0)
+                return log_error_errno(r, "Failed to finish serialization file: %m");
 
         r = fd_cloexec(fileno(f), false);
         if (r < 0)
@@ -1688,6 +1690,11 @@ static int become_shutdown(int objective, int retval) {
 
         /* Tell the binary how often to ping, ignore failure */
         (void) strv_extendf(&env_block, "WATCHDOG_USEC="USEC_FMT, watchdog_timer);
+
+        /* Make sure that tools that look for $WATCHDOG_USEC (and might get started by the exitrd) don't get
+         * confused by the variable, because the sd_watchdog_enabled() protocol uses the same variable for
+         * the same purposes. */
+        (void) strv_extendf(&env_block, "WATCHDOG_PID=" PID_FMT, getpid_cached());
 
         if (arg_watchdog_device)
                 (void) strv_extendf(&env_block, "WATCHDOG_DEVICE=%s", arg_watchdog_device);
@@ -2582,13 +2589,13 @@ static int do_queue_default_job(
 
         assert(target->load_state == UNIT_LOADED);
 
-        r = manager_add_job(m, JOB_START, target, JOB_ISOLATE, NULL, &error, &job);
+        r = manager_add_job(m, JOB_START, target, JOB_ISOLATE, &error, &job);
         if (r == -EPERM) {
                 log_debug_errno(r, "Default target could not be isolated, starting instead: %s", bus_error_message(&error, r));
 
                 sd_bus_error_free(&error);
 
-                r = manager_add_job(m, JOB_START, target, JOB_REPLACE, NULL, &error, &job);
+                r = manager_add_job(m, JOB_START, target, JOB_REPLACE, &error, &job);
                 if (r < 0) {
                         *ret_error_message = "Failed to start default target";
                         return log_struct_errno(LOG_EMERG, r,
@@ -3170,20 +3177,10 @@ int main(int argc, char *argv[]) {
                 }
 
                 if (!skip_setup) {
-                        /* Before we actually start deleting cgroup v1 code, make it harder to boot
-                         * in cgroupv1 mode first. See also #30852. */
-
                         r = mount_cgroup_legacy_controllers(loaded_policy);
                         if (r < 0) {
-                                if (r == -ERFKILL)
-                                        error_message = "Refusing to run under cgroup v1, SYSTEMD_CGROUP_ENABLE_LEGACY_FORCE=1 not specified on kernel command line";
-                                else
-                                        error_message = "Failed to mount cgroup v1 hierarchy";
+                                error_message = "Failed to mount cgroup v1 hierarchy";
                                 goto finish;
-                        }
-                        if (r > 0) {
-                                log_full(LOG_CRIT, "Legacy cgroup v1 support selected. This is no longer supported. Will proceed anyway after 30s.");
-                                (void) usleep_safe(30 * USEC_PER_SEC);
                         }
                 }
 

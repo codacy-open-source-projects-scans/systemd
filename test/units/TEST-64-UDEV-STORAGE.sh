@@ -177,7 +177,7 @@ testcase_nvme_basic() {
     local expected_symlinks=()
     local i
 
-    for (( i = 0; i < 5; i++ )); do
+    for i in {0..4}; do
         expected_symlinks+=(
             # both replace mode provides the same devlink
             /dev/disk/by-id/nvme-QEMU_NVMe_Ctrl_deadbeef"$i"
@@ -185,7 +185,7 @@ testcase_nvme_basic() {
             /dev/disk/by-id/nvme-QEMU_NVMe_Ctrl_deadbeef"$i"_1
         )
     done
-    for (( i = 5; i < 10; i++ )); do
+    for i in {5..9}; do
         expected_symlinks+=(
             # old replace mode
             /dev/disk/by-id/nvme-QEMU_NVMe_Ctrl__deadbeef_"$i"
@@ -195,7 +195,7 @@ testcase_nvme_basic() {
             /dev/disk/by-id/nvme-QEMU_NVMe_Ctrl_____deadbeef__"$i"_1
         )
     done
-    for (( i = 10; i < 15; i++ )); do
+    for i in {10..14}; do
         expected_symlinks+=(
             # old replace mode does not provide devlink, as serial contains "/"
             # newer replace mode
@@ -204,7 +204,7 @@ testcase_nvme_basic() {
             /dev/disk/by-id/nvme-QEMU_NVMe_Ctrl_____dead_beef_"$i"_1
         )
     done
-    for (( i = 15; i < 20; i++ )); do
+    for i in {15..19}; do
         expected_symlinks+=(
             # old replace mode does not provide devlink, as serial contains "/"
             # newer replace mode
@@ -1006,19 +1006,21 @@ testcase_long_sysfs_path() {
     journalctl --cursor-file="${cursor:?}" -n0 -q
 
     # Make sure the test device is connected and show its "wonderful" path
-    stat /sys/block/vda
-    readlink -f /sys/block/vda/dev
+    dev="$(udevadm info -e --property-match=ID_SERIAL=long-sysfs-path --property-match DEVTYPE=disk --json=short | jq -r .DEVNAME)"
+    dev="${dev#/dev/}"
 
-    dev="/dev/vda"
-    udevadm lock --device "$dev" sfdisk "$dev" <<EOF
+    stat "/sys/block/${dev}"
+    readlink -f "/sys/block/${dev}/dev"
+
+    udevadm lock --device "/dev/${dev}" sfdisk "/dev/${dev}" <<EOF
 label: gpt
 
 name="test_swap", size=32M
 uuid="deadbeef-dead-dead-beef-000000000000", name="test_part", size=5M
 EOF
     udevadm settle
-    udevadm lock --device "${dev}1" mkswap -U "deadbeef-dead-dead-beef-111111111111" -L "swap_vol" "${dev}1"
-    udevadm lock --device "${dev}2" mkfs.ext4 -U "deadbeef-dead-dead-beef-222222222222" -L "data_vol" "${dev}2"
+    udevadm lock --device "/dev/${dev}1" mkswap -U "deadbeef-dead-dead-beef-111111111111" -L "swap_vol" "/dev/${dev}1"
+    udevadm lock --device "/dev/${dev}2" mkfs.ext4 -U "deadbeef-dead-dead-beef-222222222222" -L "data_vol" "/dev/${dev}2"
     udevadm wait --settle --timeout=30 "${expected_symlinks[@]}"
 
     # Try to mount the data partition manually (using its label)
@@ -1044,13 +1046,13 @@ EOF
     # Check state of affairs after https://github.com/systemd/systemd/pull/22759
     # Note: can't use `--cursor-file` here, since we don't want to update the cursor
     #       after using it
-    [[ "$(journalctl --after-cursor="$(<"$cursor")" -q --no-pager -o short-monotonic -p info --grep "Device path.*vda.?' too long to fit into unit name" | wc -l)" -eq 0 ]]
-    [[ "$(journalctl --after-cursor="$(<"$cursor")" -q --no-pager -o short-monotonic --grep "Unit name .*vda.?\.device\" too long, falling back to hashed unit name" | wc -l)" -gt 0 ]]
+    [[ "$(journalctl --after-cursor="$(<"$cursor")" -q --no-pager -o short-monotonic -p info --grep "Device path.*${dev}.?' too long to fit into unit name" | wc -l)" -eq 0 ]]
+    [[ "$(journalctl --after-cursor="$(<"$cursor")" -q --no-pager -o short-monotonic --grep "Unit name .*${dev}.?\.device\" too long, falling back to hashed unit name" | wc -l)" -gt 0 ]]
     # Check if the respective "hashed" units exist and are active (plugged)
-    systemctl status --no-pager "$(readlink -f /sys/block/vda/vda1)"
-    systemctl status --no-pager "$(readlink -f /sys/block/vda/vda2)"
+    systemctl status --no-pager "$(readlink -f "/sys/block/${dev}/${dev}1")"
+    systemctl status --no-pager "$(readlink -f "/sys/block/${dev}/${dev}2")"
     # Make sure we don't unnecessarily spam the log
-    { journalctl -b -q --no-pager -o short-monotonic -p info --grep "/sys/devices/.+/vda[0-9]?" _PID=1 + UNIT=systemd-udevd.service || :;} | tee "$logfile"
+    { journalctl -b -q --no-pager -o short-monotonic -p info --grep "/sys/devices/.+/${dev}[0-9]?" _PID=1 + UNIT=systemd-udevd.service || :;} | tee "$logfile"
     [[ "$(wc -l <"$logfile")" -lt 10 ]]
 
     : >/etc/fstab

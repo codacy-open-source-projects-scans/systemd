@@ -363,16 +363,14 @@ bool inhibitor_is_orphan(Inhibitor *i) {
         return false;
 }
 
-InhibitWhat manager_inhibit_what(Manager *m, bool block) {
+InhibitWhat manager_inhibit_what(Manager *m, InhibitMode mode) {
         Inhibitor *i;
         InhibitWhat what = 0;
 
         assert(m);
 
         HASHMAP_FOREACH(i, m->inhibitors)
-                if (i->started &&
-                    ((!block && IN_SET(i->mode, INHIBIT_DELAY, INHIBIT_DELAY_WEAK)) ||
-                     (block && IN_SET(i->mode, INHIBIT_BLOCK, INHIBIT_BLOCK_WEAK))))
+                if (i->started && i->mode == mode)
                         what |= i->what;
 
         return what;
@@ -401,14 +399,12 @@ static int pidref_is_active_session(Manager *m, const PidRef *pid) {
 bool manager_is_inhibited(
                 Manager *m,
                 InhibitWhat w,
-                bool block,
                 dual_timestamp *since,
-                bool ignore_inactive,
-                bool ignore_uid,
-                uid_t uid,
-                Inhibitor **offending) {
+                ManagerIsInhibitedFlags flags,
+                uid_t uid_to_ignore,
+                Inhibitor **ret_offending) {
 
-        Inhibitor *i;
+        Inhibitor *i, *offending = NULL;
         struct dual_timestamp ts = DUAL_TIMESTAMP_NULL;
         bool inhibited = false;
 
@@ -423,28 +419,33 @@ bool manager_is_inhibited(
                 if (!(i->what & w))
                         continue;
 
-                if ((block && !IN_SET(i->mode, INHIBIT_BLOCK, INHIBIT_BLOCK_WEAK)) ||
-                    (!block && !IN_SET(i->mode, INHIBIT_DELAY, INHIBIT_DELAY_WEAK)))
+                if ((flags & MANAGER_IS_INHIBITED_CHECK_DELAY) != (i->mode == INHIBIT_DELAY))
                         continue;
 
-                if (ignore_inactive && pidref_is_active_session(m, &i->pid) <= 0)
+                if ((flags & MANAGER_IS_INHIBITED_IGNORE_INACTIVE) &&
+                    pidref_is_active_session(m, &i->pid) <= 0)
                         continue;
 
-                if (IN_SET(i->mode, INHIBIT_BLOCK_WEAK, INHIBIT_DELAY_WEAK) && ignore_uid && i->uid == uid)
+                if (i->mode == INHIBIT_BLOCK_WEAK &&
+                    uid_is_valid(uid_to_ignore) &&
+                    uid_to_ignore == i->uid)
                         continue;
 
-                if (!inhibited ||
-                    i->since.monotonic < ts.monotonic)
+                if (!inhibited || i->since.monotonic < ts.monotonic)
                         ts = i->since;
 
                 inhibited = true;
 
-                if (offending)
-                        *offending = i;
+                /* Stronger inhibitor wins */
+                if (!offending || (i->mode < offending->mode))
+                        offending = i;
         }
 
         if (since)
                 *since = ts;
+
+        if (ret_offending)
+                *ret_offending = offending;
 
         return inhibited;
 }
@@ -531,7 +532,6 @@ static const char* const inhibit_mode_table[_INHIBIT_MODE_MAX] = {
         [INHIBIT_BLOCK]      = "block",
         [INHIBIT_BLOCK_WEAK] = "block-weak",
         [INHIBIT_DELAY]      = "delay",
-        [INHIBIT_DELAY_WEAK] = "delay-weak"
 };
 
 DEFINE_STRING_TABLE_LOOKUP(inhibit_mode, InhibitMode);

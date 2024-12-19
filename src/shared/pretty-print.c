@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <sys/utsname.h>
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
+#include <sys/utsname.h>
 
 #include "alloc-util.h"
 #include "color-util.h"
@@ -75,6 +76,25 @@ bool urlify_enabled(void) {
 #endif
 }
 
+static bool url_suitable_for_osc8(const char *url) {
+        assert(url);
+
+        /* Not all URLs are safe for inclusion in OSC 8 due to charset and length restrictions. Let's detect
+         * which ones those are */
+
+        /* If the URL is longer than 2K let's not try to do OSC 8. As per recommendation in
+         * https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda#length-limits */
+        if (strlen(url) > 2000)
+                return false;
+
+        /* OSC sequences may only contain chars from the 32..126 range, as per ECMA-48 */
+        for (const char *c = url; *c; c++)
+                if (!osc_char_is_valid(*c))
+                        return false;
+
+        return true;
+}
+
 int terminal_urlify(const char *url, const char *text, char **ret) {
         char *n;
 
@@ -86,8 +106,10 @@ int terminal_urlify(const char *url, const char *text, char **ret) {
         if (isempty(text))
                 text = url;
 
-        if (urlify_enabled())
-                n = strjoin("\x1B]8;;", url, "\a", text, "\x1B]8;;\a");
+        if (urlify_enabled() && url_suitable_for_osc8(url))
+                n = strjoin(ANSI_OSC "8;;", url, ANSI_ST,
+                            text,
+                            ANSI_OSC "8;;" ANSI_ST);
         else
                 n = strdup(text);
         if (!n)
@@ -290,12 +312,13 @@ void print_separator(void) {
                 size_t c = columns();
 
                 flockfile(stdout);
-                fputs_unlocked(ANSI_GREY_UNDERLINE, stdout);
+                fputs_unlocked(ansi_grey_underline(), stdout);
 
                 for (size_t i = 0; i < c; i++)
                         fputc_unlocked(' ', stdout);
 
-                fputs_unlocked(ANSI_NORMAL "\n\n", stdout);
+                fputs_unlocked(ansi_normal(), stdout);
+                fputs_unlocked("\n\n", stdout);
                 funlockfile(stdout);
         } else
                 fputs("\n\n", stdout);
@@ -460,7 +483,7 @@ bool shall_tint_background(void) {
         return cache != 0;
 }
 
-void draw_progress_bar_impl(const char *prefix, double percentage) {
+void draw_progress_bar_unbuffered(const char *prefix, double percentage) {
         fputc('\r', stderr);
         if (prefix) {
                 fputs(prefix, stderr);
@@ -468,6 +491,14 @@ void draw_progress_bar_impl(const char *prefix, double percentage) {
         }
 
         if (!terminal_is_dumb()) {
+                /* Generate the Windows Terminal progress indication OSC sequence here. Most Linux terminals currently
+                 * ignore this. But let's hope this changes one day. For details about this OSC sequence, see:
+                 *
+                 * https://conemu.github.io/en/AnsiEscapeCodes.html#ConEmu_specific_OSC
+                 * https://github.com/microsoft/terminal/pull/8055
+                 */
+                fprintf(stderr, ANSI_OSC "9;4;1;%u" ANSI_ST, (unsigned) ceil(percentage));
+
                 size_t cols = columns();
                 size_t prefix_width = utf8_console_width(prefix) + 1 /* space */;
                 size_t length = cols > prefix_width + 6 ? cols - prefix_width - 6 : 0;
@@ -513,10 +544,9 @@ void draw_progress_bar_impl(const char *prefix, double percentage) {
                 fputs(ANSI_ERASE_TO_END_OF_LINE, stderr);
 
         fputc('\r', stderr);
-
 }
 
-void clear_progress_bar_impl(const char *prefix) {
+void clear_progress_bar_unbuffered(const char *prefix) {
         fputc('\r', stderr);
 
         if (terminal_is_dumb())
@@ -525,7 +555,9 @@ void clear_progress_bar_impl(const char *prefix) {
                               LESS_BY(columns(), 1U)),
                       stderr);
         else
-                fputs(ANSI_ERASE_TO_END_OF_LINE, stderr);
+                /* Undo Windows Terminal progress indication again. */
+                fputs(ANSI_OSC "9;4;0;;" ANSI_ST
+                      ANSI_ERASE_TO_END_OF_LINE, stderr);
 
         fputc('\r', stderr);
 }
@@ -535,10 +567,26 @@ void draw_progress_bar(const char *prefix, double percentage) {
          * unbuffered by default. Let's temporarily turn on full buffering, so that this is passed to the tty
          * as a single buffer, to make things more efficient. */
         WITH_BUFFERED_STDERR;
-        draw_progress_bar_impl(prefix, percentage);
+        draw_progress_bar_unbuffered(prefix, percentage);
+}
+
+int draw_progress_barf(double percentage, const char *prefixf, ...) {
+        _cleanup_free_ char *s = NULL;
+        va_list ap;
+        int r;
+
+        va_start(ap, prefixf);
+        r = vasprintf(&s, prefixf, ap);
+        va_end(ap);
+
+        if (r < 0)
+                return -ENOMEM;
+
+        draw_progress_bar(s, percentage);
+        return 0;
 }
 
 void clear_progress_bar(const char *prefix) {
         WITH_BUFFERED_STDERR;
-        clear_progress_bar_impl(prefix);
+        clear_progress_bar_unbuffered(prefix);
 }
