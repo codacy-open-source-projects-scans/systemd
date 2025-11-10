@@ -1301,7 +1301,7 @@ feature = get_option('gcrypt')
 libgcrypt = dependency('libgcrypt',
                        required : feature)
 libgpg_error = dependency('gpg-error',
-                          required : feature.disabled() ? feature : false)
+                          required : feature)
 
 have = libgcrypt.found() and libgpg_error.found()
 if not have
@@ -1427,10 +1427,16 @@ libarchive = dependency('libarchive',
                         required : get_option('libarchive'))
 libarchive_cflags = libarchive.partial_dependency(includes: true, compile_args: true)
 conf.set10('HAVE_LIBARCHIVE', libarchive.found())
-conf.set10('HAVE_LIBARCHIVE_UID_IS_SET',
-           libarchive.found() and cc.has_function('archive_entry_uid_is_set', dependencies : libarchive))
-conf.set10('HAVE_LIBARCHIVE_HARDLINK_IS_SET',
-           libarchive.found() and cc.has_function('archive_entry_hardlink_is_set', dependencies : libarchive))
+
+foreach ident : [
+                'archive_entry_gid_is_set',      # since 3.7.3
+                'archive_entry_uid_is_set',      # since 3.7.3
+                'archive_entry_hardlink_is_set', # since 3.7.5
+        ]
+
+        have = libarchive.found() and cc.has_function(ident, dependencies : libarchive)
+        conf.set10('HAVE_' + ident.to_upper(), have)
+endforeach
 
 libxkbcommon = dependency('xkbcommon',
                           version : '>= 0.3.0',
@@ -1534,10 +1540,19 @@ conf.set('DEFAULT_DNSSEC_MODE',
          'DNSSEC_' + default_dnssec.underscorify().to_upper())
 conf.set_quoted('DEFAULT_DNSSEC_MODE_STR', default_dnssec)
 
+have = get_option('importd').require(
+        conf.get('HAVE_LIBCURL') == 1 and
+        conf.get('HAVE_OPENSSL') == 1 and
+        conf.get('HAVE_ZLIB') == 1 and
+        conf.get('HAVE_XZ') == 1,
+        error_message : 'curl, openssl, zlib and xz required').allowed()
+conf.set10('ENABLE_IMPORTD', have)
+
 have = get_option('sysupdate').require(
+        conf.get('ENABLE_IMPORTD') == 1 and
         conf.get('HAVE_OPENSSL') == 1 and
         conf.get('HAVE_LIBFDISK') == 1,
-        error_message : 'fdisk and openssl required').allowed()
+        error_message : 'systemd-importd, fdisk, and openssl required').allowed()
 conf.set10('ENABLE_SYSUPDATE', have)
 
 have2 = get_option('sysupdated')
@@ -1555,14 +1570,6 @@ endif
 conf.set10('ENABLE_SYSUPDATED', have2)
 
 conf.set10('ENABLE_STORAGETM', get_option('storagetm'))
-
-have = get_option('importd').require(
-        conf.get('HAVE_LIBCURL') == 1 and
-        conf.get('HAVE_OPENSSL') == 1 and
-        conf.get('HAVE_ZLIB') == 1 and
-        conf.get('HAVE_XZ') == 1,
-        error_message : 'curl, openssl/grypt, zlib and xz required').allowed()
-conf.set10('ENABLE_IMPORTD', have)
 
 have = get_option('homed').require(
         conf.get('HAVE_OPENSSL') == 1 and

@@ -187,6 +187,18 @@ static int connect_journal_socket(
         return r;
 }
 
+static bool exec_output_forward_to_console(ExecOutput o) {
+        return IN_SET(o,
+                      EXEC_OUTPUT_JOURNAL_AND_CONSOLE,
+                      EXEC_OUTPUT_KMSG_AND_CONSOLE);
+}
+
+static bool exec_output_forward_to_kmsg(ExecOutput o) {
+        return IN_SET(o,
+                      EXEC_OUTPUT_KMSG,
+                      EXEC_OUTPUT_KMSG_AND_CONSOLE);
+}
+
 static int connect_logger_as(
                 const ExecContext *context,
                 const ExecParameters *params,
@@ -219,20 +231,20 @@ static int connect_logger_as(
         (void) fd_inc_sndbuf(fd, SNDBUF_SIZE);
 
         if (dprintf(fd,
-                "%s\n"
-                "%s\n"
-                "%i\n"
-                "%i\n"
-                "%i\n"
-                "%i\n"
-                "%i\n",
-                context->syslog_identifier ?: ident,
-                params->flags & EXEC_PASS_LOG_UNIT ? params->unit_id : "",
-                context->syslog_priority,
-                !!context->syslog_level_prefix,
-                false,
-                exec_output_is_kmsg(output),
-                exec_output_is_terminal(output)) < 0)
+                    "%s\n"
+                    "%s\n"
+                    "%i\n"
+                    "%i\n"
+                    "%i\n"
+                    "%i\n"
+                    "%i\n",
+                    context->syslog_identifier ?: ident,
+                    params->flags & EXEC_PASS_LOG_UNIT ? params->unit_id : "",
+                    context->syslog_priority,
+                    !!context->syslog_level_prefix,
+                    false,
+                    exec_output_forward_to_kmsg(output),
+                    exec_output_forward_to_console(output)) < 0)
                 return -errno;
 
         return move_fd(TAKE_FD(fd), nfd, false);
@@ -1237,7 +1249,10 @@ static int exec_context_get_tty_for_pam(const ExecContext *context, char **ret) 
                 return 1;
         }
 
-        if (!IN_SET(context->std_input, EXEC_INPUT_TTY, EXEC_INPUT_TTY_FAIL, EXEC_INPUT_TTY_FORCE)) {
+        /* Do not implicitly configure TTY unless TTYPath= or StandardInput=tty is specified. See issue
+         * #39334. Note, exec_context_tty_path() returns "/dev/console" when TTYPath= is unspecified, hence
+         * explicitly check context->tty_path here. */
+        if (!context->tty_path && !exec_input_is_terminal(context->std_input)) {
                 *ret = NULL;
                 return 0;
         }
@@ -2009,6 +2024,7 @@ static int build_environment(
 
         _cleanup_strv_free_ char **e = NULL;
         size_t n = 0;
+        pid_t exec_pid;
         int r;
 
         assert(c);
@@ -2016,10 +2032,12 @@ static int build_environment(
         assert(cgroup_context);
         assert(ret);
 
+        exec_pid = needs_sandboxing && exec_needs_pid_namespace(c, p) ? 1 : getpid_cached();
+
         if (p->n_socket_fds + p->n_stashed_fds > 0) {
                 _cleanup_free_ char *joined = NULL;
 
-                r = strv_extendf_with_size(&e, &n, "LISTEN_PID="PID_FMT, getpid_cached());
+                r = strv_extendf_with_size(&e, &n, "LISTEN_PID="PID_FMT, exec_pid);
                 if (r < 0)
                         return r;
 
@@ -2044,7 +2062,7 @@ static int build_environment(
         }
 
         if ((p->flags & EXEC_SET_WATCHDOG) && p->watchdog_usec > 0) {
-                r = strv_extendf_with_size(&e, &n, "WATCHDOG_PID="PID_FMT, getpid_cached());
+                r = strv_extendf_with_size(&e, &n, "WATCHDOG_PID="PID_FMT, exec_pid);
                 if (r < 0)
                         return r;
 
@@ -2174,7 +2192,7 @@ static int build_environment(
                         return r;
         }
 
-        r = strv_extendf_with_size(&e, &n, "SYSTEMD_EXEC_PID=" PID_FMT, getpid_cached());
+        r = strv_extendf_with_size(&e, &n, "SYSTEMD_EXEC_PID=" PID_FMT, exec_pid);
         if (r < 0)
                 return r;
 
