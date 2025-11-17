@@ -866,6 +866,10 @@ static int parse_argv(int argc, char *argv[]) {
                                                "--wait may not be combined with --scope.");
         }
 
+        if (arg_scope && arg_root_directory)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "--root-directory= is not supported in --scope mode.");
+
         if (same_dir && arg_root_directory && !path_equal(arg_root_directory, "/"))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "--same-dir cannot be used with a root directory other than '/'");
@@ -895,6 +899,7 @@ static int parse_argv_sudo_mode(int argc, char *argv[]) {
                 ARG_AREA,
                 ARG_VIA_SHELL,
                 ARG_EMPOWER,
+                ARG_SAME_ROOT_DIR,
         };
 
         /* If invoked as "run0" binary, let's expose a more sudo-like interface. We add various extensions
@@ -925,6 +930,7 @@ static int parse_argv_sudo_mode(int argc, char *argv[]) {
                 { "lightweight",         required_argument, NULL, ARG_LIGHTWEIGHT         },
                 { "area",                required_argument, NULL, ARG_AREA                },
                 { "empower",             no_argument,       NULL, ARG_EMPOWER             },
+                { "same-root-dir",       no_argument,       NULL, ARG_SAME_ROOT_DIR       },
                 {},
         };
 
@@ -1066,6 +1072,13 @@ static int parse_argv_sudo_mode(int argc, char *argv[]) {
 
                 case ARG_EMPOWER:
                         arg_empower = true;
+                        break;
+
+                case ARG_SAME_ROOT_DIR:
+                        r = free_and_strdup_warn(&arg_root_directory, "/");
+                        if (r < 0)
+                                return r;
+
                         break;
 
                 case '?':
@@ -1420,6 +1433,15 @@ static int transient_service_set_properties(sd_bus_message *m, const char *pty_p
                 r = sd_bus_message_append(m, "(sv)", "AmbientCapabilities", "t", CAP_MASK_ALL);
                 if (r < 0)
                         return bus_log_create_error(r);
+
+                r = getgrnam_malloc("empower", /* ret= */ NULL);
+                if (r < 0 && r != -ESRCH)
+                        return log_error_errno(r, "Failed to look up group 'empower' via NSS: %m");
+                if (r >= 0) {
+                        r = sd_bus_message_append(m, "(sv)", "SupplementaryGroups", "as", 1, "empower");
+                        if (r < 0)
+                                return bus_log_create_error(r);
+                }
         }
 
         if (arg_nice_set) {
