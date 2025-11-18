@@ -26,8 +26,8 @@ else
         project_minor_version = '0'
 endif
 
-libsystemd_version = '0.41.0'
-libudev_version = '1.7.11'
+libsystemd_version = '0.42.0'
+libudev_version = '1.7.12'
 
 conf = configuration_data()
 conf.set_quoted('PROJECT_URL', 'https://systemd.io/')
@@ -1687,7 +1687,7 @@ foreach tuple : [
                 ['timesyncd'],
                 ['tmpfiles'],
                 ['tpm'],
-                ['utmp'],
+                ['utmp',            get_option('libc') != 'musl',     'musl does not support it'],
                 ['userdb'],
                 ['vconsole'],
                 ['xdg-autostart'],

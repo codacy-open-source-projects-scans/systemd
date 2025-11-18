@@ -2087,8 +2087,11 @@ static int build_environment(
                 assert(!c->user);
 
                 r = get_fixed_user("root", /* prefer_nss = */ false, &username, NULL, NULL, &home, &shell);
-                if (r < 0)
-                        return log_debug_errno(r, "Failed to determine user credentials for root: %m");
+                if (r < 0) {
+                        log_debug_errno(r, "Failed to determine credentials for user root: %s",
+                                        STRERROR_USER(r));
+                        return ERRNO_IS_NEG_BAD_ACCOUNT(r) ? -EINVAL : r;  /* Suppress confusing errno */
+                }
         }
 
         bool set_user_login_env = exec_context_get_set_login_environment(c);
@@ -5265,7 +5268,9 @@ int exec_invoke(
                                            &username, &uid, &gid, &pwent_home, &shell);
                         if (r < 0) {
                                 *exit_status = EXIT_USER;
-                                return log_error_errno(r, "Failed to determine user credentials: %m");
+                                log_error_errno(r, "Failed to determine credentials for user '%s': %s",
+                                                u, STRERROR_USER(r));
+                                return ERRNO_IS_NEG_BAD_ACCOUNT(r) ? -EINVAL : r;  /* Suppress confusing errno */
                         }
                 }
 
@@ -5273,7 +5278,9 @@ int exec_invoke(
                         r = get_fixed_group(context->group, &groupname, &gid);
                         if (r < 0) {
                                 *exit_status = EXIT_GROUP;
-                                return log_error_errno(r, "Failed to determine group credentials: %m");
+                                log_error_errno(r, "Failed to determine credentials for group '%s': %s",
+                                                u, STRERROR_GROUP(r));
+                                return ERRNO_IS_NEG_BAD_ACCOUNT(r) ? -EINVAL : r;  /* Suppress confusing errno */
                         }
                 }
         }
@@ -5579,7 +5586,7 @@ int exec_invoke(
 
                 if (is_pressure_supported() > 0) {
                         if (cgroup_context_want_memory_pressure(cgroup_context)) {
-                                r = cg_get_path("memory", params->cgroup_path, "memory.pressure", &memory_pressure_path);
+                                r = cg_get_path(params->cgroup_path, "memory.pressure", &memory_pressure_path);
                                 if (r < 0) {
                                         *exit_status = EXIT_MEMORY;
                                         return log_oom();
@@ -5597,7 +5604,7 @@ int exec_invoke(
                                  * memory_pressure_path != NULL in the conditional below. */
                                 if (memory_pressure_path && needs_sandboxing && exec_needs_cgroup_namespace(context)) {
                                         memory_pressure_path = mfree(memory_pressure_path);
-                                        r = cg_get_path("memory", "/", "memory.pressure", &memory_pressure_path);
+                                        r = cg_get_path("/", "memory.pressure", &memory_pressure_path);
                                         if (r < 0) {
                                                 *exit_status = EXIT_MEMORY;
                                                 return log_oom();
