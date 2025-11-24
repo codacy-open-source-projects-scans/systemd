@@ -6,7 +6,6 @@
 #include "alloc-util.h"
 #include "ansi-color.h"
 #include "bitfield.h"
-#include "bootspec.h"
 #include "boot-entry.h"
 #include "constants.h"
 #include "creds-util.h"
@@ -14,7 +13,6 @@
 #include "dirent-util.h"
 #include "dlfcn-util.h"
 #include "efi-api.h"
-#include "errno-util.h"
 #include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
@@ -42,7 +40,6 @@
 #include "sync-util.h"
 #include "time-util.h"
 #include "tpm2-pcr.h"
-#include "tmpfile-util.h"
 #include "tpm2-util.h"
 #include "virt.h"
 
@@ -6612,7 +6609,7 @@ static int tpm2_userspace_log(
                 r = sd_json_variant_append_arraybo(
                                 &array,
                                 SD_JSON_BUILD_PAIR_STRING("hashAlg", a),
-                                SD_JSON_BUILD_PAIR("digest", SD_JSON_BUILD_HEX(&values->digests[i].digest, EVP_MD_size(implementation))));
+                                SD_JSON_BUILD_PAIR_HEX("digest", &values->digests[i].digest, EVP_MD_size(implementation)));
                 if (r < 0)
                         return log_debug_errno(r, "Failed to append digest object to JSON array: %m");
         }
@@ -6627,13 +6624,13 @@ static int tpm2_userspace_log(
                         &v,
                         SD_JSON_BUILD_PAIR_CONDITION(pcr_index != UINT_MAX, "pcr", SD_JSON_BUILD_UNSIGNED(pcr_index)),
                         SD_JSON_BUILD_PAIR_CONDITION(nv_index != UINT32_MAX, "nv_index", SD_JSON_BUILD_UNSIGNED(nv_index)),
-                        SD_JSON_BUILD_PAIR("digests", SD_JSON_BUILD_VARIANT(array)),
-                        SD_JSON_BUILD_PAIR("content_type", SD_JSON_BUILD_STRING("systemd")),
+                        SD_JSON_BUILD_PAIR_VARIANT("digests", array),
+                        SD_JSON_BUILD_PAIR_STRING("content_type", "systemd"),
                         SD_JSON_BUILD_PAIR("content", SD_JSON_BUILD_OBJECT(
                                                            SD_JSON_BUILD_PAIR_CONDITION(!!nv_index_name, "nvIndexName", SD_JSON_BUILD_STRING(nv_index_name)),
                                                            SD_JSON_BUILD_PAIR_CONDITION(!!description, "string", SD_JSON_BUILD_STRING(description)),
-                                                           SD_JSON_BUILD_PAIR("bootId", SD_JSON_BUILD_ID128(boot_id)),
-                                                           SD_JSON_BUILD_PAIR("timestamp", SD_JSON_BUILD_UNSIGNED(now(CLOCK_BOOTTIME))),
+                                                           SD_JSON_BUILD_PAIR_ID128("bootId", boot_id),
+                                                           SD_JSON_BUILD_PAIR_UNSIGNED("timestamp", now(CLOCK_BOOTTIME)),
                                                            SD_JSON_BUILD_PAIR_CONDITION(event_type >= 0, "eventType", SD_JSON_BUILD_STRING(tpm2_userspace_event_type_to_string(event_type))))));
         if (r < 0)
                 return log_debug_errno(r, "Failed to build log record JSON: %m");
@@ -8466,11 +8463,11 @@ int tpm2_make_luks2_json(
                         &v,
                         SD_JSON_BUILD_PAIR("type", JSON_BUILD_CONST_STRING("systemd-tpm2")),
                         SD_JSON_BUILD_PAIR("keyslots", SD_JSON_BUILD_ARRAY(SD_JSON_BUILD_STRING(keyslot_as_string))),
-                        SD_JSON_BUILD_PAIR("tpm2-blob", SD_JSON_BUILD_VARIANT(bj)),
-                        SD_JSON_BUILD_PAIR("tpm2-pcrs", SD_JSON_BUILD_VARIANT(hmj)),
+                        SD_JSON_BUILD_PAIR_VARIANT("tpm2-blob", bj),
+                        SD_JSON_BUILD_PAIR_VARIANT("tpm2-pcrs", hmj),
                         SD_JSON_BUILD_PAIR_CONDITION(pcr_bank != 0 && tpm2_hash_alg_to_string(pcr_bank), "tpm2-pcr-bank", SD_JSON_BUILD_STRING(tpm2_hash_alg_to_string(pcr_bank))),
                         SD_JSON_BUILD_PAIR_CONDITION(primary_alg != 0 && tpm2_asym_alg_to_string(primary_alg), "tpm2-primary-alg", SD_JSON_BUILD_STRING(tpm2_asym_alg_to_string(primary_alg))),
-                        SD_JSON_BUILD_PAIR("tpm2-policy-hash", SD_JSON_BUILD_VARIANT(phj)),
+                        SD_JSON_BUILD_PAIR_VARIANT("tpm2-policy-hash", phj),
                         SD_JSON_BUILD_PAIR_CONDITION(FLAGS_SET(flags, TPM2_FLAGS_USE_PIN), "tpm2-pin", SD_JSON_BUILD_BOOLEAN(true)),
                         SD_JSON_BUILD_PAIR_CONDITION(FLAGS_SET(flags, TPM2_FLAGS_USE_PCRLOCK), "tpm2_pcrlock", SD_JSON_BUILD_BOOLEAN(true)),
                         SD_JSON_BUILD_PAIR_CONDITION(pubkey_pcr_mask != 0, "tpm2_pubkey_pcrs", SD_JSON_BUILD_VARIANT(pkmj)),

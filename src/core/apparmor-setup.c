@@ -1,9 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "apparmor-setup.h"
+
+#if HAVE_APPARMOR
 #include <unistd.h>
 
 #include "alloc-util.h"
-#include "apparmor-setup.h"
 #include "apparmor-util.h"
 #include "errno-util.h"
 #include "fd-util.h"
@@ -11,6 +13,7 @@
 #include "log.h"
 #include "string-util.h"
 #include "strv.h"
+#endif
 
 int mac_apparmor_setup(void) {
 #if HAVE_APPARMOR
@@ -20,7 +23,7 @@ int mac_apparmor_setup(void) {
         int r;
 
         if (!mac_apparmor_use()) {
-                log_debug("Skipping AppArmor initialization: not supported by the kernel, is disabled or libapparmor is not installed.");
+                log_debug("Skipping AppArmor initialization: not supported by the kernel, disabled, or libapparmor not installed.");
                 return 0;
         }
 

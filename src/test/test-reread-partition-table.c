@@ -4,6 +4,8 @@
 #include <sys/file.h>
 
 #include "blockdev-util.h"
+#include "capability-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "loop-util.h"
 #include "memfd-util.h"
@@ -45,6 +47,8 @@ TEST(rereadpt) {
 
         if (detect_container() > 0)
                 return (void) log_tests_skipped("test not available in container");
+        if (geteuid() != 0 || have_effective_cap(CAP_SYS_ADMIN) <= 0)
+                return (void) log_tests_skipped("test requires privileges");
         if (running_in_chroot() > 0)
                 return (void) log_tests_skipped("test not available in chroot()");
 
@@ -70,6 +74,8 @@ TEST(rereadpt) {
                         LOCK_EX, &loop);
         if (ERRNO_IS_NEG_PRIVILEGE(r) || ERRNO_IS_NOT_SUPPORTED(r))
                 return (void) log_tests_skipped("loopback block devices not available");
+        if (r < 0)
+                return (void) log_tests_skipped_errno(r, "Failed to create loop device");
 
         _cleanup_free_ char *p = NULL;
         ASSERT_OK(partition_node_of(loop->node, 1, &p));
