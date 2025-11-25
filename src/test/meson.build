@@ -349,6 +349,7 @@ executables += [
         },
         test_template + {
                 'sources' : files('test-libmount.c'),
+                'conditions' : ['HAVE_LIBMOUNT'],
                 'dependencies' : [
                         libmount_cflags,
                         threads,
@@ -368,6 +369,7 @@ executables += [
         },
         test_template + {
                 'sources' : files('test-mount-util.c'),
+                'conditions' : ['HAVE_LIBMOUNT'],
                 'dependencies' : libmount_cflags,
         },
         test_template + {
@@ -574,6 +576,7 @@ executables += [
                 'sources' : files('test-namespace.c'),
                 'dependencies' : [
                         threads,
+                        libmount_cflags,
                 ],
         },
         core_test_template + {
