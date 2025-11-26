@@ -878,7 +878,7 @@ static char *format_svc_param_value(DnsSvcParam *i) {
                 size_t offset = 0;
                 _cleanup_strv_free_ char **values_strv = NULL;
                 while (offset < i->length) {
-                        size_t sz = (uint8_t) i->value[offset++];
+                        size_t sz = i->value[offset++];
 
                         char *alpn = cescape_length((char *)&i->value[offset], sz);
                         if (!alpn)
@@ -2183,9 +2183,9 @@ int dns_resource_key_to_json(DnsResourceKey *key, sd_json_variant **ret) {
 
         return sd_json_buildo(
                         ret,
-                        SD_JSON_BUILD_PAIR("class", SD_JSON_BUILD_INTEGER(key->class)),
-                        SD_JSON_BUILD_PAIR("type", SD_JSON_BUILD_INTEGER(key->type)),
-                        SD_JSON_BUILD_PAIR("name", SD_JSON_BUILD_STRING(dns_resource_key_name(key))));
+                        SD_JSON_BUILD_PAIR_INTEGER("class", key->class),
+                        SD_JSON_BUILD_PAIR_INTEGER("type", key->type),
+                        SD_JSON_BUILD_PAIR_STRING("name", dns_resource_key_name(key)));
 }
 
 int dns_resource_key_from_json(sd_json_variant *v, DnsResourceKey **ret) {

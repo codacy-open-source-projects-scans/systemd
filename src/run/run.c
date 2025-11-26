@@ -65,6 +65,7 @@
 #include "unit-def.h"
 #include "unit-name.h"
 #include "user-util.h"
+#include "virt.h"
 
 static bool arg_ask_password = true;
 static bool arg_scope = false;
@@ -263,14 +264,15 @@ static int help_sudo_mode(void) {
 }
 
 static bool become_root(void) {
-        return !arg_exec_user || STR_IN_SET(arg_exec_user, "root", "0");
-}
-
-static bool privileged_execution(void) {
         if (arg_runtime_scope != RUNTIME_SCOPE_SYSTEM)
                 return false;
 
-        return become_root() || arg_empower;
+        if (!arg_exec_user) {
+                assert(!arg_empower); /* assume default user has been set */
+                return true;
+        }
+
+        return STR_IN_SET(arg_exec_user, "root", "0");
 }
 
 static int add_timer_property(const char *name, const char *val) {
@@ -752,7 +754,7 @@ static int parse_argv(int argc, char *argv[]) {
         with_trigger = !!arg_path_property || !!arg_socket_property || arg_with_timer;
 
         /* currently, only single trigger (path, socket, timer) unit can be created simultaneously */
-        if ((int) !!arg_path_property + (int) !!arg_socket_property + (int) arg_with_timer > 1)
+        if (!!arg_path_property + !!arg_socket_property + (int) arg_with_timer > 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Only single trigger (path, socket, timer) unit can be created.");
 
@@ -881,6 +883,36 @@ static int parse_argv(int argc, char *argv[]) {
                                        "--same-dir cannot be used with a root directory other than '/'");
 
         return 1;
+}
+
+static double shell_prompt_hue(void) {
+        if (become_root())
+                return 0; /* red */
+
+        if (arg_empower)
+                return 30; /* orange */
+
+        return 60; /* yellow */
+}
+
+static Glyph shell_prompt_glyph(void) {
+        if (become_root())
+                return GLYPH_SUPERHERO;
+
+        if (arg_empower)
+                return GLYPH_PUMPKIN;
+
+        return GLYPH_IDCARD;
+}
+
+static Glyph pty_window_glyph(void) {
+        if (become_root())
+                return GLYPH_RED_CIRCLE;
+
+        if (arg_empower)
+                return GLYPH_ORANGE_CIRCLE;
+
+        return GLYPH_YELLOW_CIRCLE;
 }
 
 static int parse_argv_sudo_mode(int argc, char *argv[]) {
@@ -1098,6 +1130,24 @@ static int parse_argv_sudo_mode(int argc, char *argv[]) {
                         assert_not_reached();
                 }
 
+        if (!arg_working_directory) {
+                if (arg_exec_user || arg_area) {
+                        /* When switching to a specific user or an area, also switch to its home directory. */
+                        arg_working_directory = strdup("~");
+                        if (!arg_working_directory)
+                                return log_oom();
+                } else {
+                        /* When elevating privileges without this being specified, then stay in the current directory */
+                        r = safe_getcwd(&arg_working_directory);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to get current working directory: %m");
+                }
+        } else {
+                /* Root was not suppressed earlier, to allow the above check to work properly. */
+                if (empty_or_root(arg_working_directory))
+                        arg_working_directory = mfree(arg_working_directory);
+        }
+
         if (!arg_exec_user && (arg_area || arg_empower)) {
                 /* If the user specifies --area= but not --user= then consider this an area switch request,
                  * and default to logging into our own account.
@@ -1108,30 +1158,6 @@ static int parse_argv_sudo_mode(int argc, char *argv[]) {
                 arg_exec_user = getusername_malloc();
                 if (!arg_exec_user)
                         return log_oom();
-
-                if (arg_empower && !arg_working_directory) {
-                        r = safe_getcwd(&arg_working_directory);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to get current working directory: %m");
-                }
-        }
-
-        if (!arg_working_directory) {
-                if (arg_exec_user) {
-                        /* When switching to a specific user, also switch to its home directory. */
-                        arg_working_directory = strdup("~");
-                        if (!arg_working_directory)
-                                return log_oom();
-                } else {
-                        /* When switching to root without this being specified, then stay in the current directory */
-                        r = safe_getcwd(&arg_working_directory);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to get current working directory: %m");
-                }
-        } else {
-                /* Root was not suppressed earlier, to allow the above check to work properly. */
-                if (empty_or_root(arg_working_directory))
-                        arg_working_directory = mfree(arg_working_directory);
         }
 
         arg_service_type = "exec";
@@ -1236,14 +1262,7 @@ static int parse_argv_sudo_mode(int argc, char *argv[]) {
                 return log_oom();
 
         if (!arg_background && arg_stdio == ARG_STDIO_PTY) {
-                double hue;
-
-                if (privileged_execution())
-                        hue = 0; /* red */
-                else
-                        hue = 60 /* yellow */;
-
-                r = terminal_tint_color(hue, &arg_background);
+                r = terminal_tint_color(shell_prompt_hue(), &arg_background);
                 if (r < 0)
                         log_debug_errno(r, "Unable to get terminal background color, not tinting background: %m");
         }
@@ -1255,7 +1274,7 @@ static int parse_argv_sudo_mode(int argc, char *argv[]) {
                         if (!arg_shell_prompt_prefix)
                                 return log_oom();
                 } else if (emoji_enabled()) {
-                        arg_shell_prompt_prefix = strjoin(glyph(privileged_execution() ? GLYPH_SUPERHERO : GLYPH_IDCARD), " ");
+                        arg_shell_prompt_prefix = strjoin(glyph(shell_prompt_glyph()), " ");
                         if (!arg_shell_prompt_prefix)
                                 return log_oom();
                 }
@@ -1277,10 +1296,10 @@ static int parse_argv_sudo_mode(int argc, char *argv[]) {
                  * default. Note that pam_logind/systemd-logind doesn't distinguish between run0-style privilege
                  * escalation on a TTY and first class (getty-style) TTY logins (and thus gives root a per-session
                  * manager for interactive TTY sessions), hence let's override the logic explicitly here. We only do
-                 * this for root though, under the assumption that if a regular user temporarily transitions into
-                 * another regular user it's a better default that the full user environment is uniformly
-                 * available. */
-                if (arg_lightweight < 0 && privileged_execution())
+                 * this for root or --empower though, under the assumption that if a regular user temporarily
+                 * transitions into another regular user it's a better default that the full user environment is
+                 * uniformly available. */
+                if (arg_lightweight < 0 && (become_root() || arg_empower))
                         arg_lightweight = true;
 
                 if (arg_lightweight >= 0) {
@@ -2290,9 +2309,7 @@ static int run_context_setup_ptyfwd(RunContext *c) {
         if (!isempty(arg_background))
                 (void) pty_forward_set_background_color(c->forward, arg_background);
 
-        (void) pty_forward_set_window_title(c->forward,
-                                            privileged_execution() ? GLYPH_RED_CIRCLE : GLYPH_YELLOW_CIRCLE,
-                                            arg_host, arg_cmdline);
+        (void) pty_forward_set_window_title(c->forward, pty_window_glyph(), arg_host, arg_cmdline);
         return 0;
 }
 
@@ -3033,6 +3050,12 @@ static bool shall_make_executable_absolute(void) {
         if (strv_isempty(arg_cmdline))
                 return false;
         if (arg_transport != BUS_TRANSPORT_LOCAL)
+                return false;
+        if (!empty_or_root(arg_root_directory))
+                return false;
+        /* If we're running in a chroot, our view of the filesystem might be completely different from pid1's
+         * view of the filesystem, hence don't try to resolve the executable in that case. */
+        if (!arg_root_directory && running_in_chroot() > 0)
                 return false;
 
         FOREACH_STRING(f, "RootDirectory=", "RootImage=", "ExecSearchPath=", "MountImages=", "ExtensionImages=")

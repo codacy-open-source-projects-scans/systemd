@@ -435,21 +435,21 @@ int boot_config_load_type1(
                 const char *root,
                 const BootEntrySource source,
                 const char *dir,
-                const char *fname) {
+                const char *filename) {
         int r;
 
         assert(config);
         assert(f);
         assert(root);
         assert(dir);
-        assert(fname);
+        assert(filename);
 
         if (!GREEDY_REALLOC(config->entries, config->n_entries + 1))
                 return log_oom();
 
         BootEntry *entry = config->entries + config->n_entries;
 
-        r = boot_entry_load_type1(f, root, source, dir, fname, entry);
+        r = boot_entry_load_type1(f, root, source, dir, filename, entry);
         if (r < 0)
                 return r;
         config->n_entries++;
@@ -1770,8 +1770,8 @@ static int json_addon(
 
         r = sd_json_variant_append_arraybo(
                         array,
-                        SD_JSON_BUILD_PAIR(addon_str, SD_JSON_BUILD_STRING(addon->location)),
-                        SD_JSON_BUILD_PAIR("options", SD_JSON_BUILD_STRING(addon->cmdline)));
+                        SD_JSON_BUILD_PAIR_STRING(addon_str, addon->location),
+                        SD_JSON_BUILD_PAIR_STRING("options", addon->cmdline));
         if (r < 0)
                 return log_oom();
 
