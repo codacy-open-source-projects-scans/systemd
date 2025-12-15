@@ -2353,16 +2353,12 @@ int home_create_luks(
                         0,
                         LOCK_EX,
                         &setup->loop);
-        if (r < 0) {
-                if (r == -ENOENT) { /* this means /dev/loop-control doesn't exist, i.e. we are in a container
-                                     * or similar and loopback bock devices are not available, return a
-                                     * recognizable error in this case. */
-                        log_error_errno(r, "Loopback block device support is not available on this system.");
-                        return -ENOLINK; /* Make recognizable */
-                }
-
+        if (r == -ENOENT) /* this means /dev/loop-control doesn't exist, i.e. we are in a container
+                           * or similar and loopback bock devices are not available, return a
+                           * recognizable error in this case. */
+                return log_error_errno(SYNTHETIC_ERRNO(ENOLINK), "Loopback block device support is not available on this system.");
+        if (r < 0)
                 return log_error_errno(r, "Failed to set up loopback device for %s: %m", setup->temporary_image_path);
-        }
 
         log_info("Setting up loopback device %s completed.", setup->loop->node ?: ip);
 
@@ -2393,11 +2389,11 @@ int home_create_luks(
         r = make_filesystem(setup->dm_node,
                             fstype,
                             user_record_user_name_and_realm(h),
-                            /* root = */ NULL,
+                            /* root= */ NULL,
                             fs_uuid,
                             (user_record_luks_discard(h) ? MKFS_DISCARD : 0) | MKFS_QUIET,
-                            /* sector_size = */ 0,
-                            /* compression = */ NULL,
+                            /* sector_size= */ 0,
+                            /* compression= */ NULL,
                             /* compression_level= */ NULL,
                             extra_mkfs_options);
         if (r < 0)

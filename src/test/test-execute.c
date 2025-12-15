@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fnmatch.h>
+#include <gnu/libc-version.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mount.h>
@@ -264,7 +265,7 @@ static bool have_userns_privileges(void) {
                  * configured to make CLONE_NEWUSER require CAP_SYS_ADMIN.
                  * Additionally, AppArmor may restrict unprivileged user
                  * namespace creation. */
-                r = capability_bounding_set_drop(UINT64_C(1) << CAP_SYS_ADMIN, /* right_now = */ true);
+                r = capability_bounding_set_drop(UINT64_C(1) << CAP_SYS_ADMIN, /* right_now= */ true);
                 if (r < 0) {
                         log_debug_errno(r, "Failed to drop capabilities: %m");
                         _exit(2);
@@ -368,6 +369,12 @@ static void test_exec_workingdirectory(Manager *m) {
 }
 
 static void test_exec_execsearchpath(Manager *m) {
+        int r;
+
+        ASSERT_OK(r = is_symlink("/bin/ls"));
+        if (r > 0)
+                return (void) log_tests_skipped("/bin/ls is a symlink, maybe coreutils is built with --enable-single-binary=symlinks");
+
         ASSERT_OK(mkdir_p("/tmp/test-exec_execsearchpath", 0755));
 
         ASSERT_OK(copy_file("/bin/ls", "/tmp/test-exec_execsearchpath/ls_temp", 0,  0777, COPY_REPLACE));
@@ -1170,6 +1177,9 @@ static void test_exec_capabilityboundingset(Manager *m) {
 }
 
 static void test_exec_basic(Manager *m) {
+        if (isempty(gnu_get_libc_version()))
+                return (void) log_tests_skipped("ConditionVersion=glibc will not pass under musl");
+
         if (MANAGER_IS_SYSTEM(m) || have_userns_privileges())
                 test(m, "exec-basic.service", can_unshare || MANAGER_IS_SYSTEM(m) ? 0 : EXIT_NAMESPACE, CLD_EXITED);
         else
@@ -1596,7 +1606,7 @@ TEST(run_tests_unprivileged) {
         ASSERT_NOT_NULL((filters = strv_copy(strv_skip(saved_argv, 1))));
 
         if (prepare_ns("(test-execute-unprivileged)") == 0) {
-                ASSERT_OK(capability_bounding_set_drop(0, /* right_now = */ true));
+                ASSERT_OK(capability_bounding_set_drop(0, /* right_now= */ true));
 
                 can_unshare = false;
                 run_tests(RUNTIME_SCOPE_USER, filters);

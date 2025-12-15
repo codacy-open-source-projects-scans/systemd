@@ -1263,12 +1263,10 @@ int flush_accept(int fd) {
                 int cfd;
 
                 r = fd_wait_for_event(fd, POLLIN, 0);
-                if (r < 0) {
-                        if (r == -EINTR)
-                                continue;
-
+                if (r == -EINTR)
+                        continue;
+                if (r < 0)
                         return r;
-                }
                 if (r == 0)
                         return 0;
 
@@ -1305,12 +1303,10 @@ ssize_t flush_mqueue(int fd) {
                 ssize_t l;
 
                 r = fd_wait_for_event(fd, POLLIN, /* timeout= */ 0);
-                if (r < 0) {
-                        if (r == -EINTR)
-                                continue;
-
+                if (r == -EINTR)
+                        continue;
+                if (r < 0)
                         return r;
-                }
                 if (r == 0)
                         return count;
 
@@ -1324,7 +1320,7 @@ ssize_t flush_mqueue(int fd) {
                                 return -ENOMEM;
                 }
 
-                l = mq_receive(fd, buf, attr.mq_msgsize, /* msg_prio = */ NULL);
+                l = mq_receive(fd, buf, attr.mq_msgsize, /* msg_prio= */ NULL);
                 if (l < 0) {
                         if (errno == EINTR)
                                 continue;
