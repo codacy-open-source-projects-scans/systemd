@@ -165,6 +165,7 @@ int dissect_image_file(const char *path, const VeritySettings *verity, const Mou
 int dissect_image_file_and_warn(const char *path, const VeritySettings *verity, const MountOptions *mount_options, const ImagePolicy *image_policy, const ImageFilter *filter, DissectImageFlags flags, DissectedImage **ret);
 int dissect_loop_device(LoopDevice *loop, const VeritySettings *verity, const MountOptions *mount_options, const ImagePolicy *image_policy, const ImageFilter *image_filter, DissectImageFlags flags, DissectedImage **ret);
 int dissect_loop_device_and_warn(LoopDevice *loop, const VeritySettings *verity, const MountOptions *mount_options, const ImagePolicy *image_policy, const ImageFilter *image_filter, DissectImageFlags flags, DissectedImage **ret);
+int dissected_image_new_from_existing_verity(const char *src, const VeritySettings *verity, const MountOptions *options, const ImagePolicy *image_policy, const ImageFilter *image_filter, RuntimeScope runtime_scope, DissectImageFlags dissect_image_flags, DissectedImage **ret);
 
 void dissected_image_close(DissectedImage *m);
 DissectedImage* dissected_image_unref(DissectedImage *m);
@@ -267,9 +268,10 @@ static inline const char* dissected_partition_fstype(const DissectedPartition *m
 
 int get_common_dissect_directory(char **ret);
 
+int mountfsd_mount_image_fd(int image_fd, int userns_fd, const ImagePolicy *image_policy, const VeritySettings *verity, DissectImageFlags flags, DissectedImage **ret);
 int mountfsd_mount_image(const char *path, int userns_fd, const ImagePolicy *image_policy, const VeritySettings *verity, DissectImageFlags flags, DissectedImage **ret);
 int mountfsd_mount_directory_fd(int directory_fd, int userns_fd, DissectImageFlags flags, int *ret_mount_fd);
 int mountfsd_mount_directory(const char *path, int userns_fd, DissectImageFlags flags, int *ret_mount_fd);
 
-int mountfsd_make_directory_fd(int parent_fd, const char *name, DissectImageFlags flags, int *ret_directory_fd);
-int mountfsd_make_directory(const char *path, DissectImageFlags flags, int *ret_directory_fd);
+int mountfsd_make_directory_fd(int parent_fd, const char *name, mode_t mode, DissectImageFlags flags, int *ret_directory_fd);
+int mountfsd_make_directory(const char *path, mode_t mode, DissectImageFlags flags, int *ret_directory_fd);

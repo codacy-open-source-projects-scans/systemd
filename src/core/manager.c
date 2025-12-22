@@ -113,7 +113,7 @@
 /* How many units and jobs to process of the bus queue before returning to the event loop. */
 #define MANAGER_BUS_MESSAGE_BUDGET 100U
 
-#define DEFAULT_TASKS_MAX ((CGroupTasksMax) { 15U, 100U }) /* 15% */
+#define DEFAULT_TASKS_MAX ((const CGroupTasksMax) { 15U, 100U }) /* 15% */
 
 static int manager_dispatch_notify_fd(sd_event_source *source, int fd, uint32_t revents, void *userdata);
 static int manager_dispatch_signal_fd(sd_event_source *source, int fd, uint32_t revents, void *userdata);
@@ -4350,7 +4350,7 @@ static bool manager_journal_is_running(Manager *m) {
         u = manager_get_unit(m, SPECIAL_JOURNALD_SERVICE);
         if (!u)
                 return false;
-        if (!IN_SET(SERVICE(u)->state, SERVICE_RELOAD, SERVICE_RUNNING))
+        if (!UNIT_IS_ACTIVE_OR_RELOADING(unit_active_state(u)) || SERVICE(u)->state == SERVICE_EXITED)
                 return false;
 
         return true;

@@ -13,6 +13,7 @@
 #include "base-filesystem.h"
 #include "bitfield.h"
 #include "chase.h"
+#include "cryptsetup-util.h"
 #include "dev-setup.h"
 #include "devnum-util.h"
 #include "dissect-image.h"
@@ -2549,65 +2550,82 @@ int setup_namespace(const NamespaceParameters *p, char **reterr_path) {
 
                 SET_FLAG(dissect_image_flags, DISSECT_IMAGE_NO_PARTITION_TABLE, p->verity && p->verity->data_path);
 
-                if (p->runtime_scope == RUNTIME_SCOPE_SYSTEM) {
-                        /* In system mode we mount directly */
+                /* First check if we have a verity device already open and with a fstype pinned by policy. If it
+                * cannot be found, then fallback to the slow path (full dissect). */
+                r = dissected_image_new_from_existing_verity(
+                                p->root_image,
+                                p->verity,
+                                p->root_image_options,
+                                p->root_image_policy,
+                                /* image_filter= */ NULL,
+                                p->runtime_scope,
+                                dissect_image_flags,
+                                &dissected_image);
+                if (r < 0 && !ERRNO_IS_NEG_DEVICE_ABSENT(r) && r != -ENOPKG)
+                        return r;
+                if (r >= 0)
+                        log_debug("Reusing pre-existing verity-protected root image %s", p->root_image);
+                else {
+                        if (p->runtime_scope == RUNTIME_SCOPE_SYSTEM) {
+                                /* In system mode we mount directly */
 
-                        r = loop_device_make_by_path(
-                                        p->root_image,
-                                        FLAGS_SET(dissect_image_flags, DISSECT_IMAGE_DEVICE_READ_ONLY) ? O_RDONLY : -1 /* < 0 means writable if possible, read-only as fallback */,
-                                        /* sector_size= */ UINT32_MAX,
-                                        FLAGS_SET(dissect_image_flags, DISSECT_IMAGE_NO_PARTITION_TABLE) ? 0 : LO_FLAGS_PARTSCAN,
-                                        LOCK_SH,
-                                        &loop_device);
-                        if (r < 0)
-                                return log_debug_errno(r, "Failed to create loop device for root image: %m");
+                                r = loop_device_make_by_path(
+                                                p->root_image,
+                                                FLAGS_SET(dissect_image_flags, DISSECT_IMAGE_DEVICE_READ_ONLY) ? O_RDONLY : -1 /* < 0 means writable if possible, read-only as fallback */,
+                                                /* sector_size= */ UINT32_MAX,
+                                                FLAGS_SET(dissect_image_flags, DISSECT_IMAGE_NO_PARTITION_TABLE) ? 0 : LO_FLAGS_PARTSCAN,
+                                                LOCK_SH,
+                                                &loop_device);
+                                if (r < 0)
+                                        return log_debug_errno(r, "Failed to create loop device for root image: %m");
 
-                        r = dissect_loop_device(
-                                        loop_device,
-                                        p->verity,
-                                        p->root_image_options,
-                                        p->root_image_policy,
-                                        /* image_filter= */ NULL,
-                                        dissect_image_flags,
-                                        &dissected_image);
-                        if (r < 0)
-                                return log_debug_errno(r, "Failed to dissect image: %m");
+                                r = dissect_loop_device(
+                                                loop_device,
+                                                p->verity,
+                                                p->root_image_options,
+                                                p->root_image_policy,
+                                                /* image_filter= */ NULL,
+                                                dissect_image_flags,
+                                                &dissected_image);
+                                if (r < 0)
+                                        return log_debug_errno(r, "Failed to dissect image: %m");
 
-                        r = dissected_image_load_verity_sig_partition(
-                                        dissected_image,
-                                        loop_device->fd,
-                                        p->verity);
-                        if (r < 0)
-                                return r;
+                                r = dissected_image_load_verity_sig_partition(
+                                                dissected_image,
+                                                loop_device->fd,
+                                                p->verity);
+                                if (r < 0)
+                                        return r;
 
-                        r = dissected_image_guess_verity_roothash(
-                                        dissected_image,
-                                        p->verity);
-                        if (r < 0)
-                                return r;
+                                r = dissected_image_guess_verity_roothash(
+                                                dissected_image,
+                                                p->verity);
+                                if (r < 0)
+                                        return r;
 
-                        r = dissected_image_decrypt(
-                                        dissected_image,
-                                        NULL,
-                                        p->verity,
-                                        p->root_image_policy,
-                                        dissect_image_flags);
-                        if (r < 0)
-                                return log_debug_errno(r, "Failed to decrypt dissected image: %m");
-                } else {
-                        userns_fd = namespace_open_by_type(NAMESPACE_USER);
-                        if (userns_fd < 0)
-                                return log_debug_errno(userns_fd, "Failed to open our own user namespace: %m");
+                                r = dissected_image_decrypt(
+                                                dissected_image,
+                                                /* passphrase= */ NULL,
+                                                p->verity,
+                                                p->root_image_policy,
+                                                dissect_image_flags);
+                                if (r < 0)
+                                        return log_debug_errno(r, "Failed to decrypt dissected image: %m");
+                        } else {
+                                userns_fd = namespace_open_by_type(NAMESPACE_USER);
+                                if (userns_fd < 0)
+                                        return log_debug_errno(userns_fd, "Failed to open our own user namespace: %m");
 
-                        r = mountfsd_mount_image(
-                                        p->root_image,
-                                        userns_fd,
-                                        p->root_image_policy,
-                                        p->verity,
-                                        dissect_image_flags,
-                                        &dissected_image);
-                        if (r < 0)
-                                return r;
+                                r = mountfsd_mount_image(
+                                                p->root_image,
+                                                userns_fd,
+                                                p->root_image_policy,
+                                                p->verity,
+                                                dissect_image_flags,
+                                                &dissected_image);
+                                if (r < 0)
+                                        return r;
+                        }
                 }
         }
 
@@ -3852,6 +3870,8 @@ int refresh_extensions_in_namespace(
         if (r > 0)
                 return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Target namespace is not separate, cannot reload extensions");
 
+        (void) dlopen_cryptsetup();
+
         extension_dir = path_join(p->private_namespace_dir, "unit-extensions");
         if (!extension_dir)
                 return log_oom_debug();
@@ -3891,7 +3911,7 @@ int refresh_extensions_in_namespace(
         if (r == 0) {
                 /* Child (host namespace) */
                 _cleanup_close_pair_ int pair[2] = EBADF_PAIR;
-                _cleanup_(sigkill_waitp) pid_t grandchild_pid = 0;
+                _cleanup_(pidref_done_sigkill_wait) PidRef grandchild = PIDREF_NULL;
 
                  (void) mkdir_p_label(overlay_prefix, 0555);
 
@@ -3908,9 +3928,7 @@ int refresh_extensions_in_namespace(
                         _exit(EXIT_FAILURE);
                 }
 
-                r = safe_fork("(sd-ns-refresh-exts-grandchild)",
-                                FORK_LOG|FORK_DEATHSIG_SIGKILL,
-                                &grandchild_pid);
+                r = pidref_safe_fork("(sd-ns-refresh-exts-grandchild)", FORK_LOG|FORK_DEATHSIG_SIGKILL, &grandchild);
                 if (r < 0)
                         _exit(EXIT_FAILURE);
                 if (r == 0) {
@@ -3944,11 +3962,14 @@ int refresh_extensions_in_namespace(
                                 _exit(EXIT_FAILURE);
                 }
 
-                r = wait_for_terminate_and_check("(sd-ns-refresh-exts-grandchild)", TAKE_PID(grandchild_pid), 0);
+                r = pidref_wait_for_terminate_and_check("(sd-ns-refresh-exts-grandchild)", &grandchild, 0);
                 if (r < 0) {
                         log_debug_errno(r, "Failed to wait for target namespace process to finish: %m");
                         _exit(EXIT_FAILURE);
                 }
+
+                pidref_done(&grandchild);
+
                 if (r != EXIT_SUCCESS) {
                         log_debug("Target namespace fork did not succeed");
                         _exit(EXIT_FAILURE);

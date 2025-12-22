@@ -1746,6 +1746,8 @@ if conf.get('BPF_FRAMEWORK') == 1
         bpf_clang_flags = [
                 '-std=gnu17',
                 '-Wno-compare-distinct-pointer-types',
+                '-Wno-microsoft-anon-tag',
+                '-fms-extensions',
                 '-fno-stack-protector',
                 '-O2',
                 '-target',
@@ -1756,6 +1758,7 @@ if conf.get('BPF_FRAMEWORK') == 1
 
         bpf_gcc_flags = [
                 '-std=gnu17',
+                '-fms-extensions',
                 '-fno-stack-protector',
                 '-fno-ssa-phiopt',
                 '-O2',
@@ -2514,6 +2517,7 @@ foreach dict : executables
 
         is_test = name.startswith('test-')
         is_fuzz = name.startswith('fuzz-')
+        is_standalone = name.endswith('.standalone')
 
         build = true
         foreach cond : dict.get('conditions', [])
@@ -2526,17 +2530,13 @@ foreach dict : executables
                 continue
         endif
 
-        if name.endswith('.standalone') and not have_standalone_binaries
-                continue
-        endif
-
         exe_sources = dict.get('sources', []) + dict.get('extract', [])
 
         kwargs = {}
         foreach key, val : dict
                 if key in ['name', 'dbus', 'public', 'conditions', 'type', 'suite',
                            'timeout', 'parallel', 'objects', 'sources', 'extract',
-                           'include_directories']
+                           'include_directories', 'build_by_default']
                         continue
                 endif
 
@@ -2548,7 +2548,7 @@ foreach dict : executables
         endforeach
 
         include_directories = dict['include_directories']
-        if not is_test
+        if not is_test and exe_sources.length() > 0
                 include_directories += fs.parent(exe_sources[0])
         endif
 
@@ -2576,17 +2576,21 @@ foreach dict : executables
                 endforeach
         endif
 
+        build_by_default = dict.get('build_by_default',
+                                    have_standalone_binaries or not is_standalone)
+
         exe = executable(
                 name,
                 sources : exe_sources,
                 kwargs : kwargs,
                 implicit_include_directories : false,
                 include_directories : include_directories,
+                build_by_default: build_by_default,
         )
 
         executables_by_name += { name : exe }
 
-        if not name.endswith('.standalone')
+        if not is_standalone
                 sources += exe_sources
         endif
 
@@ -2599,7 +2603,7 @@ foreach dict : executables
                 }
         endif
 
-        if dict.get('build_by_default', true)
+        if build_by_default
                 if dict.get('dbus', false)
                         dbus_programs += exe
                 endif
@@ -2944,7 +2948,18 @@ endif
 alias_target('gensources', generated_sources)
 
 clang_tidy = find_program('clang-tidy', required : false)
-if meson.version().version_compare('>=1.4.0')
+if meson.version().version_compare('>=1.10.0')
+        uniq = {}
+
+        foreach source : sources
+                if uniq.has_key(source.full_path())
+                        continue
+                endif
+                uniq += {source.full_path(): source}
+        endforeach
+
+        sources = uniq.values()
+
         foreach source : sources
                 if systemd_headers.contains(source)
                         continue
