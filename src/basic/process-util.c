@@ -389,11 +389,6 @@ int container_get_leader(const char *machine, pid_t *pid) {
 }
 
 int pid_is_kernel_thread(pid_t pid) {
-        _cleanup_free_ char *line = NULL;
-        unsigned long long flags;
-        size_t l, i;
-        const char *p;
-        char *q;
         int r;
 
         if (IN_SET(pid, 0, 1) || pid == getpid_cached()) /* pid 1, and we ourselves certainly aren't a kernel thread */
@@ -401,7 +396,8 @@ int pid_is_kernel_thread(pid_t pid) {
         if (!pid_is_valid(pid))
                 return -EINVAL;
 
-        p = procfs_file_alloca(pid, "stat");
+        const char *p = procfs_file_alloca(pid, "stat");
+        _cleanup_free_ char *line = NULL;
         r = read_one_line_file(p, &line);
         if (r == -ENOENT)
                 return -ESRCH;
@@ -409,14 +405,14 @@ int pid_is_kernel_thread(pid_t pid) {
                 return r;
 
         /* Skip past the comm field */
-        q = strrchr(line, ')');
+        char *q = strrchr(line, ')');
         if (!q)
                 return -EINVAL;
         q++;
 
         /* Skip 6 fields to reach the flags field */
-        for (i = 0; i < 6; i++) {
-                l = strspn(q, WHITESPACE);
+        for (size_t i = 0; i < 6; i++) {
+                size_t l = strspn(q, WHITESPACE);
                 if (l < 1)
                         return -EINVAL;
                 q += l;
@@ -428,7 +424,7 @@ int pid_is_kernel_thread(pid_t pid) {
         }
 
         /* Skip preceding whitespace */
-        l = strspn(q, WHITESPACE);
+        size_t l = strspn(q, WHITESPACE);
         if (l < 1)
                 return -EINVAL;
         q += l;
@@ -439,6 +435,7 @@ int pid_is_kernel_thread(pid_t pid) {
                 return -EINVAL;
         q[l] = 0;
 
+        unsigned long long flags;
         r = safe_atollu(q, &flags);
         if (r < 0)
                 return r;
@@ -883,25 +880,23 @@ int pidref_wait_for_terminate_and_check(const char *name, PidRef *pidref, WaitFl
         siginfo_t status;
         r = pidref_wait_for_terminate(pidref, &status);
         if (r < 0)
-                return log_full_errno(prio, r, "Failed to wait for %s: %m", strna(name));
+                return log_full_errno(prio, r, "Failed to wait for '%s': %m", strna(name));
 
         if (status.si_code == CLD_EXITED) {
                 if (status.si_status != EXIT_SUCCESS)
                         log_full(flags & WAIT_LOG_NON_ZERO_EXIT_STATUS ? LOG_ERR : LOG_DEBUG,
-                                 "%s failed with exit status %i.", strna(name), status.si_status);
+                                 "'%s' failed with exit status %i.", strna(name), status.si_status);
                 else
-                        log_debug("%s succeeded.", name);
+                        log_debug("'%s' succeeded.", name);
 
                 return status.si_status;
 
-        } else if (IN_SET(status.si_code, CLD_KILLED, CLD_DUMPED)) {
+        } else if (IN_SET(status.si_code, CLD_KILLED, CLD_DUMPED))
+                return log_full_errno(prio, SYNTHETIC_ERRNO(EPROTO),
+                                      "'%s' terminated by signal %s.", strna(name), signal_to_string(status.si_status));
 
-                log_full(prio, "%s terminated by signal %s.", strna(name), signal_to_string(status.si_status));
-                return -EPROTO;
-        }
-
-        log_full(prio, "%s failed due to unknown reason.", strna(name));
-        return -EPROTO;
+        return log_full_errno(prio, SYNTHETIC_ERRNO(EPROTO),
+                              "'%s' failed due to unknown reason.", strna(name));
 }
 
 int kill_and_sigcont(pid_t pid, int sig) {
@@ -1135,17 +1130,17 @@ bool oom_score_adjust_is_valid(int oa) {
         return oa >= OOM_SCORE_ADJ_MIN && oa <= OOM_SCORE_ADJ_MAX;
 }
 
-unsigned long personality_from_string(const char *p) {
+unsigned long personality_from_string(const char *s) {
         Architecture architecture;
 
-        if (!p)
+        if (!s)
                 return PERSONALITY_INVALID;
 
         /* Parse a personality specifier. We use our own identifiers that indicate specific ABIs, rather than just
          * hints regarding the register size, since we want to keep things open for multiple locally supported ABIs for
          * the same register size. */
 
-        architecture = architecture_from_string(p);
+        architecture = architecture_from_string(s);
         if (architecture < 0)
                 return PERSONALITY_INVALID;
 
@@ -1247,8 +1242,8 @@ bool nice_is_valid(int n) {
         return n >= PRIO_MIN && n < PRIO_MAX;
 }
 
-bool sched_policy_is_valid(int i) {
-        return IN_SET(i, SCHED_OTHER, SCHED_BATCH, SCHED_IDLE, SCHED_FIFO, SCHED_RR, SCHED_EXT);
+bool sched_policy_is_valid(int policy) {
+        return IN_SET(policy, SCHED_OTHER, SCHED_BATCH, SCHED_IDLE, SCHED_FIFO, SCHED_RR, SCHED_EXT);
 }
 
 bool sched_policy_supported(int policy) {
@@ -1407,7 +1402,7 @@ int pidref_safe_fork_full(
                 int except_fds[],
                 size_t n_except_fds,
                 ForkFlags flags,
-                PidRef *ret_pid) {
+                PidRef *ret) {
 
         pid_t original_pid, pid;
         sigset_t saved_ss, ss;
@@ -1421,7 +1416,7 @@ int pidref_safe_fork_full(
                (flags & (FORK_WAIT|FORK_DEATHSIG_SIGTERM|FORK_DEATHSIG_SIGINT|FORK_DEATHSIG_SIGKILL)) == 0);
 
         /* A wrapper around fork(), that does a couple of important initializations in addition to mere
-         * forking. If provided, ret_pid is initialized in both the parent and the child process, both times
+         * forking. If provided, ret is initialized in both the parent and the child process, both times
          * referencing the child process. Returns == 0 in the child and > 0 in the parent. */
 
         prio = flags & FORK_LOG ? LOG_ERR : LOG_DEBUG;
@@ -1465,7 +1460,7 @@ int pidref_safe_fork_full(
                 if (!r) {
                         /* Not a reaper process, hence do a double fork() so we are reparented to one */
 
-                        if (ret_pid && socketpair(AF_UNIX, SOCK_DGRAM|SOCK_CLOEXEC, 0, pidref_transport_fds) < 0)
+                        if (ret && socketpair(AF_UNIX, SOCK_DGRAM|SOCK_CLOEXEC, 0, pidref_transport_fds) < 0)
                                 return log_full_errno(prio, errno, "Failed to allocate pidref socket: %m");
 
                         pid = fork();
@@ -1499,7 +1494,7 @@ int pidref_safe_fork_full(
                                         if (n < 0)
                                                 return log_full_errno(prio, n, "Failed to receive child pidref: %m");
 
-                                        *ret_pid = (PidRef) { .pid = pid, .fd = pidfd };
+                                        *ret = (PidRef) { .pid = pid, .fd = pidfd };
                                 }
 
                                 return 1; /* return in the parent */
@@ -1569,20 +1564,16 @@ int pidref_safe_fork_full(
                                 return -EPROTO;
 
                         /* If we are in the parent and successfully waited, then the process doesn't exist anymore. */
-                        if (ret_pid)
-                                *ret_pid = PIDREF_NULL;
+                        if (ret)
+                                *ret = PIDREF_NULL;
 
                         return 1;
                 }
 
-                if (ret_pid) {
-                        if (FLAGS_SET(flags, _FORK_PID_ONLY))
-                                *ret_pid = PIDREF_MAKE_FROM_PID(pid);
-                        else {
-                                r = pidref_set_pid(ret_pid, pid);
-                                if (r < 0) /* Let's not fail for this, no matter what, the process exists after all, and that's key */
-                                        *ret_pid = PIDREF_MAKE_FROM_PID(pid);
-                        }
+                if (ret) {
+                        r = pidref_set_pid(ret, pid);
+                        if (r < 0) /* Let's not fail for this, no matter what, the process exists after all, and that's key */
+                                *ret = PIDREF_MAKE_FROM_PID(pid);
                 }
 
                 return 1;
@@ -1763,43 +1754,15 @@ int pidref_safe_fork_full(
         if (FLAGS_SET(flags, FORK_FREEZE))
                 freeze();
 
-        if (ret_pid) {
-                if (FLAGS_SET(flags, _FORK_PID_ONLY))
-                        *ret_pid = PIDREF_MAKE_FROM_PID(getpid_cached());
-                else {
-                        r = pidref_set_self(ret_pid);
-                        if (r < 0) {
-                                log_full_errno(prio, r, "Failed to acquire PID reference on ourselves: %m");
-                                _exit(EXIT_FAILURE);
-                        }
+        if (ret) {
+                r = pidref_set_self(ret);
+                if (r < 0) {
+                        log_full_errno(prio, r, "Failed to acquire PID reference on ourselves: %m");
+                        _exit(EXIT_FAILURE);
                 }
         }
 
         return 0;
-}
-
-int safe_fork_full(
-                const char *name,
-                const int stdio_fds[3],
-                int except_fds[],
-                size_t n_except_fds,
-                ForkFlags flags,
-                pid_t *ret_pid) {
-
-        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
-        int r;
-
-        /* Getting the detached child process pid without pidfd is racy, so don't allow it if not returning
-         * a pidref to the caller. */
-        assert(!FLAGS_SET(flags, FORK_DETACH) || !ret_pid);
-
-        r = pidref_safe_fork_full(name, stdio_fds, except_fds, n_except_fds, flags|_FORK_PID_ONLY, ret_pid ? &pidref : NULL);
-        if (r < 0 || !ret_pid)
-                return r;
-
-        *ret_pid = pidref.pid;
-
-        return r;
 }
 
 int namespace_fork_full(

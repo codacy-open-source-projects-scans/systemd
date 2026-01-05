@@ -46,9 +46,7 @@ typedef struct Image {
         void *userdata;
 } Image;
 
-Image* image_unref(Image *i);
-Image* image_ref(Image *i);
-
+DECLARE_TRIVIAL_REF_UNREF_FUNC(Image, image);
 DEFINE_TRIVIAL_CLEANUP_FUNC(Image*, image_unref);
 
 int image_find(RuntimeScope scope, ImageClass class, const char *name, const char *root, Image **ret);
@@ -61,8 +59,7 @@ int image_rename(Image *i, const char *new_name, RuntimeScope scope);
 int image_clone(Image *i, const char *new_name, bool read_only, RuntimeScope scope);
 int image_read_only(Image *i, bool b, RuntimeScope scope);
 
-const char* image_type_to_string(ImageType t) _const_;
-ImageType image_type_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(image_type, ImageType);
 
 int image_path_lock(RuntimeScope scope, const char *path, int operation, LockFile *global, LockFile *local);
 int image_name_lock(RuntimeScope scope, const char *name, int operation, LockFile *ret);
@@ -74,7 +71,7 @@ int image_get_pool_usage(RuntimeScope scope, ImageClass class, uint64_t *ret);
 int image_get_pool_limit(RuntimeScope scope, ImageClass class, uint64_t *ret);
 int image_setup_pool(RuntimeScope scope, ImageClass class, bool use_btrfs_subvol, bool use_btrfs_quota);
 
-int image_read_metadata(Image *i, const ImagePolicy *image_policy, RuntimeScope scope);
+int image_read_metadata(Image *i, const char *root, const ImagePolicy *image_policy, RuntimeScope scope);
 
 bool image_in_search_path(RuntimeScope scope, ImageClass class, const char *root, const char *image);
 

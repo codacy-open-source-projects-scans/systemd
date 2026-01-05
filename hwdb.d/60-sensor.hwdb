@@ -41,7 +41,9 @@
 #    PROXIMITY_NEAR_LEVEL=<value>
 #
 # where <matrix> is a mount-matrix in the format specified in the IIO
-# subsystem[1]. The default, when unset, is equivalent to:
+# subsystem[1]. The default, when unset, is the one defined by the ACPI
+# found in /sys/bus/iio/devices/iio\:deviceXXX/in_mount_matrix or, in
+# absence of it, is equivalent to:
 #   ACCEL_MOUNT_MATRIX=1, 0, 0; 0, 1, 0; 0, 0, 1
 # eg. the identity matrix,
 # and <value> is an integer value above or equal to which an object is
@@ -759,6 +761,11 @@ sensor:modalias:acpi:BMA250E*:dmi:bvnLENOVO:*:pvrLenovoMIIX3-1030:*
 # Miix3-830
 sensor:modalias:acpi:SMO8500*:dmi:bvnLENOVO:*:pvrLenovoMIIX3-830:*
  ACCEL_MOUNT_MATRIX=-1, 0, 0; 0, 1, 0; 0, 0, 1
+
+# IdeaPad D330-10IGM (both 81H3 and 81MD product names)
+# ACPI in_mount_matrix is 0, -1, 0; 1, 0, 0; 0, 0, 1, but the correct one is identity matrix.
+sensor:modalias:acpi:BOSC0200*:dmi:*:svnLENOVO:*:pvrLenovoideapadD330-10IGM:*
+ ACCEL_MOUNT_MATRIX=1, 0, 0; 0, 1, 0; 0, 0, 1
 
 # IdeaPad Miix 300
 sensor:modalias:acpi:SMO8500*:dmi:bvnLENOVO:*:pvrMIIX300-*:*

@@ -4354,7 +4354,7 @@ int tpm2_tpm2b_public_to_openssl_pkey(const TPM2B_PUBLIC *public, EVP_PKEY **ret
  * "name", because it would break unsealing of previously-sealed objects that used (for example)
  * tpm2_calculate_policy_authorize(). See bug #30546. */
 int tpm2_tpm2b_public_from_openssl_pkey(const EVP_PKEY *pkey, TPM2B_PUBLIC *ret) {
-        int key_id, r;
+        int r;
 
         assert(pkey);
         assert(ret);
@@ -4368,12 +4368,7 @@ int tpm2_tpm2b_public_from_openssl_pkey(const EVP_PKEY *pkey, TPM2B_PUBLIC *ret)
                 },
         };
 
-#if OPENSSL_VERSION_MAJOR >= 3
-        key_id = EVP_PKEY_get_id(pkey);
-#else
-        key_id = EVP_PKEY_id(pkey);
-#endif
-
+        int key_id = EVP_PKEY_get_id(pkey);
         switch (key_id) {
         case EVP_PKEY_EC: {
                 public.type = TPM2_ALG_ECC;
@@ -7479,6 +7474,21 @@ int tpm2_nvpcr_read(
         if (r < 0)
                 return r;
 
+        /* Check if the NvPCR is already anchored */
+        const char *anchor_fname = strjoina("/run/systemd/nvpcr/", name, ".anchor");
+        r = access_nofollow(anchor_fname, F_OK);
+        if (r < 0) {
+                if (r != -ENOENT)
+                        return log_debug_errno(r, "Failed to check if '%s' exists: %m", anchor_fname);
+
+                /* valid, but not anchored */
+                *ret_value = (struct iovec) {};
+                if (ret_nv_index)
+                        *ret_nv_index = p.nv_index;
+
+                return 0;
+        }
+
         _cleanup_(tpm2_handle_freep) Tpm2Handle *nv_handle = NULL;
         r = tpm2_index_to_handle(
                         c,
@@ -7493,19 +7503,26 @@ int tpm2_nvpcr_read(
 
         log_debug("Successfully acquired handle to NV index 0x%" PRIx32 ".", p.nv_index);
 
-        r = tpm2_read_nv_index(
-                        c,
-                        /* session= */ NULL,
-                        p.nv_index,
-                        nv_handle,
-                        ret_value);
-        if (r < 0)
-                return r;
+        if (r > 0) {
+                r = tpm2_read_nv_index(
+                                c,
+                                /* session= */ NULL,
+                                p.nv_index,
+                                nv_handle,
+                                ret_value);
+                if (r < 0)
+                        return r;
+
+                r = 1;
+        } else {
+                *ret_value = (struct iovec) {};
+                r = 0;
+        }
 
         if (ret_nv_index)
                 *ret_nv_index = p.nv_index;
 
-        return 0;
+        return r;
 #else /* HAVE_OPENSSL */
         return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "OpenSSL support is disabled.");
 #endif

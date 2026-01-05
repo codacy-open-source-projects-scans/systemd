@@ -686,15 +686,6 @@ conf.set('GPERF_LEN_TYPE', gperf_len_type,
 #####################################################################
 
 foreach header : [
-        'crypt.h',
-]
-
-        if not cc.has_header(header)
-                error(f'Header file @header@ not found')
-        endif
-endforeach
-
-foreach header : [
         'gshadow.h',
         'nss.h',
         'sys/sdt.h',
@@ -1046,22 +1037,18 @@ else
         libatomic = []
 endif
 
-libcrypt = dependency('libcrypt', 'libxcrypt', required : false)
-if not libcrypt.found()
-        # fallback to use find_library() if libcrypt is provided by glibc, e.g. for LibreELEC.
-        libcrypt = cc.find_library('crypt')
+if get_option('libc') == 'musl'
+        libcrypt = []
+        libcrypt_cflags = []
+        have = get_option('libcrypt').allowed()
+else
+        libcrypt = dependency('libcrypt', 'libxcrypt',
+                              required : get_option('libcrypt'),
+                              version : '>=4.4.0')
+        libcrypt_cflags = libcrypt.partial_dependency(includes: true, compile_args: true)
+        have = libcrypt.found()
 endif
-
-foreach func : [
-        'crypt_ra',               # since libxcrypt-4.0.0
-        'crypt_gensalt_ra',       # since libxcrypt-4.0.0
-        'crypt_preferred_method', # since libxcrypt-4.4.0
-]
-
-        have = cc.has_function(func, prefix : '''#include <crypt.h>''', args : '-D_GNU_SOURCE',
-                               dependencies : libcrypt)
-        conf.set10('HAVE_' + func.to_upper(), have)
-endforeach
+conf.set10('HAVE_LIBCRYPT', have)
 
 bpf_framework = get_option('bpf-framework')
 bpf_compiler = get_option('bpf-compiler')
@@ -1180,7 +1167,7 @@ conf.set10('HAVE_PWQUALITY', have)
 conf.set10('HAVE_PASSWDQC', not have and libpwquality.found())
 
 libseccomp = dependency('libseccomp',
-                        version : '>= 2.3.1',
+                        version : '>= 2.4.0',
                         required : get_option('seccomp'))
 conf.set10('HAVE_SECCOMP', libseccomp.found())
 libseccomp_cflags = libseccomp.partial_dependency(includes: true, compile_args: true)
@@ -1229,10 +1216,9 @@ conf.set10('HAVE_AUDIT', libaudit.found())
 libaudit_cflags = libaudit.partial_dependency(includes: true, compile_args: true)
 
 libblkid = dependency('blkid',
+                      version : '>=2.37.0',
                       required : get_option('blkid'))
 conf.set10('HAVE_BLKID', libblkid.found())
-conf.set10('HAVE_BLKID_PROBE_SET_HINT',
-           libblkid.found() and cc.has_function('blkid_probe_set_hint', dependencies : libblkid))
 libblkid_cflags = libblkid.partial_dependency(includes: true, compile_args: true)
 
 libkmod = dependency('libkmod',
@@ -1277,19 +1263,16 @@ if libcryptsetup_plugins.enabled()
 endif
 
 libcryptsetup = dependency('libcryptsetup',
-                           version : libcryptsetup_plugins.enabled() ? '>= 2.4.0' : '>= 2.0.1',
+                           version : '>= 2.4.0',
                            required : libcryptsetup)
 libcryptsetup_cflags = libcryptsetup.partial_dependency(includes: true, compile_args: true)
 
 have = libcryptsetup.found()
 conf.set10('HAVE_LIBCRYPTSETUP', have)
+conf.set10('HAVE_LIBCRYPTSETUP_PLUGINS',
+           libcryptsetup_plugins.allowed() and have)
 
 foreach ident : [
-                'crypt_activate_by_token_pin',   # 2.4
-                'crypt_logf',                    # 2.4
-                'crypt_reencrypt_run',           # 2.4
-                'crypt_token_external_path',     # 2.4
-                'crypt_token_max',               # 2.4
                 'crypt_set_keyring_to_link',     # 2.7
                 'crypt_token_set_external_path', # 2.7
         ]
@@ -1300,12 +1283,6 @@ foreach ident : [
                 dependencies : libcryptsetup)
         conf.set10('HAVE_' + ident.to_upper(), have_ident)
 endforeach
-
-conf.set10('HAVE_LIBCRYPTSETUP_PLUGINS',
-           libcryptsetup_plugins.allowed() and
-           conf.get('HAVE_CRYPT_ACTIVATE_BY_TOKEN_PIN') == 1 and
-           conf.get('HAVE_CRYPT_LOGF') == 1 and
-           conf.get('HAVE_CRYPT_TOKEN_EXTERNAL_PATH') == 1)
 
 libcurl = dependency('libcurl',
                      version : '>= 7.32.0',
@@ -1355,7 +1332,7 @@ libgnutls = dependency('gnutls',
 conf.set10('HAVE_GNUTLS', libgnutls.found())
 
 libopenssl = dependency('openssl',
-                        version : '>= 1.1.0',
+                        version : '>= 3.0.0',
                         required : get_option('openssl'))
 conf.set10('HAVE_OPENSSL', libopenssl.found())
 
@@ -1381,16 +1358,13 @@ conf.set10('HAVE_TSS2_ESYS3', tpm2.found() and tpm2.version().version_compare('>
 conf.set('TPM2_NVPCR_BASE', get_option('tpm2-nvpcr-base'))
 
 libdw = dependency('libdw',
+                   version : '>=0.177',
                    required : get_option('elfutils'))
 libdw_cflags = libdw.partial_dependency(includes: true, compile_args: true)
 libelf = dependency('libelf',
                     required : get_option('elfutils'))
 libelf_cflags = libelf.partial_dependency(includes: true, compile_args: true)
 conf.set10('HAVE_ELFUTILS', libdw.found() and libelf.found())
-
-# New in elfutils 0.177
-conf.set10('HAVE_DWELF_ELF_E_MACHINE_STRING',
-           libdw.found() and cc.has_function('dwelf_elf_e_machine_string', dependencies : libdw))
 
 # New in elfutils 0.192
 conf.set10('HAVE_DWFL_SET_SYSROOT',
@@ -1607,10 +1581,11 @@ conf.set10('ENABLE_SYSUPDATED', have2)
 conf.set10('ENABLE_STORAGETM', get_option('storagetm'))
 
 have = get_option('homed').require(
+        conf.get('HAVE_LIBCRYPT') == 1 and
         conf.get('HAVE_OPENSSL') == 1 and
         conf.get('HAVE_LIBFDISK') == 1 and
         conf.get('HAVE_LIBCRYPTSETUP') == 1,
-        error_message : 'openssl, fdisk and libcryptsetup required').allowed()
+        error_message : 'libcrypt, openssl, fdisk, and libcryptsetup required').allowed()
 conf.set10('ENABLE_HOMED', have)
 
 have = have and conf.get('HAVE_PAM') == 1
@@ -3137,6 +3112,7 @@ foreach tuple : [
         ['gnutls'],
         ['libarchive'],
         ['libbpf'],
+        ['libcrypt'],
         ['libcryptsetup'],
         ['libcryptsetup-plugins'],
         ['libcurl'],

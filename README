@@ -212,15 +212,14 @@ REQUIREMENTS:
         newer though. TL;DR: turn audit off, still.
 
         glibc >= 2.31
-        libxcrypt or glibc (<= 2.38 built with --enable-crypt)
+        libxcrypt >= 4.4.0 (optional)
         libmount >= 2.30 (from util-linux)
                 (util-linux *must* be built without --enable-libmount-support-mtab)
-        libseccomp >= 2.3.1 (optional)
-        libblkid >= 2.24 (from util-linux) (optional)
+        libseccomp >= 2.4.0 (optional)
+        libblkid >= 2.37 (from util-linux) (optional)
         libkmod >= 15 (optional)
         PAM >= 1.1.2 (optional)
-        libcryptsetup >= 2.0.1 (optional),
-                      >= 2.3.0 is required for signed Verity images support
+        libcryptsetup >= 2.4.0 (optional),
         libaudit (optional)
         libacl (optional)
         libbpf >= 0.1.0 (optional),
@@ -243,11 +242,11 @@ REQUIREMENTS:
         libcurl >= 7.32.0 (optional)
         libidn2 or libidn (optional)
         gnutls >= 3.1.4 (optional)
-        openssl >= 1.1.0 (optional, required to support DNS-over-TLS)
+        openssl >= 3.0.0 (optional, required to support DNS-over-TLS)
         p11-kit >= 0.23.3 (optional)
         libfido2 (optional)
         tpm2-tss (optional)
-        elfutils >= 158 (optional)
+        elfutils >= 177 (optional)
         polkit (optional)
         tzdata >= 2014f (optional)
         pkg-config

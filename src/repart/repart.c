@@ -2730,7 +2730,7 @@ static MakeFileSystemFlags partition_mkfs_flags(const Partition *p) {
         if (arg_discard)
                 flags |= MKFS_DISCARD;
 
-        if (streq(p->format, "erofs") && !DEBUG_LOGGING)
+        if (streq(p->format, "erofs") && !DEBUG_LOGGING && !isatty_safe(STDERR_FILENO))
                 flags |= MKFS_QUIET;
 
         FOREACH_ARRAY(cf, p->copy_files, p->n_copy_files)
@@ -5442,11 +5442,7 @@ static int partition_encrypt(Context *context, Partition *p, PartitionTarget *ta
                 if (r < 0)
                         return log_error_errno(r, "Failed to load reencryption context: %m");
 
-#if HAVE_CRYPT_REENCRYPT_RUN
                 r = sym_crypt_reencrypt_run(cd, NULL, NULL);
-#else
-                r = sym_crypt_reencrypt(cd, NULL);
-#endif
                 if (r < 0)
                         return log_error_errno(r, "Failed to encrypt %s: %m", node);
         } else {
@@ -5507,7 +5503,7 @@ static int partition_encrypt(Context *context, Partition *p, PartitionTarget *ta
         return 0;
 #else
         return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
-                               "libcryptsetup is not supported or is missing required symbols, cannot encrypt.");
+                               "libcryptsetup is not supported, cannot encrypt.");
 #endif
 }
 
@@ -6723,7 +6719,10 @@ static int partition_populate_filesystem(Context *context, Partition *p, const c
 
         (void) dlopen_libmount();
 
-        r = safe_fork("(sd-copy)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT|FORK_NEW_MOUNTNS|FORK_MOUNTNS_SLAVE, NULL);
+        r = pidref_safe_fork(
+                        "(sd-copy)",
+                        FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT|FORK_NEW_MOUNTNS|FORK_MOUNTNS_SLAVE,
+                        /* ret= */ NULL);
         if (r < 0)
                 return r;
         if (r == 0) {

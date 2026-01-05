@@ -101,17 +101,14 @@ bool oom_score_adjust_is_valid(int oa);
  * personality we're interested in. */
 #define OPINIONATED_PERSONALITY_MASK 0xFFUL
 
-unsigned long personality_from_string(const char *p);
-const char* personality_to_string(unsigned long);
+unsigned long personality_from_string(const char *s);
+const char* personality_to_string(unsigned long p);
 
 int safe_personality(unsigned long p);
 int opinionated_personality(unsigned long *ret);
 
-const char* sigchld_code_to_string(int i) _const_;
-int sigchld_code_from_string(const char *s) _pure_;
-
-int sched_policy_to_string_alloc(int i, char **ret);
-int sched_policy_from_string(const char *s);
+DECLARE_STRING_TABLE_LOOKUP(sigchld_code, int);
+DECLARE_STRING_TABLE_LOOKUP_WITH_FALLBACK(sched_policy, int);
 
 static inline pid_t PTR_TO_PID(const void *p) {
         return (pid_t) ((uintptr_t) p);
@@ -127,10 +124,10 @@ int pid_compare_func(const pid_t *a, const pid_t *b);
 
 bool nice_is_valid(int n) _const_;
 
-bool sched_policy_is_valid(int i) _const_;
-bool sched_policy_supported(int i);
-int sched_get_priority_min_safe(int i);
-int sched_get_priority_max_safe(int i);
+bool sched_policy_is_valid(int policy) _const_;
+bool sched_policy_supported(int policy);
+int sched_get_priority_min_safe(int policy);
+int sched_get_priority_max_safe(int policy);
 
 #define PID_AUTOMATIC ((pid_t) INT_MIN) /* special value indicating "acquire pid from connection peer" */
 
@@ -179,8 +176,6 @@ typedef enum ForkFlags {
         FORK_NEW_PIDNS          = 1 << 21, /* Run child in its own PID namespace                                 💣 DO NOT USE IN THREADED PROGRAMS! 💣 */
         FORK_FREEZE             = 1 << 22, /* Don't return in child, just call freeze() instead */
         FORK_ALLOW_DLOPEN       = 1 << 23, /* Do not block dlopen() in child */
-
-        _FORK_PID_ONLY          = 1 << 24, /* Don't open a pidfd referencing the child process */
 } ForkFlags;
 
 int pidref_safe_fork_full(
@@ -189,22 +184,10 @@ int pidref_safe_fork_full(
                 int except_fds[],
                 size_t n_except_fds,
                 ForkFlags flags,
-                PidRef *ret_pid);
+                PidRef *ret);
 
-static inline int pidref_safe_fork(const char *name, ForkFlags flags, PidRef *ret_pid) {
-        return pidref_safe_fork_full(name, NULL, NULL, 0, flags, ret_pid);
-}
-
-int safe_fork_full(
-                const char *name,
-                const int stdio_fds[3],
-                int except_fds[],
-                size_t n_except_fds,
-                ForkFlags flags,
-                pid_t *ret_pid);
-
-static inline int safe_fork(const char *name, ForkFlags flags, pid_t *ret_pid) {
-        return safe_fork_full(name, NULL, NULL, 0, flags, ret_pid);
+static inline int pidref_safe_fork(const char *name, ForkFlags flags, PidRef *ret) {
+        return pidref_safe_fork_full(name, NULL, NULL, 0, flags, ret);
 }
 
 int namespace_fork_full(
