@@ -1117,7 +1117,8 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
                 "%sProtectHostname: %s%s%s\n"
                 "%sProtectProc: %s\n"
                 "%sProcSubset: %s\n"
-                "%sPrivateBPF: %s\n",
+                "%sPrivateBPF: %s\n"
+                "%sMemoryTHP: %s\n",
                 prefix, c->umask,
                 prefix, empty_to_root(c->working_directory),
                 prefix, empty_to_root(c->root_directory),
@@ -1145,7 +1146,8 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
                 prefix, protect_hostname_to_string(c->protect_hostname), c->private_hostname ? ":" : "", strempty(c->private_hostname),
                 prefix, protect_proc_to_string(c->protect_proc),
                 prefix, proc_subset_to_string(c->proc_subset),
-                prefix, private_bpf_to_string(c->private_bpf));
+                prefix, private_bpf_to_string(c->private_bpf),
+                prefix, memory_thp_to_string(c->memory_thp));
 
         if (c->private_bpf == PRIVATE_BPF_YES) {
                 _cleanup_free_ char
@@ -1167,13 +1169,10 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
                 fprintf(f, "%sRootImage: %s\n", prefix, c->root_image);
 
         if (c->root_image_options) {
-                fprintf(f, "%sRootImageOptions:", prefix);
-                LIST_FOREACH(mount_options, o, c->root_image_options)
-                        if (!isempty(o->options))
-                                fprintf(f, " %s:%s",
-                                        partition_designator_to_string(o->partition_designator),
-                                        o->options);
-                fprintf(f, "\n");
+                _cleanup_free_ char *opts_str = NULL;
+
+                if (mount_options_to_string(c->root_image_options, &opts_str) >= 0 && !isempty(opts_str))
+                        fprintf(f, "%sRootImageOptions: %s\n", prefix, opts_str);
         }
 
         if (iovec_is_set(&c->root_hash)) {
@@ -1580,10 +1579,12 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
                         mount->ignore_enoent ? "-": "",
                         mount->source,
                         mount->destination);
-                LIST_FOREACH(mount_options, o, mount->mount_options)
-                        fprintf(f, ":%s:%s",
-                                partition_designator_to_string(o->partition_designator),
-                                strempty(o->options));
+                if (mount->mount_options) {
+                        _cleanup_free_ char *opts = NULL;
+
+                        if (mount_options_to_string(mount->mount_options, &opts) >= 0 && !isempty(opts))
+                                fprintf(f, " %s", opts);
+                }
                 fprintf(f, "\n");
         }
 
@@ -1591,10 +1592,12 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
                 fprintf(f, "%sExtensionImages: %s%s", prefix,
                         mount->ignore_enoent ? "-": "",
                         mount->source);
-                LIST_FOREACH(mount_options, o, mount->mount_options)
-                        fprintf(f, ":%s:%s",
-                                partition_designator_to_string(o->partition_designator),
-                                strempty(o->options));
+                if (mount->mount_options) {
+                        _cleanup_free_ char *opts = NULL;
+
+                        if (mount_options_to_string(mount->mount_options, &opts) >= 0 && !isempty(opts))
+                                fprintf(f, " %s", opts);
+                }
                 fprintf(f, "\n");
         }
 

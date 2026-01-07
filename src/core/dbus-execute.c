@@ -58,6 +58,7 @@ static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_private_bpf, private_bpf, Priva
 static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_protect_home, protect_home, ProtectHome);
 static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_protect_system, protect_system, ProtectSystem);
 static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_personality, personality, unsigned long);
+static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_memory_thp, memory_thp, MemoryTHP);
 static BUS_DEFINE_PROPERTY_GET(property_get_ioprio, "i", ExecContext, exec_context_get_effective_ioprio);
 static BUS_DEFINE_PROPERTY_GET(property_get_mount_apivfs, "b", ExecContext, exec_context_get_effective_mount_apivfs);
 static BUS_DEFINE_PROPERTY_GET(property_get_bind_log_sockets, "b", ExecContext, exec_context_get_effective_bind_log_sockets);
@@ -793,6 +794,33 @@ static int property_get_root_hash_sig(
         return sd_bus_message_append_array(reply, 'y', c->root_hash_sig.iov_base, c->root_hash_sig.iov_len);
 }
 
+static int bus_append_mount_options(
+                sd_bus_message *reply,
+                MountOptions *options) {
+
+        int r;
+
+        assert(reply);
+
+        r = sd_bus_message_open_container(reply, 'a', "(ss)");
+        if (r < 0)
+                return r;
+
+        if (options)
+                for (PartitionDesignator i = 0; i < _PARTITION_DESIGNATOR_MAX; i++) {
+                        if (isempty(options->options[i]))
+                                continue;
+
+                        r = sd_bus_message_append(reply, "(ss)",
+                                                  partition_designator_to_string(i),
+                                                  options->options[i]);
+                        if (r < 0)
+                                return r;
+                }
+
+        return sd_bus_message_close_container(reply);
+}
+
 static int property_get_root_image_options(
                 sd_bus *bus,
                 const char *path,
@@ -803,25 +831,12 @@ static int property_get_root_image_options(
                 sd_bus_error *reterr_error) {
 
         ExecContext *c = ASSERT_PTR(userdata);
-        int r;
 
         assert(bus);
         assert(property);
         assert(reply);
 
-        r = sd_bus_message_open_container(reply, 'a', "(ss)");
-        if (r < 0)
-                return r;
-
-        LIST_FOREACH(mount_options, m, c->root_image_options) {
-                r = sd_bus_message_append(reply, "(ss)",
-                                          partition_designator_to_string(m->partition_designator),
-                                          m->options);
-                if (r < 0)
-                        return r;
-        }
-
-        return sd_bus_message_close_container(reply);
+        return bus_append_mount_options(reply, c->root_image_options);
 }
 
 static int property_get_mount_images(
@@ -857,19 +872,7 @@ static int property_get_mount_images(
                 if (r < 0)
                         return r;
 
-                r = sd_bus_message_open_container(reply, 'a', "(ss)");
-                if (r < 0)
-                        return r;
-
-                LIST_FOREACH(mount_options, m, i->mount_options) {
-                        r = sd_bus_message_append(reply, "(ss)",
-                                                  partition_designator_to_string(m->partition_designator),
-                                                  m->options);
-                        if (r < 0)
-                                return r;
-                }
-
-                r = sd_bus_message_close_container(reply);
+                r = bus_append_mount_options(reply, i->mount_options);
                 if (r < 0)
                         return r;
 
@@ -913,19 +916,7 @@ static int property_get_extension_images(
                 if (r < 0)
                         return r;
 
-                r = sd_bus_message_open_container(reply, 'a', "(ss)");
-                if (r < 0)
-                        return r;
-
-                LIST_FOREACH(mount_options, m, i->mount_options) {
-                        r = sd_bus_message_append(reply, "(ss)",
-                                                  partition_designator_to_string(m->partition_designator),
-                                                  m->options);
-                        if (r < 0)
-                                return r;
-                }
-
-                r = sd_bus_message_close_container(reply);
+                r = bus_append_mount_options(reply, i->mount_options);
                 if (r < 0)
                         return r;
 
@@ -1407,6 +1398,7 @@ const sd_bus_vtable bus_exec_vtable[] = {
         SD_BUS_PROPERTY("BPFDelegatePrograms", "s", property_get_bpf_delegate_programs, offsetof(ExecContext, bpf_delegate_programs), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("BPFDelegateAttachments", "s", property_get_bpf_delegate_attachments, offsetof(ExecContext, bpf_delegate_attachments), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("MemoryKSM", "b", bus_property_get_tristate, offsetof(ExecContext, memory_ksm), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("MemoryTHP", "s", property_get_memory_thp, offsetof(ExecContext, memory_thp), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("UserNamespacePath", "s", NULL, offsetof(ExecContext, user_namespace_path), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("NetworkNamespacePath", "s", NULL, offsetof(ExecContext, network_namespace_path), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("IPCNamespacePath", "s", NULL, offsetof(ExecContext, ipc_namespace_path), SD_BUS_VTABLE_PROPERTY_CONST),
@@ -1845,6 +1837,7 @@ static BUS_DEFINE_SET_TRANSIENT_PARSE(keyring_mode, ExecKeyringMode, exec_keyrin
 static BUS_DEFINE_SET_TRANSIENT_PARSE(protect_proc, ProtectProc, protect_proc_from_string);
 static BUS_DEFINE_SET_TRANSIENT_PARSE(proc_subset, ProcSubset, proc_subset_from_string);
 static BUS_DEFINE_SET_TRANSIENT_PARSE(private_bpf, PrivateBPF, private_bpf_from_string);
+static BUS_DEFINE_SET_TRANSIENT_PARSE(memory_thp, MemoryTHP, memory_thp_from_string);
 static BUS_DEFINE_SET_TRANSIENT_PARSE_PTR(bpf_delegate_commands, uint64_t, bpf_delegate_commands_from_string);
 static BUS_DEFINE_SET_TRANSIENT_PARSE_PTR(bpf_delegate_maps, uint64_t, bpf_delegate_maps_from_string);
 static BUS_DEFINE_SET_TRANSIENT_PARSE_PTR(bpf_delegate_programs, uint64_t, bpf_delegate_programs_from_string);
@@ -1899,7 +1892,17 @@ int bus_exec_context_set_transient_property(
 
                 if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
                         if (options) {
-                                LIST_JOIN(mount_options, c->root_image_options, options);
+                                if (!c->root_image_options)
+                                        c->root_image_options = TAKE_PTR(options);
+                                else
+                                        for (PartitionDesignator j = 0; j < _PARTITION_DESIGNATOR_MAX; j++) {
+                                                if (isempty(options->options[j])) {
+                                                        if (options->options[j]) /* Free current value if "" is passed */
+                                                                c->root_image_options->options[j] = mfree(c->root_image_options->options[j]);
+                                                        continue;
+                                                }
+                                                free_and_replace(c->root_image_options->options[j], options->options[j]);
+                                        }
                                 unit_write_settingf(
                                                 u, flags|UNIT_ESCAPE_SPECIFIERS, name,
                                                 "%s=%s",
@@ -2332,6 +2335,9 @@ int bus_exec_context_set_transient_property(
 
         if (streq(name, "MemoryKSM"))
                 return bus_set_transient_tristate(u, name, &c->memory_ksm, message, flags, reterr_error);
+
+        if (streq(name, "MemoryTHP"))
+                return bus_set_transient_memory_thp(u, name, &c->memory_thp, message, flags, reterr_error);
 
         if (streq(name, "UtmpIdentifier"))
                 return bus_set_transient_string(u, name, &c->utmp_id, message, flags, reterr_error);

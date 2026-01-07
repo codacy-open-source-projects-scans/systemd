@@ -7,6 +7,16 @@ CHANGES WITH 260 in spe:
         * Meson options '-Dintegration-tests=' and '-Dcryptolib=' (deprecated
           in v258) have been removed.
 
+        * Support for libidn has been removed. IDN functionality now requires
+          libidn2. The corresponding meson option '-Dlibidn=' is deprecated
+          too and will be dropped in a future release.
+
+        * The parsing of RootImageOptions= and the mount image parameters of
+          ExtensionImages= and MountImages= has been changed so that the last
+          duplicated definition for a given partition wins and is applied,
+          rather than the first, to keep these options coherent with other
+          unit settings.
+
 CHANGES WITH 259:
 
         Announcements of Future Feature Removals and Incompatible Changes:
@@ -4631,7 +4641,7 @@ CHANGES WITH 255:
         * A new component "systemd-storagetm" has been added, which exposes all
           local block devices as NVMe-TCP devices, fully automatically. It's
           hooked into a new target unit storage-target-mode.target that is
-          suppsoed to be booted into via
+          supposed to be booted into via
           rd.systemd.unit=storage-target-mode.target on the kernel command
           line. This is intended to be used for installers and debugging to
           quickly get access to the local disk. It's inspired by MacOS "target

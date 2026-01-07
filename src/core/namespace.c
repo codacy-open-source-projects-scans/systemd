@@ -27,7 +27,6 @@
 #include "glyph-util.h"
 #include "iovec-util.h"
 #include "label-util.h"
-#include "list.h"
 #include "lock-util.h"
 #include "log.h"
 #include "loop-util.h"
@@ -117,7 +116,7 @@ typedef struct MountEntry {
         char *options_malloc;
         unsigned long flags;      /* Mount flags used by EMPTY_DIR and TMPFS. Do not include MS_RDONLY here, but please use read_only. */
         unsigned n_followed;
-        LIST_HEAD(MountOptions, image_options_const);
+        MountOptions *image_options_const;
         char **overlay_layers;
         VeritySettings verity;
         ImageClass filter_class; /* Used for live updates to skip inapplicable images */
@@ -3128,7 +3127,8 @@ MountImage* mount_image_free_many(MountImage *m, size_t *n) {
 
 int mount_image_add(MountImage **m, size_t *n, const MountImage *item) {
         _cleanup_free_ char *s = NULL, *d = NULL;
-        _cleanup_(mount_options_free_allp) MountOptions *options = NULL;
+        _cleanup_(mount_options_free_allp) MountOptions *o = NULL;
+        int r;
 
         assert(m);
         assert(n);
@@ -3144,21 +3144,10 @@ int mount_image_add(MountImage **m, size_t *n, const MountImage *item) {
                         return -ENOMEM;
         }
 
-        LIST_FOREACH(mount_options, i, item->mount_options) {
-                _cleanup_(mount_options_free_allp) MountOptions *o = NULL;
-
-                o = new(MountOptions, 1);
-                if (!o)
-                        return -ENOMEM;
-
-                *o = (MountOptions) {
-                        .partition_designator = i->partition_designator,
-                        .options = strdup(i->options),
-                };
-                if (!o->options)
-                        return -ENOMEM;
-
-                LIST_APPEND(mount_options, options, TAKE_PTR(o));
+        if (item->mount_options) {
+                r = mount_options_dup(item->mount_options, &o);
+                if (r < 0)
+                        return r;
         }
 
         if (!GREEDY_REALLOC(*m, *n + 1))
@@ -3167,7 +3156,7 @@ int mount_image_add(MountImage **m, size_t *n, const MountImage *item) {
         (*m)[(*n)++] = (MountImage) {
                 .source = TAKE_PTR(s),
                 .destination = TAKE_PTR(d),
-                .mount_options = TAKE_PTR(options),
+                .mount_options = TAKE_PTR(o),
                 .ignore_enoent = item->ignore_enoent,
                 .type = item->type,
         };
@@ -4046,6 +4035,15 @@ DEFINE_STRING_TABLE_LOOKUP(bpf_delegate_cmd, uint64_t);
 DEFINE_STRING_TABLE_LOOKUP(bpf_delegate_map_type, uint64_t);
 DEFINE_STRING_TABLE_LOOKUP(bpf_delegate_prog_type, uint64_t);
 DEFINE_STRING_TABLE_LOOKUP(bpf_delegate_attach_type, uint64_t);
+
+static const char* const memory_thp_table[_MEMORY_THP_MAX] = {
+        [MEMORY_THP_INHERIT] = "inherit",
+        [MEMORY_THP_DISABLE] = "disable",
+        [MEMORY_THP_MADVISE] = "madvise",
+        [MEMORY_THP_SYSTEM]  = "system",
+};
+
+DEFINE_STRING_TABLE_LOOKUP(memory_thp, MemoryTHP);
 
 char* bpf_delegate_to_string(uint64_t u, const char * (*parser)(uint64_t) _const_ ) {
         assert(parser);
