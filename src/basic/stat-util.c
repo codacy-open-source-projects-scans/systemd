@@ -31,9 +31,24 @@ static int verify_stat_at(
         struct stat st;
         int r;
 
-        assert(fd >= 0 || fd == AT_FDCWD);
+        assert(fd >= 0 || IN_SET(fd, AT_FDCWD, XAT_FDROOT));
         assert(!isempty(path) || !follow);
         assert(verify_func);
+
+        _cleanup_free_ char *p = NULL;
+        if (fd == XAT_FDROOT) {
+                fd = AT_FDCWD;
+
+                if (isempty(path))
+                        path = "/";
+                else if (!path_is_absolute(path)) {
+                        p = strjoin("/", path);
+                        if (!p)
+                                return -ENOMEM;
+
+                        path = p;
+                }
+        }
 
         if (fstatat(fd, strempty(path), &st,
                     (isempty(path) ? AT_EMPTY_PATH : 0) | (follow ? 0 : AT_SYMLINK_NOFOLLOW)) < 0)
@@ -66,8 +81,10 @@ int verify_regular_at(int fd, const char *path, bool follow) {
 }
 
 int fd_verify_regular(int fd) {
-        assert(fd >= 0);
-        return verify_regular_at(fd, NULL, false);
+        if (IN_SET(fd, AT_FDCWD, XAT_FDROOT))
+                return -EISDIR;
+
+        return verify_regular_at(fd, /* path= */ NULL, /* follow= */ false);
 }
 
 int stat_verify_directory(const struct stat *st) {
@@ -83,7 +100,9 @@ int stat_verify_directory(const struct stat *st) {
 }
 
 int fd_verify_directory(int fd) {
-        assert(fd >= 0);
+        if (IN_SET(fd, AT_FDCWD, XAT_FDROOT))
+                return 0;
+
         return verify_stat_at(fd, NULL, false, stat_verify_directory, true);
 }
 
@@ -127,7 +146,10 @@ int stat_verify_linked(const struct stat *st) {
 }
 
 int fd_verify_linked(int fd) {
-        assert(fd >= 0);
+
+        if (fd == XAT_FDROOT)
+                return 0;
+
         return verify_stat_at(fd, NULL, false, stat_verify_linked, true);
 }
 
@@ -223,23 +245,49 @@ int null_or_empty_path_with_root(const char *fn, const char *root) {
         return null_or_empty(&st);
 }
 
-int fd_is_read_only_fs(int fd) {
-        struct statfs st;
+static int xfstatfs(int fd, struct statfs *ret) {
+        assert(ret);
+
+        if (fd == AT_FDCWD)
+                return RET_NERRNO(statfs(".", ret));
+        if (fd == XAT_FDROOT)
+                return RET_NERRNO(statfs("/", ret));
 
         assert(fd >= 0);
+        return RET_NERRNO(fstatfs(fd, ret));
+}
 
-        if (fstatfs(fd, &st) < 0)
-                return -errno;
+int xstatfsat(int dir_fd, const char *path, struct statfs *ret) {
+        _cleanup_close_ int fd = -EBADF;
+
+        assert(dir_fd >= 0 || IN_SET(dir_fd, AT_FDCWD, XAT_FDROOT));
+        assert(ret);
+
+        if (!isempty(path)) {
+                fd = xopenat(dir_fd, path, O_PATH|O_CLOEXEC);
+                if (fd < 0)
+                        return fd;
+                dir_fd = fd;
+        }
+
+        return xfstatfs(dir_fd, ret);
+}
+
+int fd_is_read_only_fs(int fd) {
+        int r;
+
+        struct statfs st;
+        r = xfstatfs(fd, &st);
+        if (r < 0)
+                return r;
 
         if (st.f_flags & ST_RDONLY)
                 return true;
 
-        if (is_network_fs(&st)) {
+        if (is_network_fs(&st))
                 /* On NFS, fstatfs() might not reflect whether we can actually write to the remote share.
                  * Let's try again with access(W_OK) which is more reliable, at least sometimes. */
-                if (access_fd(fd, W_OK) == -EROFS)
-                        return true;
-        }
+                return access_fd(fd, W_OK) == -EROFS;
 
         return false;
 }
@@ -364,9 +412,9 @@ bool is_fs_type(const struct statfs *s, statfs_f_type_t magic_value) {
 }
 
 int is_fs_type_at(int dir_fd, const char *path, statfs_f_type_t magic_value) {
-        struct statfs s;
         int r;
 
+        struct statfs s;
         r = xstatfsat(dir_fd, path, &s);
         if (r < 0)
                 return r;
@@ -383,19 +431,23 @@ bool is_network_fs(const struct statfs *s) {
 }
 
 int fd_is_temporary_fs(int fd) {
-        struct statfs s;
+        int r;
 
-        if (fstatfs(fd, &s) < 0)
-                return -errno;
+        struct statfs s;
+        r = xfstatfs(fd, &s);
+        if (r < 0)
+                return r;
 
         return is_temporary_fs(&s);
 }
 
 int fd_is_network_fs(int fd) {
-        struct statfs s;
+        int r;
 
-        if (fstatfs(fd, &s) < 0)
-                return -errno;
+        struct statfs s;
+        r = xfstatfs(fd, &s);
+        if (r < 0)
+                return r;
 
         return is_network_fs(&s);
 }
@@ -463,8 +515,13 @@ bool statx_inode_same(const struct statx *a, const struct statx *b) {
 
         /* Same as stat_inode_same() but for struct statx */
 
-        return statx_is_set(a) && statx_is_set(b) &&
-                FLAGS_SET(a->stx_mask, STATX_TYPE|STATX_INO) && FLAGS_SET(b->stx_mask, STATX_TYPE|STATX_INO) &&
+        if (!statx_is_set(a) || !statx_is_set(b))
+                return false;
+
+        assert(FLAGS_SET(a->stx_mask, STATX_TYPE|STATX_INO));
+        assert(FLAGS_SET(b->stx_mask, STATX_TYPE|STATX_INO));
+
+        return
                 ((a->stx_mode ^ b->stx_mode) & S_IFMT) == 0 &&
                 a->stx_dev_major == b->stx_dev_major &&
                 a->stx_dev_minor == b->stx_dev_minor &&
@@ -475,29 +532,10 @@ bool statx_mount_same(const struct statx *a, const struct statx *b) {
         if (!statx_is_set(a) || !statx_is_set(b))
                 return false;
 
-        /* if we have the mount ID, that's all we need */
-        if (FLAGS_SET(a->stx_mask, STATX_MNT_ID) && FLAGS_SET(b->stx_mask, STATX_MNT_ID))
-                return a->stx_mnt_id == b->stx_mnt_id;
+        assert(FLAGS_SET(a->stx_mask, STATX_MNT_ID));
+        assert(FLAGS_SET(b->stx_mask, STATX_MNT_ID));
 
-        /* Otherwise, major/minor of backing device must match */
-        return a->stx_dev_major == b->stx_dev_major &&
-                a->stx_dev_minor == b->stx_dev_minor;
-}
-
-int xstatfsat(int dir_fd, const char *path, struct statfs *ret) {
-        _cleanup_close_ int fd = -EBADF;
-
-        assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
-        assert(ret);
-
-        if (!isempty(path)) {
-                fd = xopenat(dir_fd, path, O_PATH|O_CLOEXEC|O_NOCTTY);
-                if (fd < 0)
-                        return fd;
-                dir_fd = fd;
-        }
-
-        return RET_NERRNO(fstatfs(dir_fd, ret));
+        return a->stx_mnt_id == b->stx_mnt_id;
 }
 
 usec_t statx_timestamp_load(const struct statx_timestamp *ts) {
@@ -571,4 +609,26 @@ mode_t inode_type_from_string(const char *s) {
                 return S_IFSOCK;
 
         return MODE_INVALID;
+}
+
+int statx_warn_mount_root(const struct statx *sx, int log_level) {
+        assert(sx);
+
+        /* The STATX_ATTR_MOUNT_ROOT flag is supported since kernel v5.8. */
+        if (!FLAGS_SET(sx->stx_attributes_mask, STATX_ATTR_MOUNT_ROOT))
+                return log_full_errno(log_level, SYNTHETIC_ERRNO(ENOSYS),
+                                      "statx() did not set STATX_ATTR_MOUNT_ROOT, running on an old kernel?");
+
+        return 0;
+}
+
+int statx_warn_mount_id(const struct statx *sx, int log_level) {
+        assert(sx);
+
+        /* The STATX_MNT_ID flag is supported since kernel v5.10. */
+        if (!FLAGS_SET(sx->stx_mask, STATX_MNT_ID))
+                return log_full_errno(log_level, SYNTHETIC_ERRNO(ENOSYS),
+                                      "statx() does not support STATX_MNT_ID, running on an old kernel?");
+
+        return 0;
 }

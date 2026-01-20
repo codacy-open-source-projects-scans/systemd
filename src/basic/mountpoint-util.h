@@ -39,13 +39,12 @@ int name_to_handle_at_try_fid(int fd, const char *path, struct file_handle **ret
 
 bool file_handle_equal(const struct file_handle *a, const struct file_handle *b);
 
-int path_get_mnt_id_at_fallback(int dir_fd, const char *path, int *ret);
 int path_get_mnt_id_at(int dir_fd, const char *path, int *ret);
 static inline int path_get_mnt_id(const char *path, int *ret) {
         return path_get_mnt_id_at(AT_FDCWD, path, ret);
 }
 
-int is_mount_point_at(int fd, const char *filename, int flags);
+int is_mount_point_at(int dir_fd, const char *path, int flags);
 int path_is_mount_point_full(const char *path, const char *root, int flags);
 static inline int path_is_mount_point(const char *path) {
         return path_is_mount_point_full(path, NULL, 0);
@@ -76,7 +75,6 @@ int mount_propagation_flag_from_string(const char *name, unsigned long *ret);
 bool mount_propagation_flag_is_valid(unsigned long flag);
 
 bool mount_new_api_supported(void);
-unsigned long ms_nosymfollow_supported(void);
 
 int mount_option_supported(const char *fstype, const char *key, const char *value);
 

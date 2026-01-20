@@ -13,6 +13,7 @@
 #include "export-vars.h"
 #include "graphics.h"
 #include "initrd.h"
+#include "iovec-util-fundamental.h"
 #include "line-edit.h"
 #include "measure.h"
 #include "memory-util-fundamental.h"
@@ -127,7 +128,8 @@ typedef struct {
         size_t n_entries;
         size_t idx_default;
         size_t idx_default_efivar;
-        uint64_t timeout_sec; /* Actual timeout used (efi_main() override > efivar > config). */
+        uint64_t timeout_sec; /* Actual timeout used (efi_main() override > smbios > efivar > config). */
+        uint64_t timeout_sec_smbios;
         uint64_t timeout_sec_config;
         uint64_t timeout_sec_efivar;
         char16_t *entry_default_config;
@@ -322,6 +324,7 @@ static void print_status(Config *config, char16_t *loaded_image_path) {
 
         print_timeout_status("              timeout (config)", config->timeout_sec_config);
         print_timeout_status("             timeout (EFI var)", config->timeout_sec_efivar);
+        print_timeout_status("              timeout (smbios)", config->timeout_sec_smbios);
 
         if (config->entry_default_config)
                 printf("              default (config): %ls\n", config->entry_default_config);
@@ -435,7 +438,7 @@ static EFI_STATUS set_reboot_into_firmware(void) {
 
         err = efivar_set_uint64_le(MAKE_GUID_PTR(EFI_GLOBAL_VARIABLE), u"OsIndications", osind, EFI_VARIABLE_NON_VOLATILE);
         if (err != EFI_SUCCESS)
-                return log_error_status(err, "Error setting OsIndications, ignoring: %m");
+                return log_warning_status(err, "Error setting OsIndications, ignoring: %m");
 
         return EFI_SUCCESS;
 }
@@ -1005,6 +1008,41 @@ static BootEntry* boot_entry_free(BootEntry *entry) {
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(BootEntry *, boot_entry_free);
 
+static EFI_STATUS config_timeout_sec_from_string(const char *value, uint64_t *dst) {
+        if (streq8(value, "menu-disabled"))
+                *dst = TIMEOUT_MENU_DISABLED;
+        else if (streq8(value, "menu-force"))
+                *dst = TIMEOUT_MENU_DISABLED;
+        else if (streq8(value, "menu-hidden"))
+                *dst = TIMEOUT_MENU_DISABLED;
+        else {
+                uint64_t u;
+                if (!parse_number8(value, &u, NULL) || u > TIMEOUT_TYPE_MAX)
+                        return EFI_INVALID_PARAMETER;
+                *dst = u;
+        }
+        return EFI_SUCCESS;
+}
+
+static void config_timeout_load_from_smbios(Config *config) {
+        EFI_STATUS err;
+
+        if (is_confidential_vm())
+                return; /* Don't consume SMBIOS in Confidential Computing contexts */
+
+        const char *value = smbios_find_oem_string("io.systemd.boot.timeout=", /* after= */ NULL);
+        if (!value)
+                return;
+
+        err = config_timeout_sec_from_string(value, &config->timeout_sec_smbios);
+        if (err != EFI_SUCCESS) {
+                log_warning_status(err, "Error parsing 'timeout' smbios option, ignoring: %s",
+                                   value);
+                return;
+        }
+        config->timeout_sec = config->timeout_sec_smbios;
+}
+
 static void config_defaults_load_from_file(Config *config, char *content) {
         char *line;
         size_t pos = 0;
@@ -1017,26 +1055,17 @@ static void config_defaults_load_from_file(Config *config, char *content) {
          * shared/bootspec.c@boot_loader_read_conf() to make parsing by bootctl/logind/etc. work. */
         while ((line = line_get_key_value(content, " \t", &pos, &key, &value)))
                 if (streq8(key, "timeout")) {
-                        if (streq8(value, "menu-disabled"))
-                                config->timeout_sec_config = TIMEOUT_MENU_DISABLED;
-                        else if (streq8(value, "menu-force"))
-                                config->timeout_sec_config = TIMEOUT_MENU_FORCE;
-                        else if (streq8(value, "menu-hidden"))
-                                config->timeout_sec_config = TIMEOUT_MENU_HIDDEN;
-                        else {
-                                uint64_t u;
-                                if (!parse_number8(value, &u, NULL) || u > TIMEOUT_TYPE_MAX) {
-                                        log_error("Error parsing 'timeout' config option, ignoring: %s",
-                                                  value);
-                                        continue;
-                                }
-                                config->timeout_sec_config = u;
+                        EFI_STATUS err = config_timeout_sec_from_string(value, &config->timeout_sec_config);
+                        if (err != EFI_SUCCESS) {
+                                log_warning_status(err, "Error parsing 'timeout' config option, ignoring: %s",
+                                                   value);
+                                continue;
                         }
                         config->timeout_sec = config->timeout_sec_config;
 
                 } else if (streq8(key, "default")) {
                         if (value[0] == '@' && !strcaseeq8(value, "@saved")) {
-                                log_error("Unsupported special entry identifier, ignoring: %s", value);
+                                log_warning("Unsupported special entry identifier, ignoring: %s", value);
                                 continue;
                         }
                         free(config->entry_default_config);
@@ -1044,31 +1073,31 @@ static void config_defaults_load_from_file(Config *config, char *content) {
 
                 } else if (streq8(key, "editor")) {
                         if (!parse_boolean(value, &config->editor))
-                                log_error("Error parsing 'editor' config option, ignoring: %s", value);
+                                log_warning("Error parsing 'editor' config option, ignoring: %s", value);
 
                 } else if (streq8(key, "auto-entries")) {
                         if (!parse_boolean(value, &config->auto_entries))
-                                log_error("Error parsing 'auto-entries' config option, ignoring: %s", value);
+                                log_warning("Error parsing 'auto-entries' config option, ignoring: %s", value);
 
                 } else if (streq8(key, "auto-firmware")) {
                         if (!parse_boolean(value, &config->auto_firmware))
-                                log_error("Error parsing 'auto-firmware' config option, ignoring: %s", value);
+                                log_warning("Error parsing 'auto-firmware' config option, ignoring: %s", value);
 
                 } else if (streq8(key, "auto-poweroff")) {
                         if (!parse_boolean(value, &config->auto_poweroff))
-                                log_error("Error parsing 'auto-poweroff' config option, ignoring: %s", value);
+                                log_warning("Error parsing 'auto-poweroff' config option, ignoring: %s", value);
 
                 } else if (streq8(key, "auto-reboot")) {
                         if (!parse_boolean(value, &config->auto_reboot))
-                                log_error("Error parsing 'auto-reboot' config option, ignoring: %s", value);
+                                log_warning("Error parsing 'auto-reboot' config option, ignoring: %s", value);
 
                 } else if (streq8(key, "beep")) {
                         if (!parse_boolean(value, &config->beep))
-                                log_error("Error parsing 'beep' config option, ignoring: %s", value);
+                                log_warning("Error parsing 'beep' config option, ignoring: %s", value);
 
                 } else if (streq8(key, "reboot-for-bitlocker")) {
                         if (!parse_boolean(value, &config->reboot_for_bitlocker))
-                                log_error("Error parsing 'reboot-for-bitlocker' config option, ignoring: %s",
+                                log_warning("Error parsing 'reboot-for-bitlocker' config option, ignoring: %s",
                                           value);
 
                 } else if (streq8(key, "reboot-on-error")) {
@@ -1077,7 +1106,7 @@ static void config_defaults_load_from_file(Config *config, char *content) {
                         else {
                                 bool reboot_yes_no;
                                 if (!parse_boolean(value, &reboot_yes_no))
-                                        log_error("Error parsing 'reboot-on-error' config option, ignoring: %s", value);
+                                        log_warning("Error parsing 'reboot-on-error' config option, ignoring: %s", value);
                                 else
                                         config->reboot_on_error = reboot_yes_no ? REBOOT_YES : REBOOT_NO;
                         }
@@ -1092,7 +1121,7 @@ static void config_defaults_load_from_file(Config *config, char *content) {
                         else if (streq8(value, "off"))
                                 config->secure_boot_enroll = ENROLL_OFF;
                         else
-                                log_error("Error parsing 'secure-boot-enroll' config option, ignoring: %s",
+                                log_warning("Error parsing 'secure-boot-enroll' config option, ignoring: %s",
                                           value);
                 } else if (streq8(key, "secure-boot-enroll-action")) {
                         if (streq8(value, "reboot"))
@@ -1100,7 +1129,7 @@ static void config_defaults_load_from_file(Config *config, char *content) {
                         else if (streq8(value, "shutdown"))
                                 config->secure_boot_enroll_action = ENROLL_ACTION_SHUTDOWN;
                         else
-                                log_error("Error parsing 'secure-boot-enroll-action' config option, ignoring: %s",
+                                log_warning("Error parsing 'secure-boot-enroll-action' config option, ignoring: %s",
                                           value);
                 } else if (streq8(key, "secure-boot-enroll-timeout-sec")) {
                         if (streq8(value, "hidden"))
@@ -1108,7 +1137,7 @@ static void config_defaults_load_from_file(Config *config, char *content) {
                         else {
                                 uint64_t u;
                                 if (!parse_number8(value, &u, NULL) || u > ENROLL_TIMEOUT_MAX) {
-                                        log_error("Error parsing 'secure-boot-enroll-timeout-sec' config option, ignoring: %s",
+                                        log_warning("Error parsing 'secure-boot-enroll-timeout-sec' config option, ignoring: %s",
                                                   value);
                                         continue;
                                 }
@@ -1124,7 +1153,7 @@ static void config_defaults_load_from_file(Config *config, char *content) {
                         else {
                                 uint64_t u;
                                 if (!parse_number8(value, &u, NULL) || u > CONSOLE_MODE_RANGE_MAX) {
-                                        log_error("Error parsing 'console-mode' config option, ignoring: %s",
+                                        log_warning("Error parsing 'console-mode' config option, ignoring: %s",
                                                   value);
                                         continue;
                                 }
@@ -1132,7 +1161,7 @@ static void config_defaults_load_from_file(Config *config, char *content) {
                         }
                 } else if (streq8(key, "log-level")) {
                         if (log_set_max_level_from_string(value) < 0)
-                                log_error("Error parsing 'log-level' config option, ignoring: %s", value);
+                                log_warning("Error parsing 'log-level' config option, ignoring: %s", value);
                 }
 }
 
@@ -1495,6 +1524,7 @@ static void config_load_defaults(Config *config, EFI_FILE *root_dir) {
                 .console_mode_efivar = CONSOLE_MODE_KEEP,
                 .timeout_sec_config = TIMEOUT_UNSET,
                 .timeout_sec_efivar = TIMEOUT_UNSET,
+                .timeout_sec_smbios = TIMEOUT_UNSET,
         };
 
         err = file_read(root_dir, u"\\loader\\loader.conf", 0, 0, &content, &content_size);
@@ -1519,6 +1549,7 @@ static void config_load_defaults(Config *config, EFI_FILE *root_dir) {
                 config->timeout_sec = config->timeout_sec_efivar;
         else if (err != EFI_NOT_FOUND)
                 log_warning_status(err, "Error reading LoaderConfigTimeout EFI variable, ignoring: %m");
+        config_timeout_load_from_smbios(config);
 
         err = efivar_get_timeout(u"LoaderConfigTimeoutOneShot", &config->timeout_sec);
         if (err == EFI_SUCCESS) {
@@ -2690,7 +2721,7 @@ static EFI_STATUS call_image_start(
                                 return log_error_status(err, "Error loading %ls: %m", entry->devicetree);
                 }
 
-                err = initrd_register(PHYSICAL_ADDRESS_TO_POINTER(initrd_pages.addr), initrd_size, &initrd_handle);
+                err = initrd_register(&IOVEC_MAKE(PHYSICAL_ADDRESS_TO_POINTER(initrd_pages.addr), initrd_size), &initrd_handle);
                 if (err != EFI_SUCCESS)
                         return log_error_status(err, "Error registering initrd: %m");
         }

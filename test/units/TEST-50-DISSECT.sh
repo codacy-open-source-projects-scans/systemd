@@ -25,6 +25,7 @@ at_exit() {
     done < <(find "${IMAGE_DIR}" -mindepth 1 -maxdepth 1 -type d)
 
     rm -rf "$IMAGE_DIR"
+    rm -rf /etc/polkit-1/rules.d/mountoptions.rules
 
     rm -f /etc/polkit-1/rules.d/sysext-unpriv.rules
 
@@ -117,8 +118,6 @@ else
     echo "Unexpected uname -m: $machine in TEST-50-DISSECT.sh, please fix me"
     exit 1
 fi
-
-udevadm control --log-level=debug
 
 IMAGE_DIR="$(mktemp -d --tmpdir="" TEST-50-IMAGES.XXX)"
 chmod go+rx "$IMAGE_DIR"

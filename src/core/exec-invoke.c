@@ -3669,7 +3669,8 @@ static int pick_versions(
                 r = path_pick(/* toplevel_path= */ NULL,
                               /* toplevel_fd= */ AT_FDCWD,
                               context->root_image,
-                              &pick_filter_image_raw,
+                              pick_filter_image_raw,
+                              ELEMENTSOF(pick_filter_image_raw),
                               PICK_ARCHITECTURE|PICK_TRIES|PICK_RESOLVE,
                               &result);
                 if (r < 0) {
@@ -3693,7 +3694,8 @@ static int pick_versions(
                 r = path_pick(/* toplevel_path= */ NULL,
                               /* toplevel_fd= */ AT_FDCWD,
                               context->root_directory,
-                              &pick_filter_image_dir,
+                              pick_filter_image_dir,
+                              ELEMENTSOF(pick_filter_image_dir),
                               PICK_ARCHITECTURE|PICK_TRIES|PICK_RESOLVE,
                               &result);
                 if (r < 0) {
@@ -4750,6 +4752,33 @@ static int setup_delegated_namespaces(
         return 0;
 }
 
+static int set_memory_thp(MemoryTHP thp) {
+        int r;
+
+        switch (thp) {
+
+        case MEMORY_THP_INHERIT:
+                return 0;
+
+        case MEMORY_THP_DISABLE:
+                r = RET_NERRNO(prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0));
+                break;
+
+        case MEMORY_THP_MADVISE:
+                r = RET_NERRNO(prctl(PR_SET_THP_DISABLE, 1, PR_THP_DISABLE_EXCEPT_ADVISED, 0, 0));
+                break;
+
+        case MEMORY_THP_SYSTEM:
+                r = RET_NERRNO(prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0));
+                break;
+
+        default:
+                assert_not_reached();
+        }
+
+        return r == -EINVAL ? -EOPNOTSUPP : r;
+}
+
 static bool exec_context_shall_confirm_spawn(const ExecContext *context) {
         assert(context);
 
@@ -4864,32 +4893,6 @@ static int exec_fd_mark_hot(
         }
 
         return 1;
-}
-
-static int set_memory_thp(MemoryTHP thp) {
-        switch (thp) {
-
-        case MEMORY_THP_INHERIT:
-                return 0;
-
-        case MEMORY_THP_DISABLE:
-                if (prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) < 0)
-                        return errno == EINVAL ? -EOPNOTSUPP : -errno;
-                return 0;
-
-        case MEMORY_THP_MADVISE:
-                if (prctl(PR_SET_THP_DISABLE, 1, PR_THP_DISABLE_EXCEPT_ADVISED, 0, 0) < 0)
-                        return errno == EINVAL ? -EOPNOTSUPP : -errno;
-                return 0;
-
-        case MEMORY_THP_SYSTEM:
-                if (prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0) < 0)
-                        return errno == EINVAL ? -EOPNOTSUPP : -errno;
-                return 0;
-
-        default:
-                assert_not_reached();
-        }
 }
 
 static int send_handoff_timestamp(
@@ -5578,7 +5581,7 @@ int exec_invoke(
 
         r = set_memory_thp(context->memory_thp);
         if (r == -EOPNOTSUPP)
-                log_debug_errno(r, "Setting MemoryTHP=%s is not supported, ignoring: %m",
+                log_debug_errno(r, "Setting MemoryTHP=%s is not supported, ignoring.",
                                 memory_thp_to_string(context->memory_thp));
         else if (r < 0) {
                 *exit_status = EXIT_MEMORY_THP;

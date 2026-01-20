@@ -22,10 +22,6 @@ export SYSTEMD_UTF8=0
 
 seed=750b6cd5c4ae4012a15e7be3c29e6a47
 
-if ! systemd-detect-virt --quiet --container; then
-    udevadm control --log-level debug
-fi
-
 esp_guid=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
 xbootldr_guid=BC13C2FF-59E6-4262-A352-B275FD6F7172
 
@@ -1897,6 +1893,108 @@ testcase_luks2_integrity() {
     _test_luks2_integrity "hmac-sha1"
     _test_luks2_integrity "hmac-sha256"
     _test_luks2_integrity "hmac-sha512"
+}
+
+testcase_ext_reproducibility() {
+    local defs imgs ts
+
+    # Online mode mounts the filesystem which updates inode timestamps non-deterministically
+    if [[ "$OFFLINE" != "yes" ]]; then
+        echo "Skipping ext reproducibility test in online mode."
+        return 0
+    fi
+
+    defs="$(mktemp --directory "/tmp/test-repart.defs.XXXXXXXXXX")"
+    imgs="$(mktemp --directory "/var/tmp/test-repart.imgs.XXXXXXXXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$defs' '$imgs'" RETURN
+
+    tee "$defs/root.conf" <<EOF
+[Partition]
+Type=root
+Format=ext4
+EOF
+
+    # Build the image twice with the same seed and verify they are identical
+    ts=$(date +%s)
+    env SOURCE_DATE_EPOCH="$ts" \
+        systemd-repart \
+        --offline="$OFFLINE" \
+        --definitions="$defs" \
+        --empty=create \
+        --size=50M \
+        --seed="$seed" \
+        --dry-run=no \
+        "$imgs/test1.img"
+
+    sleep 2
+
+    env SOURCE_DATE_EPOCH="$ts" \
+        systemd-repart \
+        --offline="$OFFLINE" \
+        --definitions="$defs" \
+        --empty=create \
+        --size=50M \
+        --seed="$seed" \
+        --dry-run=no \
+        "$imgs/test2.img"
+
+    cmp "$imgs/test1.img" "$imgs/test2.img"
+}
+
+testcase_luks2_keyhash() {
+    local defs imgs output root
+
+    defs="$(mktemp --directory "/tmp/test-repart.defs.XXXXXXXXXX")"
+    imgs="$(mktemp --directory "/var/tmp/test-repart.imgs.XXXXXXXXXX")"
+    root="$(mktemp --directory "/var/test-repart.root.XXXXXXXXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$defs' '$imgs' '$root'" RETURN
+    chmod 0755 "$defs"
+
+    echo "*** testcase for fixate-volume-key ***"
+
+    volume="test-repart-lukskeyhash-$RANDOM"
+
+    tee "$defs/root.conf" <<EOF
+[Partition]
+Type=linux-generic
+Format=ext4
+Encrypt=key-file
+EncryptedVolume=$volume:::fixate-volume-key
+EOF
+
+    systemd-repart --pretty=yes \
+                   --definitions "$defs" \
+                   --empty=create \
+                   --size=100M \
+                   --seed="$seed" \
+                   --dry-run=no \
+                   --offline="$OFFLINE" \
+                   --generate-crypttab="$imgs/crypttab" \
+                   "$imgs/enckeyhash.img"
+
+    loop="$(losetup -P --show --find "$imgs/enckeyhash.img")"
+    udevadm wait --timeout=60 --settle "${loop:?}p1"
+
+    touch "$imgs/empty-password"
+
+    # Check that the volume can be attached with the correct hash
+    expected_hash="$(grep UUID= "$imgs/crypttab" | sed s,.*fixate-volume-key=,,)"
+    echo "Expected hash: $expected_hash"
+    echo "Trying to attach the volume"
+    systemd-cryptsetup attach $volume "${loop}p1" "$imgs/empty-password" "fixate-volume-key=$expected_hash"
+    echo "Trying to detach the volume"
+    systemd-cryptsetup detach $volume
+    echo "Success!"
+
+    # Check that the volume cannot be attached with incorrect hash
+    echo "Trying to attach the volume with wrong hash"
+    systemd-cryptsetup attach $volume "${loop}p1" "$imgs/empty-password" "fixate-volume-key=aaaaaabbbbbbccccccddddddeeeeeeffffff1111112222223333334444445555" && exit 1
+    # Verify the volume is not attached
+    [ ! -f "/dev/mapper/$volume" ] || exit 1
+
+    losetup -d "$loop"
 }
 
 OFFLINE="yes"

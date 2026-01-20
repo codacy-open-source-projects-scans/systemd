@@ -471,7 +471,7 @@ static int partition_is_luks2_integrity(int part_fd, uint64_t offset, uint64_t s
                 return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to read LUKS JSON header.");
         json[sz] = '\0';
 
-        r = sd_json_parse(json, /* flags = */ 0, &v, /* reterr_line = */ NULL, /* reterr_column = */ NULL);
+        r = sd_json_parse(json, /* flags= */ 0, &v, /* reterr_line= */ NULL, /* reterr_column= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to parse LUKS JSON header.");
 
@@ -567,7 +567,7 @@ static int dissected_image_probe_filesystems(
                         m->encrypted = true;
 
                         if (p->mount_node_fd >= 0)
-                                r = partition_is_luks2_integrity(p->mount_node_fd, /* offset = */ 0, /* size = */ UINT64_MAX);
+                                r = partition_is_luks2_integrity(p->mount_node_fd, /* offset= */ 0, /* size= */ UINT64_MAX);
                         else
                                 r = partition_is_luks2_integrity(fd, p->offset, p->size);
                         if (r < 0)
@@ -1168,7 +1168,7 @@ static int dissect_image(
                         if (verity_settings_data_covers(verity, PARTITION_ROOT))
                                 found_flags = iovec_is_set(&verity->root_hash_sig) ? PARTITION_POLICY_SIGNED : PARTITION_POLICY_VERITY;
                         else if (encrypted) {
-                                r = partition_is_luks2_integrity(fd, /* offset = */ 0, /* size = */ UINT64_MAX);
+                                r = partition_is_luks2_integrity(fd, /* offset= */ 0, /* size= */ UINT64_MAX);
                                 if (r < 0)
                                         return r;
 
@@ -2383,7 +2383,7 @@ int partition_pick_mount_options(
 
         case PARTITION_ESP:
         case PARTITION_XBOOTLDR:
-                flags |= MS_NOSUID|MS_NOEXEC|ms_nosymfollow_supported();
+                flags |= MS_NOSUID|MS_NOEXEC|MS_NOSYMFOLLOW;
 
                 /* The ESP might contain a pre-boot random seed. Let's make this unaccessible to regular
                  * userspace. ESP/XBOOTLDR is almost certainly VFAT, hence if we don't know assume it is. */
@@ -4631,9 +4631,7 @@ int mount_options_set_and_consume(MountOptions **options, PartitionDesignator d,
                 }
         }
 
-        free_and_replace((*options)->options[d], s);
-
-        return 0;
+        return free_and_replace((*options)->options[d], s);
 }
 
 int mount_options_dup(const MountOptions *source, MountOptions **ret) {
@@ -4644,7 +4642,7 @@ int mount_options_dup(const MountOptions *source, MountOptions **ret) {
 
         options = new0(MountOptions, 1);
         if (!options)
-                return log_oom();
+                return log_oom_debug();
 
         for (PartitionDesignator d = 0; d < _PARTITION_DESIGNATOR_MAX; d++)
                 if (source->options[d]) {
@@ -4934,6 +4932,7 @@ int verity_dissect_and_mount(
                         r = mountfsd_mount_image(
                                         src_fd >= 0 ? FORMAT_PROC_FD_PATH(src_fd) : src,
                                         userns_fd,
+                                        options,
                                         image_policy,
                                         verity,
                                         dissect_image_flags,
@@ -5100,6 +5099,7 @@ static void mount_image_reply_parameters_done(MountImageReplyParameters *p) {
 int mountfsd_mount_image_fd(
                 int image_fd,
                 int userns_fd,
+                const MountOptions *options,
                 const ImagePolicy *image_policy,
                 const VeritySettings *verity,
                 DissectImageFlags flags,
@@ -5171,6 +5171,19 @@ int mountfsd_mount_image_fd(
                         return log_error_errno(r, "Failed to push verity data fd into varlink connection: %m");
         }
 
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *mount_options = NULL;
+        for (PartitionDesignator i = 0; i < _PARTITION_DESIGNATOR_MAX; i++) {
+                const char *o = mount_options_from_designator(options, i);
+                if (!o)
+                        continue;
+
+                r = sd_json_variant_merge_objectbo(
+                                &mount_options,
+                                SD_JSON_BUILD_PAIR_STRING(partition_designator_to_string(i), o));
+                if (r < 0)
+                        return log_error_errno(r, "Failed to build mount options array: %m");
+        }
+
         sd_json_variant *reply = NULL;
         r = varlink_callbo_and_log(
                         vl,
@@ -5182,6 +5195,7 @@ int mountfsd_mount_image_fd(
                         SD_JSON_BUILD_PAIR_BOOLEAN("readOnly", FLAGS_SET(flags, DISSECT_IMAGE_MOUNT_READ_ONLY)),
                         SD_JSON_BUILD_PAIR_BOOLEAN("growFileSystems", FLAGS_SET(flags, DISSECT_IMAGE_GROWFS)),
                         SD_JSON_BUILD_PAIR_CONDITION(!!ps, "imagePolicy", SD_JSON_BUILD_STRING(ps)),
+                        JSON_BUILD_PAIR_VARIANT_NON_NULL("mountOptions", mount_options),
                         SD_JSON_BUILD_PAIR_BOOLEAN("veritySharing", FLAGS_SET(flags, DISSECT_IMAGE_VERITY_SHARE)),
                         SD_JSON_BUILD_PAIR_CONDITION(verity_data_fd >= 0, "verityDataFileDescriptor", SD_JSON_BUILD_UNSIGNED(userns_fd >= 0 ? 2 : 1)),
                         SD_JSON_BUILD_PAIR_CONDITION(verity && iovec_is_set(&verity->root_hash), "verityRootHash", JSON_BUILD_IOVEC_HEX(&verity->root_hash)),
@@ -5274,6 +5288,7 @@ int mountfsd_mount_image_fd(
 int mountfsd_mount_image(
                 const char *path,
                 int userns_fd,
+                const MountOptions *options,
                 const ImagePolicy *image_policy,
                 const VeritySettings *verity,
                 DissectImageFlags flags,
@@ -5289,7 +5304,7 @@ int mountfsd_mount_image(
                 return log_error_errno(errno, "Failed to open '%s': %m", path);
 
         _cleanup_(dissected_image_unrefp) DissectedImage *di = NULL;
-        r = mountfsd_mount_image_fd(image_fd, userns_fd, image_policy, verity, flags, &di);
+        r = mountfsd_mount_image_fd(image_fd, userns_fd, options, image_policy, verity, flags, &di);
         if (r < 0)
                 return r;
 

@@ -4,6 +4,7 @@
 #include <pthread.h>
 #include <spawn.h>
 #include <stdio.h>
+#include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/personality.h>
 #include <sys/prctl.h>
@@ -20,6 +21,7 @@
 #include "alloc-util.h"
 #include "architecture.h"
 #include "argv-util.h"
+#include "capability-util.h"
 #include "cgroup-util.h"
 #include "dirent-util.h"
 #include "dlfcn-util.h"
@@ -1802,7 +1804,7 @@ int namespace_fork_full(
 
         r = pidref_safe_fork_full(
                         outer_name,
-                        /* stdio_fds = */ NULL, /* except_fds = */ NULL, /* n_except_fds = */ 0,
+                        /* stdio_fds= */ NULL, /* except_fds= */ NULL, /* n_except_fds= */ 0,
                         (flags|FORK_DEATHSIG_SIGKILL) & ~(FORK_DEATHSIG_SIGTERM|FORK_DEATHSIG_SIGINT|FORK_REOPEN_LOG|FORK_NEW_MOUNTNS|FORK_MOUNTNS_SLAVE|FORK_NEW_USERNS|FORK_NEW_NETNS|FORK_NEW_PIDNS|FORK_CLOSE_ALL_FDS|FORK_PACK_FDS|FORK_CLOEXEC_OFF|FORK_RLIMIT_NOFILE_SAFE),
                         &pidref_outer);
         if (r == -EPROTO && FLAGS_SET(flags, FORK_WAIT)) {
@@ -2119,15 +2121,14 @@ int posix_spawn_wrapper(
         if (ERRNO_IS_NOT_SUPPORTED(r) && FLAGS_SET(flags, POSIX_SPAWN_SETCGROUP) && cg_is_threaded(cgroup) > 0)
                 return -EUCLEAN; /* clone3() could also return EOPNOTSUPP if the target cgroup is in threaded mode,
                                     turn that into something recognizable */
-        if ((ERRNO_IS_NOT_SUPPORTED(r) || ERRNO_IS_PRIVILEGE(r) || r == E2BIG) &&
+        if ((ERRNO_IS_NOT_SUPPORTED(r) || ERRNO_IS_PRIVILEGE(r)) &&
             FLAGS_SET(flags, POSIX_SPAWN_SETCGROUP)) {
                 /* Compiled on a newer host, or seccomp&friends blocking clone3()? Fallback, but
                  * need to disable POSIX_SPAWN_SETCGROUP, which is what redirects to clone3().
-                 * Note that we might get E2BIG here since some kernels (e.g. 5.4) support clone3()
-                 * but not CLONE_INTO_CGROUP. */
-
-                /* CLONE_INTO_CGROUP definitely won't work, hence remember the fact so that we don't
-                 * retry every time. */
+                 * CLONE_INTO_CGROUP definitely won't work, hence remember the fact so that we don't
+                 * retry every time.
+                 * Note, CLONE_INTO_CGROUP is supported since kernel v5.7, but some architectures still
+                 * do not support clone3(). Hence, we need to keep the fallback logic for a while. */
                 have_clone_into_cgroup = false;
 
                 flags &= ~POSIX_SPAWN_SETCGROUP;
@@ -2225,6 +2226,26 @@ int proc_dir_read_pidref(DIR *d, PidRef *ret) {
 
         if (ret)
                 *ret = PIDREF_NULL;
+        return 0;
+}
+
+int safe_mlockall(int flags) {
+        int r;
+
+        /* When dealing with sensitive data, let's lock ourselves into memory. We do this only when
+         * privileged however, as otherwise the amount of lockable memory that RLIMIT_MEMLOCK grants us is
+         * frequently too low to make this work. The resource limit has no effect on CAP_IPC_LOCK processes,
+         * hence that's the capability we check for. */
+        r = have_effective_cap(CAP_IPC_LOCK);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to determine if we have CAP_IPC_LOCK: %m");
+        if (r == 0)
+                return log_debug_errno(SYNTHETIC_ERRNO(EPERM), "Lacking CAP_IPC_LOCK, skipping mlockall().");
+
+        if (mlockall(flags) < 0)
+                return log_debug_errno(errno, "Failed to call mlockall(): %m");
+
+        log_debug("Successfully called mlockall().");
         return 0;
 }
 
