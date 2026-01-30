@@ -2381,21 +2381,21 @@ evdev:input:b0003v05FEp1010*
 ######################### LACK OF MODIFIER LEDS ############################
 # This section lists keyboard which do not have their own LEDs for some
 # modifiers. Only Caps-Lock (KEYBOARD_LED_CAPSLOCK) and Num-Lock
-# (KEYBOARD_LED_CAPSLOCK) are currently handled and need their values set
+# (KEYBOARD_LED_NUMLOCK) are currently handled and need their values set
 # to "0" to indicate the absence of LED.
 #
 # Presence of a LED is implicit when the property is absent.
 
 # Apple Wireless keyboards
-evdev:input:b0005v05aCp022C*
-evdev:input:b0005v05aCp022D*
-evdev:input:b0005v05aCp022E*
-evdev:input:b0005v05aCp0239*
-evdev:input:b0005v05aCp023A*
-evdev:input:b0005v05aCp023B*
-evdev:input:b0005v05aCp0255*
-evdev:input:b0005v05aCp0256*
-evdev:input:b0005v05aCp0257*
+evdev:input:b0005v05ACp022C*
+evdev:input:b0005v05ACp022D*
+evdev:input:b0005v05ACp022E*
+evdev:input:b0005v05ACp0239*
+evdev:input:b0005v05ACp023A*
+evdev:input:b0005v05ACp023B*
+evdev:input:b0005v05ACp0255*
+evdev:input:b0005v05ACp0256*
+evdev:input:b0005v05ACp0257*
  KEYBOARD_LED_NUMLOCK=0
 
 # Logitech K750
