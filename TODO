@@ -116,10 +116,25 @@ Deprecations and removals:
 
 * Consider removing root=gpt-auto, and push people to use root=dissect instead.
 
+* remove any trace of "cpuacct" cgroup controller, it's a cgroupv1 thing.
+  similar "devices"
+
 Features:
 
-* mountfsd: when looking for non-foreign uid owned inodes up the tree, stop at
-  mounts
+* report:
+  - should the list of metrics use JSON-SEQ? or maybe be wrapped in a json
+    array (the latter might be necessary, once we sign the combination)
+  - "io.systemd.Manager.unit_active_state" is a weird mix of CamelCase and snake_case
+  - metrics from pid1: suppress metrics form units that are inactive and have nothing to report
+  - how to plug facts into this? i.e. hostname, ssh keys, and so on
+  - switch to daan's suggested hierarchy?
+
+* implement a varlink registry service, similar to the one of the reference
+  implementation, backed by /run/varlink/registry/. Then, also implement
+  connect-via-registry-resolution in sd-varlink and varlinkctl. Care needs to
+  be taken to do the resolution asynchronousy. Also, note that the Varlink
+  reference implementation uses a different address syntax, which needs to be
+  taken into account.
 
 * downgrade the uid/gid disposition enforcement in udev
 

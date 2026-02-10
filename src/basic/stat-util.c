@@ -90,6 +90,21 @@ int stat_verify_directory(const struct stat *st) {
         return 0;
 }
 
+int statx_verify_directory(const struct statx *stx) {
+        assert(stx);
+
+        if (!FLAGS_SET(stx->stx_mask, STATX_TYPE))
+                return -ENODATA;
+
+        if (S_ISLNK(stx->stx_mode))
+                return -ELOOP;
+
+        if (!S_ISDIR(stx->stx_mode))
+                return -ENOTDIR;
+
+        return 0;
+}
+
 int fd_verify_directory(int fd) {
         if (IN_SET(fd, AT_FDCWD, XAT_FDROOT))
                 return 0;
@@ -125,6 +140,21 @@ int fd_verify_symlink(int fd) {
 int is_symlink(const char *path) {
         assert(!isempty(path));
         return verify_stat_at(AT_FDCWD, path, false, stat_verify_symlink, false);
+}
+
+int stat_verify_socket(const struct stat *st) {
+        assert(st);
+
+        if (S_ISLNK(st->st_mode))
+                return -ELOOP;
+
+        if (S_ISDIR(st->st_mode))
+                return -EISDIR;
+
+        if (!S_ISSOCK(st->st_mode))
+                return -ENOTSOCK;
+
+        return 0;
 }
 
 int stat_verify_linked(const struct stat *st) {
