@@ -204,6 +204,8 @@ REQUIREMENTS:
           CONFIG_MEMCG
 
         glibc >= 2.34
+        musl >= 1.2.5 with fde29c04adbab9d5b081bf6717b5458188647f1c
+                (required when building systemd with -Dlibc=musl)
         libxcrypt >= 4.4.0 (optional)
         libmount >= 2.30 (from util-linux)
                 (util-linux *must* be built without --enable-libmount-support-mtab)
@@ -245,7 +247,7 @@ REQUIREMENTS:
         gperf
         docbook-xsl (optional, required for documentation)
         xsltproc    (optional, required for documentation)
-        python >= 3.7 (required by meson too, >= 3.9 is required for ukify)
+        python >= 3.9
         python-jinja2
         python-pefile (optional, required for ukify)
         python-lxml (optional, required to build the indices)

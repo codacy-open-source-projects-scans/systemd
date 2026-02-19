@@ -519,7 +519,7 @@ int boot_loader_read_conf(BootConfig *config, FILE *file, const char *path) {
 
                 if (streq(field, "preferred"))
                         r = free_and_strdup(&config->preferred_pattern, p);
-                if (streq(field, "default"))
+                else if (streq(field, "default"))
                         r = free_and_strdup(&config->default_pattern, p);
                 else if (STR_IN_SET(field, "timeout", "editor", "auto-entries", "auto-firmware",
                                     "auto-poweroff", "auto-reboot", "beep", "reboot-for-bitlocker",
@@ -1020,7 +1020,7 @@ static int pe_find_uki_sections(
                 }
 
                 /* Permit "masking" of sections in the base profile */
-                if (found->VirtualSize == 0)
+                if (le32toh(found->VirtualSize) == 0)
                         continue;
 
                 r = pe_read_section_data(fd, found, PE_SECTION_SIZE_MAX, (void**) t->data, /* ret_size= */ NULL);
