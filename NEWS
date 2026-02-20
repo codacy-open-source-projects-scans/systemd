@@ -32,7 +32,8 @@ CHANGES WITH 260 in spe:
           libseccomp 2.3.1 → 2.4.0,
           glibc 2.31 → 2.34,
           libxcrypt or libcrypt from glibc → libxcrypt 4.4.0 only,
-          OpenSSL 1.1.0 → 3.0.0.
+          OpenSSL 1.1.0 → 3.0.0,
+          Python 3.7.0 → 3.9.0.
 
           The Linux kernel version requirements have been updated too:
           baseline 5.4 → 5.10, recommended baseline 5.7 → 5.14, 6.6 for full
@@ -108,6 +109,16 @@ CHANGES WITH 260 in spe:
           it only supports setting the Markers= property.
 
         Changes in udev:
+
+        * Permissions for /dev/ptp* are now set to 0664 (previously 0660),
+          allowing unprivileged read-only access. This relies on the kernel fix
+          "ptp: Add PHC file mode checks. Allow RO adjtime() without
+          FMODE_WRITE." (commit b4e53b15c04e3852949003752f48f7a14ae39e86 in
+          v6.15, backported to LTS releases in v6.12.68, v6.6.122, v6.1.162,
+          v5.15.199, and v5.10.249), which adds missing PTP ioctl permission
+          checks and keeps clock-modifying operations write-restricted. Systems
+          running stable kernel branches should ensure they are updated to patch
+          levels that include the fix.
 
         * Persistent network interface naming has bee extended to MCTP devices
           with the "mc" prefix.
