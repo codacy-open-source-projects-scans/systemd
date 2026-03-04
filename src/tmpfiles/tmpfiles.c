@@ -586,9 +586,12 @@ static int opendir_and_stat(
                 return 0;
         }
 
-        r = xstatx_full(dirfd(d), /* path = */ NULL, AT_EMPTY_PATH,
+        r = xstatx_full(dirfd(d),
+                        /* path= */ NULL,
+                        AT_EMPTY_PATH,
+                        /* xstatx_flags= */ 0,
                         STATX_MODE|STATX_INO|STATX_ATIME|STATX_MTIME,
-                        /* optional_mask = */ 0,
+                        /* optional_mask= */ 0,
                         STATX_ATTR_MOUNT_ROOT,
                         &sx);
         if (r < 0)
@@ -687,6 +690,7 @@ static int dir_cleanup(
                 struct statx sx;
                 r = xstatx_full(dirfd(d), de->d_name,
                                 AT_SYMLINK_NOFOLLOW|AT_NO_AUTOMOUNT,
+                                /* xstatx_flags= */ 0,
                                 STATX_TYPE|STATX_MODE|STATX_UID,
                                 STATX_ATIME|STATX_MTIME|STATX_CTIME|STATX_BTIME,
                                 STATX_ATTR_MOUNT_ROOT,
@@ -2384,13 +2388,13 @@ static int create_symlink(Context *c, Item *i) {
                 r = chase(i->argument, arg_root, CHASE_SAFE|CHASE_PREFIX_ROOT|CHASE_NOFOLLOW, /* ret_path= */ NULL, /* ret_fd= */ NULL);
                 if (r == -ENOENT) {
                         /* Silently skip over lines where the source file is missing. */
-                        log_info("Symlink source path '%s/%s' does not exist, skipping line.",
-                                 empty_to_root(arg_root), skip_leading_slash(i->argument));
+                        log_debug_errno(r, "Symlink source path '%s/%s' does not exist, skipping line.",
+                                        strempty(arg_root), skip_leading_slash(i->argument));
                         return 0;
                 }
                 if (r < 0)
                         return log_error_errno(r, "Failed to check if symlink source path '%s/%s' exists: %m",
-                                               empty_to_root(arg_root), skip_leading_slash(i->argument));
+                                               strempty(arg_root), skip_leading_slash(i->argument));
         }
 
         r = path_extract_filename(i->path, &bn);
@@ -2633,7 +2637,7 @@ static int rm_if_wrong_type_safe(
         }
 
         /* Fail before removing anything if this is an unsafe transition. */
-        if (follow_links && unsafe_transition(parent_st, &st)) {
+        if (follow_links && stat_unsafe_transition(parent_st, &st)) {
                 (void) fd_get_path(parent_fd, &parent_name);
                 return log_error_errno(SYNTHETIC_ERRNO(ENOLINK),
                                        "Unsafe transition from \"%s\" to \"%s\".", parent_name ?: "...", name);

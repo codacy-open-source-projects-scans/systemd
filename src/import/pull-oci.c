@@ -489,7 +489,7 @@ static int oci_pull_job_on_open_disk(PullJob *j) {
                                 DISSECT_IMAGE_FOREIGN_UID,
                                 &st->tree_fd);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to mount directory via mountsd: %m");
+                        return log_error_errno(r, "Failed to mount directory via mountfsd: %m");
         } else {
                 if (i->flags & IMPORT_BTRFS_SUBVOL)
                         r = btrfs_subvol_make_fallback(AT_FDCWD, st->temp_path, 0755);
@@ -997,7 +997,7 @@ static int oci_pull_save_nspawn_settings(OciPull *i) {
                 return log_oom();
 
         _cleanup_free_ char *j = path_join(i->image_root, fn);
-        if (!fn)
+        if (!j)
                 return log_oom();
 
         _cleanup_fclose_ FILE *f = NULL;
@@ -1085,7 +1085,7 @@ static int oci_pull_save_oci_config(OciPull *i) {
                 return log_oom();
 
         _cleanup_free_ char *j = path_join(i->image_root, fn);
-        if (!fn)
+        if (!j)
                 return log_oom();
 
         _cleanup_close_ int fd = -EBADF;
@@ -1116,7 +1116,7 @@ static int oci_pull_save_mstack(OciPull *i) {
                 return log_oom();
 
         _cleanup_free_ char *j = path_join(i->image_root, dn);
-        if (!dn)
+        if (!j)
                 return log_oom();
 
         log_notice("Creating '%s'", j);

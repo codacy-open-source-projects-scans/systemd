@@ -8,6 +8,7 @@
 #include "sd-varlink-idl.h"
 
 #include "bootspec.h"
+#include "discover-image.h"
 #include "fd-util.h"
 #include "gpt.h"
 #include "json-util.h"
@@ -24,6 +25,7 @@
 #include "varlink-io.systemd.Hostname.h"
 #include "varlink-io.systemd.Import.h"
 #include "varlink-io.systemd.Journal.h"
+#include "varlink-io.systemd.JournalAccess.h"
 #include "varlink-io.systemd.Login.h"
 #include "varlink-io.systemd.Machine.h"
 #include "varlink-io.systemd.MachineImage.h"
@@ -33,6 +35,7 @@
 #include "varlink-io.systemd.MuteConsole.h"
 #include "varlink-io.systemd.NamespaceResource.h"
 #include "varlink-io.systemd.Network.h"
+#include "varlink-io.systemd.Network.Link.h"
 #include "varlink-io.systemd.PCRExtend.h"
 #include "varlink-io.systemd.PCRLock.h"
 #include "varlink-io.systemd.Repart.h"
@@ -188,6 +191,7 @@ TEST(parse_format) {
                 &vl_interface_io_systemd_Hostname,
                 &vl_interface_io_systemd_Import,
                 &vl_interface_io_systemd_Journal,
+                &vl_interface_io_systemd_JournalAccess,
                 &vl_interface_io_systemd_Login,
                 &vl_interface_io_systemd_Machine,
                 &vl_interface_io_systemd_MachineImage,
@@ -197,6 +201,7 @@ TEST(parse_format) {
                 &vl_interface_io_systemd_MuteConsole,
                 &vl_interface_io_systemd_NamespaceResource,
                 &vl_interface_io_systemd_Network,
+                &vl_interface_io_systemd_Network_Link,
                 &vl_interface_io_systemd_PCRExtend,
                 &vl_interface_io_systemd_PCRLock,
                 &vl_interface_io_systemd_Repart,
@@ -537,6 +542,9 @@ TEST(enums_idl) {
 
         TEST_IDL_ENUM(DnsOverTlsMode, dns_over_tls_mode, vl_type_DNSOverTLSMode);
         TEST_IDL_ENUM(ResolveSupport, resolve_support, vl_type_ResolveSupport);
+
+        TEST_IDL_ENUM(ImageType, image_type, vl_type_ImageType);
+        TEST_IDL_ENUM_TO_STRING(ImageType, image_type, vl_type_ImageType);
 }
 
 static SD_VARLINK_DEFINE_METHOD(

@@ -26,8 +26,8 @@ else
         project_minor_version = '0'
 endif
 
-libsystemd_version = '0.42.0'
-libudev_version = '1.7.12'
+libsystemd_version = '0.43.0'
+libudev_version = '1.7.13'
 
 conf = configuration_data()
 conf.set_quoted('PROJECT_URL', 'https://systemd.io/')
@@ -1798,7 +1798,7 @@ if conf.get('BPF_FRAMEWORK') == 1
                 ]
         endif
 
-        bpf_o_unstripped_cmd += ['-I.']
+        bpf_o_unstripped_cmd += ['-I.', '-include', 'config.h']
 
         if cc.get_id() == 'gcc' or meson.is_cross_build()
                 if cc.get_id() != 'gcc'
@@ -2777,7 +2777,7 @@ if install_tests
         install_subdir('mkosi',
                        install_dir : testsdir,
                        exclude_files : ['mkosi.local.conf', 'mkosi.key', 'mkosi.crt'],
-                       exclude_directories : ['mkosi.local'])
+                       exclude_directories : ['mkosi.local', 'mkosi.tools'])
 endif
 
 ############################################################

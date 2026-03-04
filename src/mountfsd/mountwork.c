@@ -779,6 +779,7 @@ static int vl_method_mount_image(
                         SD_JSON_BUILD_PAIR_STRING("imagePolicy", ps),
                         SD_JSON_BUILD_PAIR_UNSIGNED("imageSize", di->image_size),
                         SD_JSON_BUILD_PAIR_UNSIGNED("sectorSize", di->sector_size),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("imageName", di->image_name),
                         SD_JSON_BUILD_PAIR_CONDITION(!sd_id128_is_null(di->image_uuid), "imageUuid", SD_JSON_BUILD_UUID(di->image_uuid)));
 }
 
@@ -865,7 +866,8 @@ static DirectoryOwnership validate_directory_fd(
         r = xstatx_full(fd,
                         /* path= */ NULL,
                         AT_EMPTY_PATH,
-                        /* mandatory_mask= */ STATX_TYPE|STATX_UID|STATX_MNT_ID|STATX_INO,
+                        /* xstatx_flags= */ XSTATX_MNT_ID_BEST,
+                        /* mandatory_mask= */ STATX_TYPE|STATX_UID|STATX_INO,
                         /* optional_mask= */ 0,
                         /* mandatory_attributes= */ STATX_ATTR_MOUNT_ROOT,
                         &stx);
@@ -932,7 +934,8 @@ static DirectoryOwnership validate_directory_fd(
                 r = xstatx_full(new_parent_fd,
                                 /* path= */ NULL,
                                 AT_EMPTY_PATH,
-                                /* mandatory_mask= */ STATX_UID|STATX_MNT_ID|STATX_INO,
+                                /* xstatx_flags= */ XSTATX_MNT_ID_BEST,
+                                /* mandatory_mask= */ STATX_UID|STATX_INO,
                                 /* optional_mask= */ 0,
                                 /* mandatory_attributes= */ STATX_ATTR_MOUNT_ROOT,
                                 &new_stx);
@@ -946,7 +949,10 @@ static DirectoryOwnership validate_directory_fd(
                         return DIRECTORY_IS_OTHERWISE_OWNED;
                 }
 
-                if (stx.stx_mnt_id != new_stx.stx_mnt_id) {
+                r = statx_mount_same(&stx, &new_stx);
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to compare mount IDs: %m");
+                if (!r) {
                         /* NB, this check is probably redundant, given we also check
                          * STATX_ATTR_MOUNT_ROOT. The only reason we have it here is to provide extra safety
                          * in case the mount tree is rearranged concurrently with our traversal, so that
@@ -1208,29 +1214,59 @@ static int vl_method_mount_directory(
                 uid_t start;
 
                 if (userns_fd >= 0) {
+                        /* Load ranges without coalescing to preserve the 1:1 correspondence
+                         * between inside and outside entries */
                         _cleanup_(uid_range_freep) UIDRange *uid_range_outside = NULL, *uid_range_inside = NULL, *gid_range_outside = NULL, *gid_range_inside = NULL;
-                        r = uid_range_load_userns_by_fd(userns_fd, UID_RANGE_USERNS_OUTSIDE, &uid_range_outside);
+                        r = uid_range_load_userns_by_fd_full(userns_fd, UID_RANGE_USERNS_OUTSIDE, /* coalesce= */ false, &uid_range_outside);
                         if (r < 0)
                                 return log_debug_errno(r, "Failed to load outside UID range of provided userns: %m");
-                        r = uid_range_load_userns_by_fd(userns_fd, UID_RANGE_USERNS_INSIDE, &uid_range_inside);
+
+                        r = uid_range_load_userns_by_fd_full(userns_fd, UID_RANGE_USERNS_INSIDE, /* coalesce= */ false, &uid_range_inside);
                         if (r < 0)
                                 return log_debug_errno(r, "Failed to load inside UID range of provided userns: %m");
-                        r = uid_range_load_userns_by_fd(userns_fd, GID_RANGE_USERNS_OUTSIDE, &gid_range_outside);
+
+                        r = uid_range_load_userns_by_fd_full(userns_fd, GID_RANGE_USERNS_OUTSIDE, /* coalesce= */ false, &gid_range_outside);
                         if (r < 0)
                                 return log_debug_errno(r, "Failed to load outside GID range of provided userns: %m");
-                        r = uid_range_load_userns_by_fd(userns_fd, GID_RANGE_USERNS_INSIDE, &gid_range_inside);
+
+                        r = uid_range_load_userns_by_fd_full(userns_fd, GID_RANGE_USERNS_INSIDE, /* coalesce= */ false, &gid_range_inside);
                         if (r < 0)
                                 return log_debug_errno(r, "Failed to load inside GID range of provided userns: %m");
 
-                        /* Be very strict for now */
+                        /* UID and GID mappings must match */
                         if (!uid_range_equal(uid_range_outside, gid_range_outside) ||
-                            !uid_range_equal(uid_range_inside, gid_range_inside) ||
-                            uid_range_outside->n_entries != 1 ||
-                            uid_range_outside->entries[0].nr != 0x10000 ||
-                            uid_range_inside->n_entries != 1 ||
-                            uid_range_inside->entries[0].start != 0 ||
-                            uid_range_inside->entries[0].nr != 0x10000)
+                            !uid_range_equal(uid_range_inside, gid_range_inside))
                                 return sd_varlink_error_invalid_parameter_name(link, "userNamespaceFileDescriptor");
+
+                        /* Must have at least one entry, and inside/outside must have matching entry counts */
+                        if (uid_range_is_empty(uid_range_outside) ||
+                            uid_range_outside->n_entries != uid_range_inside->n_entries)
+                                return sd_varlink_error_invalid_parameter_name(link, "userNamespaceFileDescriptor");
+
+                        /* The first range must be a root UID in the transient range (i.e. aligned
+                         * to a 64K boundary) and mapped to 0 inside the user namespace (size 65536) */
+                        if (!uid_is_transient(uid_range_outside->entries[0].start) ||
+                            (uid_range_outside->entries[0].start & 0xFFFFU) != 0 ||
+                            uid_range_outside->entries[0].nr != NSRESOURCE_UIDS_64K ||
+                            uid_range_inside->entries[0].start != 0 ||
+                            uid_range_inside->entries[0].nr != NSRESOURCE_UIDS_64K)
+                                return sd_varlink_error_invalid_parameter_name(link, "userNamespaceFileDescriptor");
+
+                        /* All remaining entries must also be root UIDs in the transient range and
+                         * mapped 1:1, which identifies them as delegated ranges. The last entry
+                         * may also be the root UID in the foreign UID range. */
+                        for (size_t i = 1; i < uid_range_outside->n_entries; i++) {
+                                bool is_last = i + 1 == uid_range_outside->n_entries;
+                                uid_t entry_start = uid_range_outside->entries[i].start;
+
+                                if (!(uid_is_transient(entry_start) ||
+                                      (is_last && uid_is_foreign(entry_start))) ||
+                                    (entry_start & 0xFFFFU) != 0 ||
+                                    uid_range_outside->entries[i].nr != NSRESOURCE_UIDS_64K ||
+                                    uid_range_outside->entries[i].start != uid_range_inside->entries[i].start ||
+                                    uid_range_outside->entries[i].nr != uid_range_inside->entries[i].nr)
+                                        return sd_varlink_error_invalid_parameter_name(link, "userNamespaceFileDescriptor");
+                        }
 
                         start = uid_range_outside->entries[0].start;
                 } else

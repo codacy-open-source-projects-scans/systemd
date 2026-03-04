@@ -2089,7 +2089,7 @@ static int build_environment(
 
         /* If this is D-Bus, tell the nss-systemd module, since it relies on being able to use blocking
          * Varlink calls back to us for look up dynamic users in PID 1. Break the deadlock between D-Bus and
-         * PID 1 by disabling use of PID1' NSS interface for looking up dynamic users. */
+         * PID 1 by disabling use of PID1's NSS interface for looking up dynamic users. */
         if (p->flags & EXEC_NSS_DYNAMIC_BYPASS) {
                 r = strv_extend_with_size(&e, &n, "SYSTEMD_NSS_DYNAMIC_BYPASS=1");
                 if (r < 0)
@@ -2097,8 +2097,8 @@ static int build_environment(
         }
 
         /* We query "root" if this is a system unit and User= is not specified. $USER is always set. $HOME
-         * could cause problem for e.g. getty, since login doesn't override $HOME, and $LOGNAME and $SHELL don't
-         * really make much sense since we're not logged in. Hence we conditionalize the three based on
+         * could cause problem for e.g. getty, since login doesn't override $HOME, and $LOGNAME and $SHELL
+         * don't really make much sense since we're not logged in. Hence we conditionalize the three based on
          * SetLoginEnvironment= switch. */
         if (!username && !c->dynamic_user && p->runtime_scope == RUNTIME_SCOPE_SYSTEM) {
                 assert(!c->user);
@@ -2248,10 +2248,8 @@ static int build_environment(
         }
 
         assert(c->private_var_tmp >= 0 && c->private_var_tmp < _PRIVATE_TMP_MAX);
-        if (needs_sandboxing && c->private_tmp != c->private_var_tmp) {
-                assert(c->private_tmp == PRIVATE_TMP_DISCONNECTED);
-                assert(c->private_var_tmp == PRIVATE_TMP_NO);
-
+        if (needs_sandboxing &&
+            c->private_var_tmp == PRIVATE_TMP_NO && c->private_tmp != PRIVATE_TMP_NO) {
                 /* When private tmpfs is enabled only on /tmp/, then explicitly set $TMPDIR to suggest the
                  * service to use /tmp/. */
 
@@ -3907,14 +3905,16 @@ static int apply_mount_namespace(
         if (needs_sandboxing) {
                 /* The runtime struct only contains the parent of the private /tmp, which is non-accessible
                  * to world users. Inside of it there's a /tmp that is sticky, and that's the one we want to
-                 * use here.  This does not apply when we are using /run/systemd/empty as fallback. */
+                 * use here. This does not apply when we are using /run/systemd/empty as fallback. */
 
                 if (context->private_tmp == PRIVATE_TMP_CONNECTED && runtime->shared) {
                         if (streq_ptr(runtime->shared->tmp_dir, RUN_SYSTEMD_EMPTY))
                                 tmp_dir = runtime->shared->tmp_dir;
                         else if (runtime->shared->tmp_dir)
                                 tmp_dir = strjoina(runtime->shared->tmp_dir, "/tmp");
+                }
 
+                if (context->private_var_tmp == PRIVATE_TMP_CONNECTED && runtime->shared) {
                         if (streq_ptr(runtime->shared->var_tmp_dir, RUN_SYSTEMD_EMPTY))
                                 var_tmp_dir = runtime->shared->var_tmp_dir;
                         else if (runtime->shared->var_tmp_dir)
@@ -4274,71 +4274,48 @@ out:
         return r;
 }
 
-static void append_socket_pair(int *array, size_t *n, const int pair[static 2]) {
-        assert(array);
-        assert(n);
-        assert(pair);
+#define FD_PAIR_CONDITION(cond, pair)                           \
+        (cond) ? pair[0] : -EBADF, (cond) ? pair[1] : -EBADF
 
-        if (pair[0] >= 0)
-                array[(*n)++] = pair[0];
-        if (pair[1] >= 0)
-                array[(*n)++] = pair[1];
-}
+#define FD_PAIR(pair) FD_PAIR_CONDITION(true, pair)
 
 static int close_remaining_fds(
                 const ExecParameters *params,
                 const ExecRuntime *runtime,
                 int socket_fd,
-                const int *fds,
+                const int fds[],
                 size_t n_fds) {
-
-        size_t n_dont_close = 0;
-        int dont_close[n_fds + 17];
 
         assert(params);
         assert(runtime);
+        assert(fds || n_fds == 0);
 
-        if (params->stdin_fd >= 0)
-                dont_close[n_dont_close++] = params->stdin_fd;
-        if (params->stdout_fd >= 0)
-                dont_close[n_dont_close++] = params->stdout_fd;
-        if (params->stderr_fd >= 0)
-                dont_close[n_dont_close++] = params->stderr_fd;
+        /* fds listed here shall be closed before second close_all_fds() call to avoid double close! */
+        int static_fds[] = {
+                params->stdin_fd, params->stdout_fd, params->stderr_fd,
+                socket_fd,
+                FD_PAIR(runtime->ephemeral_storage_socket),
+                FD_PAIR_CONDITION(runtime->shared, runtime->shared->userns_storage_socket),
+                FD_PAIR_CONDITION(runtime->shared, runtime->shared->netns_storage_socket),
+                FD_PAIR_CONDITION(runtime->shared, runtime->shared->ipcns_storage_socket),
+                FD_PAIR_CONDITION(runtime->dynamic_creds && runtime->dynamic_creds->user,
+                                  runtime->dynamic_creds->user->storage_socket),
+                FD_PAIR_CONDITION(runtime->dynamic_creds && runtime->dynamic_creds->group,
+                                  runtime->dynamic_creds->group->storage_socket),
+                params->user_lookup_fd,
+                params->pidref_transport_fd,
+        };
 
-        if (socket_fd >= 0)
-                dont_close[n_dont_close++] = socket_fd;
+        _cleanup_free_ int *accum_fds = NULL;
         if (n_fds > 0) {
-                memcpy(dont_close + n_dont_close, fds, sizeof(int) * n_fds);
-                n_dont_close += n_fds;
+                accum_fds = new(int, ELEMENTSOF(static_fds) + n_fds);
+                if (!accum_fds)
+                        return -ENOMEM;
+
+                memcpy(mempcpy_typesafe(accum_fds, static_fds, ELEMENTSOF(static_fds)), fds, sizeof(int) * n_fds);
         }
 
-        append_socket_pair(dont_close, &n_dont_close, runtime->ephemeral_storage_socket);
-
-        if (runtime->shared) {
-                append_socket_pair(dont_close, &n_dont_close, runtime->shared->userns_storage_socket);
-                append_socket_pair(dont_close, &n_dont_close, runtime->shared->netns_storage_socket);
-                append_socket_pair(dont_close, &n_dont_close, runtime->shared->ipcns_storage_socket);
-        }
-
-        if (runtime->dynamic_creds) {
-                if (runtime->dynamic_creds->user)
-                        append_socket_pair(dont_close, &n_dont_close, runtime->dynamic_creds->user->storage_socket);
-                if (runtime->dynamic_creds->group)
-                        append_socket_pair(dont_close, &n_dont_close, runtime->dynamic_creds->group->storage_socket);
-        }
-
-        if (params->user_lookup_fd >= 0)
-                dont_close[n_dont_close++] = params->user_lookup_fd;
-
-        if (params->handoff_timestamp_fd >= 0)
-                dont_close[n_dont_close++] = params->handoff_timestamp_fd;
-
-        if (params->pidref_transport_fd >= 0)
-                dont_close[n_dont_close++] = params->pidref_transport_fd;
-
-        assert(n_dont_close <= ELEMENTSOF(dont_close));
-
-        return close_all_fds(dont_close, n_dont_close);
+        return close_all_fds(accum_fds ?: static_fds, ELEMENTSOF(static_fds) + n_fds);
 }
 
 static int send_user_lookup(
@@ -4624,7 +4601,7 @@ static bool exec_needs_cap_sys_admin(const ExecContext *context, const ExecParam
                 return false;
 
         return context->private_users != PRIVATE_USERS_NO ||
-               context->private_tmp != PRIVATE_TMP_NO ||
+               context->private_tmp != PRIVATE_TMP_NO || /* no need to check for private_var_tmp here, private_tmp is never demoted to "no" */
                context->private_devices ||
                context->private_network ||
                context->user_namespace_path ||
@@ -4833,7 +4810,7 @@ static int setup_delegated_namespaces(
 
         /* If PrivatePIDs= yes is configured, we're now running as pid 1 in a pid namespace! */
 
-        if (exec_needs_mount_namespace(context, params, runtime) &&
+        if (exec_needs_mount_namespace(context, params) &&
             exec_namespace_is_delegated(context, params, have_cap_sys_admin, CLONE_NEWNS) == delegate) {
                 _cleanup_free_ char *error_path = NULL;
 
@@ -5829,7 +5806,7 @@ int exec_invoke(
                         return log_error_errno(r, "Failed to connect to nsresourced: %m");
         }
 
-        needs_mount_namespace = exec_needs_mount_namespace(context, params, runtime);
+        needs_mount_namespace = exec_needs_mount_namespace(context, params);
 
         for (ExecDirectoryType dt = 0; dt < _EXEC_DIRECTORY_TYPE_MAX; dt++) {
                 r = setup_exec_directory(context, params, uid, gid, dt, needs_mount_namespace, exit_status);
@@ -6191,6 +6168,8 @@ int exec_invoke(
 
         /* Kill unnecessary process, for the case that e.g. when the bpffs mount point is hidden. */
         pidref_done_sigkill_wait(&bpffs_pidref);
+        bpffs_socket_fd = safe_close(bpffs_socket_fd);
+        bpffs_errno_pipe = safe_close(bpffs_errno_pipe);
 
         if (needs_sandboxing && exec_needs_cgroup_namespace(context) && params->cgroup_path) {
                 /* Move ourselves into the subcgroup now *after* we've unshared the cgroup namespace, which
@@ -6267,6 +6246,7 @@ int exec_invoke(
          * them open until the final execve(). But first, close the remaining sockets in the context
          * objects. */
 
+        socket_fd = safe_close(socket_fd);
         exec_runtime_close(runtime);
         exec_params_close(params);
 

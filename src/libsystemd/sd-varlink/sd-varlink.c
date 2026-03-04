@@ -280,7 +280,7 @@ _public_ int sd_varlink_connect_exec(sd_varlink **ret, const char *_command, cha
                 }
 
                 execvp(command, argv);
-                log_debug_errno(r, "Failed to invoke process '%s': %m", command);
+                log_debug_errno(errno, "Failed to invoke process '%s': %m", command);
                 _exit(EXIT_FAILURE);
         }
 
@@ -2785,7 +2785,7 @@ _public_ int sd_varlink_error_invalid_parameter(sd_varlink *v, sd_json_variant *
         if (sd_json_variant_is_string(parameters)) {
                 _cleanup_(sd_json_variant_unrefp) sd_json_variant *parameters_obj = NULL;
 
-                r = sd_json_buildo(&parameters_obj,SD_JSON_BUILD_PAIR_VARIANT("parameter", parameters));
+                r = sd_json_buildo(&parameters_obj, SD_JSON_BUILD_PAIR_VARIANT("parameter", parameters));
                 if (r < 0)
                         return r;
 
@@ -4055,8 +4055,10 @@ _public_ int sd_varlink_server_shutdown(sd_varlink_server *s) {
 static void varlink_server_test_exit_on_idle(sd_varlink_server *s) {
         assert(s);
 
-        if (s->exit_on_idle && s->event && s->n_connections == 0)
+        if (s->exit_on_idle && s->event && s->n_connections == 0) {
+                varlink_server_log(s, "Exit-on-idle triggered.");
                 (void) sd_event_exit(s->event, 0);
+        }
 }
 
 _public_ int sd_varlink_server_set_exit_on_idle(sd_varlink_server *s, int b) {

@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "bus-polkit.h"
 #include "varlink-io.systemd.Network.h"
 
 /* Helper macro to define address fields with both binary and string representation */
@@ -533,8 +532,8 @@ static SD_VARLINK_DEFINE_STRUCT_TYPE(
                 SD_VARLINK_DEFINE_FIELD(DHCPv4Client, SD_VARLINK_OBJECT, SD_VARLINK_NULLABLE),
                 SD_VARLINK_FIELD_COMMENT("DHCPv6 client configuration and lease information"),
                 SD_VARLINK_DEFINE_FIELD_BY_TYPE(DHCPv6Client, DHCPv6Client, SD_VARLINK_NULLABLE),
-                SD_VARLINK_FIELD_COMMENT("LLDP neighbors discovered on this interface"),
-                SD_VARLINK_DEFINE_FIELD_BY_TYPE(LLDP, LLDPNeighbor, SD_VARLINK_ARRAY|SD_VARLINK_NULLABLE));
+                SD_VARLINK_FIELD_COMMENT("LLDP transmit configuration for this interface"),
+                SD_VARLINK_DEFINE_FIELD_BY_TYPE(LLDP, LLDPNeighbor, SD_VARLINK_NULLABLE));
 
 static SD_VARLINK_DEFINE_METHOD(
                 Describe,
@@ -594,22 +593,6 @@ static SD_VARLINK_DEFINE_METHOD(
                 SD_VARLINK_FIELD_COMMENT("Whether persistent storage is ready and writable"),
                 SD_VARLINK_DEFINE_INPUT(Ready, SD_VARLINK_BOOL, 0));
 
-static SD_VARLINK_DEFINE_METHOD(
-                LinkUp,
-                SD_VARLINK_FIELD_COMMENT("Index of the interface. If specified together with InterfaceName, both must reference the same link."),
-                SD_VARLINK_DEFINE_INPUT(InterfaceIndex, SD_VARLINK_INT, SD_VARLINK_NULLABLE),
-                SD_VARLINK_FIELD_COMMENT("Name of the interface. If specified together with InterfaceIndex, both must reference the same link."),
-                SD_VARLINK_DEFINE_INPUT(InterfaceName, SD_VARLINK_STRING, SD_VARLINK_NULLABLE),
-                VARLINK_DEFINE_POLKIT_INPUT);
-
-static SD_VARLINK_DEFINE_METHOD(
-                LinkDown,
-                SD_VARLINK_FIELD_COMMENT("Index of the interface. If specified together with InterfaceName, both must reference the same link."),
-                SD_VARLINK_DEFINE_INPUT(InterfaceIndex, SD_VARLINK_INT, SD_VARLINK_NULLABLE),
-                SD_VARLINK_FIELD_COMMENT("Name of the interface. If specified together with InterfaceIndex, both must reference the same link."),
-                SD_VARLINK_DEFINE_INPUT(InterfaceName, SD_VARLINK_STRING, SD_VARLINK_NULLABLE),
-                VARLINK_DEFINE_POLKIT_INPUT);
-
 static SD_VARLINK_DEFINE_ERROR(StorageReadOnly);
 
 SD_VARLINK_DEFINE_INTERFACE(
@@ -620,10 +603,6 @@ SD_VARLINK_DEFINE_INTERFACE(
                 &vl_method_GetNamespaceId,
                 &vl_method_GetLLDPNeighbors,
                 &vl_method_SetPersistentStorage,
-                SD_VARLINK_SYMBOL_COMMENT("Bring the specified link up."),
-                &vl_method_LinkUp,
-                SD_VARLINK_SYMBOL_COMMENT("Bring the specified link down."),
-                &vl_method_LinkDown,
                 &vl_type_Address,
                 &vl_type_DHCPLease,
                 &vl_type_DHCPServer,
