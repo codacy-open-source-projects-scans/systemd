@@ -2785,15 +2785,15 @@ static int make_pcrlock_record(
 
                 r = sd_json_variant_append_arraybo(
                                 &digests,
-                                SD_JSON_BUILD_PAIR("hashAlg", SD_JSON_BUILD_STRING(a)),
+                                SD_JSON_BUILD_PAIR_STRING("hashAlg", a),
                                 SD_JSON_BUILD_PAIR("digest", SD_JSON_BUILD_HEX(hash, hash_usize)));
                 if (r < 0)
                         return log_error_errno(r, "Failed to build JSON digest object: %m");
         }
 
         r = sd_json_buildo(ret_record,
-                           SD_JSON_BUILD_PAIR("pcr", SD_JSON_BUILD_UNSIGNED(pcr)),
-                           SD_JSON_BUILD_PAIR("digests", SD_JSON_BUILD_VARIANT(digests)));
+                           SD_JSON_BUILD_PAIR_UNSIGNED("pcr", pcr),
+                           SD_JSON_BUILD_PAIR_VARIANT("digests", digests));
         if (r < 0)
                 return log_error_errno(r, "Failed to build record object: %m");
 
@@ -2867,7 +2867,7 @@ static int make_pcrlock_record_from_stream(
 
                 r = sd_json_variant_append_arraybo(
                                 &digests,
-                                SD_JSON_BUILD_PAIR("hashAlg", SD_JSON_BUILD_STRING(a)),
+                                SD_JSON_BUILD_PAIR_STRING("hashAlg", a),
                                 SD_JSON_BUILD_PAIR("digest", SD_JSON_BUILD_HEX(hash, hash_usize)));
                 if (r < 0)
                         return log_error_errno(r, "Failed to build JSON digest object: %m");
@@ -2881,8 +2881,8 @@ static int make_pcrlock_record_from_stream(
 
                 r = sd_json_buildo(
                                 &record,
-                                SD_JSON_BUILD_PAIR("pcr", SD_JSON_BUILD_UNSIGNED(i)),
-                                SD_JSON_BUILD_PAIR("digests", SD_JSON_BUILD_VARIANT(digests)));
+                                SD_JSON_BUILD_PAIR_UNSIGNED("pcr", i),
+                                SD_JSON_BUILD_PAIR_VARIANT("digests", digests));
                 if (r < 0)
                         return log_error_errno(r, "Failed to build record object: %m");
 
@@ -2914,7 +2914,7 @@ static int write_pcrlock(sd_json_variant *array, const char *default_pcrlock_pat
 
         r = sd_json_buildo(
                         &v,
-                        SD_JSON_BUILD_PAIR("records", SD_JSON_BUILD_VARIANT(array)));
+                        SD_JSON_BUILD_PAIR_VARIANT("records", array));
         if (r < 0)
                 return log_error_errno(r, "Failed to build JSON object: %m");
 
@@ -3238,7 +3238,7 @@ static int verb_lock_secureboot_authority(int argc, char *argv[], void *userdata
                 LIST_FOREACH(banks, bank, rec->banks) {
                         r = sd_json_variant_append_arraybo(
                                         &digests,
-                                        SD_JSON_BUILD_PAIR("hashAlg", SD_JSON_BUILD_STRING(tpm2_hash_alg_to_string(bank->algorithm))),
+                                        SD_JSON_BUILD_PAIR_STRING("hashAlg", tpm2_hash_alg_to_string(bank->algorithm)),
                                         SD_JSON_BUILD_PAIR("digest", SD_JSON_BUILD_HEX(bank->hash.buffer, bank->hash.size)));
                         if (r < 0)
                                 return log_error_errno(r, "Failed to build digests array: %m");
@@ -3246,8 +3246,8 @@ static int verb_lock_secureboot_authority(int argc, char *argv[], void *userdata
 
                 r = sd_json_variant_append_arraybo(
                                 &array,
-                                SD_JSON_BUILD_PAIR("pcr", SD_JSON_BUILD_UNSIGNED(rec->pcr)),
-                                SD_JSON_BUILD_PAIR("digests", SD_JSON_BUILD_VARIANT(digests)));
+                                SD_JSON_BUILD_PAIR_UNSIGNED("pcr", rec->pcr),
+                                SD_JSON_BUILD_PAIR_VARIANT("digests", digests));
                 if (r < 0)
                         return log_error_errno(r, "Failed to build record array: %m");
         }
@@ -3529,7 +3529,7 @@ static int verb_lock_firmware(int argc, char *argv[], void *userdata) {
                 LIST_FOREACH(banks, bank, rec->banks) {
                         r = sd_json_variant_append_arraybo(
                                         &digests,
-                                        SD_JSON_BUILD_PAIR("hashAlg", SD_JSON_BUILD_STRING(tpm2_hash_alg_to_string(bank->algorithm))),
+                                        SD_JSON_BUILD_PAIR_STRING("hashAlg", tpm2_hash_alg_to_string(bank->algorithm)),
                                         SD_JSON_BUILD_PAIR("digest", SD_JSON_BUILD_HEX(bank->hash.buffer, bank->hash.size)));
                         if (r < 0)
                                 return log_error_errno(r, "Failed to build digests array: %m");
@@ -3537,8 +3537,8 @@ static int verb_lock_firmware(int argc, char *argv[], void *userdata) {
 
                 r = sd_json_variant_append_arraybo(
                                 FLAGS_SET(separator_seen_mask, bit) ? &array_late : &array_early,
-                                SD_JSON_BUILD_PAIR("pcr", SD_JSON_BUILD_UNSIGNED(rec->pcr)),
-                                SD_JSON_BUILD_PAIR("digests", SD_JSON_BUILD_VARIANT(digests)));
+                                SD_JSON_BUILD_PAIR_UNSIGNED("pcr", rec->pcr),
+                                SD_JSON_BUILD_PAIR_VARIANT("digests", digests));
                 if (r < 0)
                         return log_error_errno(r, "Failed to build record array: %m");
         }
@@ -3748,7 +3748,7 @@ static int verb_lock_pe(int argc, char *argv[], void *userdata) {
 
                         r = sd_json_variant_append_arraybo(
                                         &digests,
-                                        SD_JSON_BUILD_PAIR("hashAlg", SD_JSON_BUILD_STRING(a)),
+                                        SD_JSON_BUILD_PAIR_STRING("hashAlg", a),
                                         SD_JSON_BUILD_PAIR("digest", SD_JSON_BUILD_HEX(hash, hash_size)));
                         if (r < 0)
                                 return log_error_errno(r, "Failed to build JSON digest object: %m");
@@ -3756,8 +3756,8 @@ static int verb_lock_pe(int argc, char *argv[], void *userdata) {
 
                 r = sd_json_variant_append_arraybo(
                                 &array,
-                                SD_JSON_BUILD_PAIR("pcr", SD_JSON_BUILD_UNSIGNED(i)),
-                                SD_JSON_BUILD_PAIR("digests", SD_JSON_BUILD_VARIANT(digests)));
+                                SD_JSON_BUILD_PAIR_UNSIGNED("pcr", i),
+                                SD_JSON_BUILD_PAIR_VARIANT("digests", digests));
                 if (r < 0)
                         return log_error_errno(r, "Failed to append record object: %m");
         }
@@ -3804,7 +3804,7 @@ static int verb_lock_uki(int argc, char *argv[], void *userdata) {
 
                 r = sd_json_variant_append_arraybo(
                                 &pe_digests,
-                                SD_JSON_BUILD_PAIR("hashAlg", SD_JSON_BUILD_STRING(a)),
+                                SD_JSON_BUILD_PAIR_STRING("hashAlg", a),
                                 SD_JSON_BUILD_PAIR("digest", SD_JSON_BUILD_HEX(peh, hash_sizes[i])));
                 if (r < 0)
                         return log_error_errno(r, "Failed to build JSON digest object: %m");
@@ -3816,8 +3816,8 @@ static int verb_lock_uki(int argc, char *argv[], void *userdata) {
 
         r = sd_json_variant_append_arraybo(
                         &array,
-                        SD_JSON_BUILD_PAIR("pcr", SD_JSON_BUILD_UNSIGNED(TPM2_PCR_BOOT_LOADER_CODE)),
-                        SD_JSON_BUILD_PAIR("digests", SD_JSON_BUILD_VARIANT(pe_digests)));
+                        SD_JSON_BUILD_PAIR_UNSIGNED("pcr", TPM2_PCR_BOOT_LOADER_CODE),
+                        SD_JSON_BUILD_PAIR_VARIANT("digests", pe_digests));
         if (r < 0)
                 return log_error_errno(r, "Failed to append record object: %m");
 
@@ -3839,7 +3839,7 @@ static int verb_lock_uki(int argc, char *argv[], void *userdata) {
 
                         r = sd_json_variant_append_arraybo(
                                         &section_digests,
-                                        SD_JSON_BUILD_PAIR("hashAlg", SD_JSON_BUILD_STRING(a)),
+                                        SD_JSON_BUILD_PAIR_STRING("hashAlg", a),
                                         SD_JSON_BUILD_PAIR("digest", SD_JSON_BUILD_HEX(hash, hash_sizes[i])));
                         if (r < 0)
                                 return log_error_errno(r, "Failed to build JSON digest object: %m");
@@ -3860,8 +3860,8 @@ static int verb_lock_uki(int argc, char *argv[], void *userdata) {
                 /* And then append a record for the section contents digests as well */
                 r = sd_json_variant_append_arraybo(
                                 &array,
-                                SD_JSON_BUILD_PAIR("pcr", SD_JSON_BUILD_UNSIGNED(TPM2_PCR_KERNEL_BOOT /* =11 */)),
-                                SD_JSON_BUILD_PAIR("digests", SD_JSON_BUILD_VARIANT(section_digests)));
+                                SD_JSON_BUILD_PAIR_UNSIGNED("pcr", TPM2_PCR_KERNEL_BOOT),
+                                SD_JSON_BUILD_PAIR_VARIANT("digests", section_digests));
                 if (r < 0)
                         return log_error_errno(r, "Failed to append record object: %m");
         }
@@ -4004,8 +4004,7 @@ static int pcr_prediction_add_result(
                 Tpm2PCRPrediction *context,
                 Tpm2PCRPredictionResult *result,
                 uint32_t pcr,
-                const char *path,
-                size_t offset) {
+                const char *path) {
 
         _cleanup_free_ Tpm2PCRPredictionResult *copy = NULL;
         int r;
@@ -4040,18 +4039,11 @@ static const EVP_MD* evp_from_tpm2_alg(uint16_t alg) {
 }
 
 static int event_log_component_variant_calculate(
-                Tpm2PCRPrediction *context,
                 Tpm2PCRPredictionResult *result,
-                EventLogComponent *component,
                 EventLogComponentVariant *variant,
-                uint32_t pcr,
-                const char *path) {
+                uint32_t pcr) {
 
-        int r;
-
-        assert(context);
         assert(result);
-        assert(component);
         assert(variant);
 
         FOREACH_ARRAY(rr, variant->records, variant->n_records) {
@@ -4107,13 +4099,6 @@ static int event_log_component_variant_calculate(
 
                         assert(l == (unsigned) sz);
                 }
-
-                /* This is a valid result once we hit the start location */
-                if (arg_location_start && strcmp(component->id, arg_location_start) >= 0) {
-                        r = pcr_prediction_add_result(context, result, pcr, path, rr - variant->records);
-                        if (r < 0)
-                                return r;
-                }
         }
 
         return 0;
@@ -4137,7 +4122,7 @@ static int event_log_predict_pcrs(
         /* Check if we reached the end of the components, generate a result, and backtrack */
         if (component_index >= el->n_components ||
             (arg_location_end && strcmp(el->components[component_index]->id, arg_location_end) > 0)) {
-                r = pcr_prediction_add_result(context, parent_result, pcr, path, /* offset= */ 0);
+                r = pcr_prediction_add_result(context, parent_result, pcr, path);
                 if (r < 0)
                         return r;
 
@@ -4145,6 +4130,13 @@ static int event_log_predict_pcrs(
         }
 
         component = ASSERT_PTR(el->components[component_index]);
+
+        /* Check if we are just about to process a component after start, if so record a result and continue. */
+        if (arg_location_start && strcmp(component->id, arg_location_start) > 0) {
+                r = pcr_prediction_add_result(context, parent_result, pcr, path);
+                if (r < 0)
+                        return r;
+        }
 
         FOREACH_ARRAY(ii, component->variants, component->n_variants) {
                 _cleanup_free_ Tpm2PCRPredictionResult *result = NULL;
@@ -4169,12 +4161,9 @@ static int event_log_predict_pcrs(
                         return log_oom();
 
                 r = event_log_component_variant_calculate(
-                                context,
                                 result,
-                                component,
                                 variant,
-                                pcr,
-                                subpath);
+                                pcr);
                 if (r < 0)
                         return r;
 
