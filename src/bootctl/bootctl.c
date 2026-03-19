@@ -117,7 +117,7 @@ int acquire_esp(
          * we simply eat up the error here, so that --list and --status work too, without noise about
          * this). */
 
-        r = find_esp_and_warn(arg_root, arg_esp_path, unprivileged_mode, &np, ret_part, ret_pstart, ret_psize, ret_uuid, ret_devid);
+        r = find_esp_and_warn_full(arg_root, arg_esp_path, unprivileged_mode, &np, ret_part, ret_pstart, ret_psize, ret_uuid, ret_devid);
         if (r == -ENOKEY) {
                 if (graceful)
                         return log_full_errno(arg_quiet ? LOG_DEBUG : LOG_INFO, r,
@@ -144,7 +144,7 @@ int acquire_xbootldr(
         char *np;
         int r;
 
-        r = find_xbootldr_and_warn(arg_root, arg_xbootldr_path, unprivileged_mode, &np, ret_uuid, ret_devid);
+        r = find_xbootldr_and_warn_full(arg_root, arg_xbootldr_path, unprivileged_mode, &np, ret_uuid, ret_devid);
         if (r == -ENOKEY || path_equal(np, arg_esp_path)) {
                 log_debug("Didn't find an XBOOTLDR partition, using the ESP as $BOOT.");
                 arg_xbootldr_path = mfree(arg_xbootldr_path);
@@ -244,7 +244,7 @@ GracefulMode arg_graceful(void) {
         return _arg_graceful;
 }
 
-static int help(int argc, char *argv[], void *userdata) {
+static int help(void) {
         _cleanup_free_ char *link = NULL;
         int r;
 
@@ -355,6 +355,10 @@ static int help(int argc, char *argv[], void *userdata) {
         return 0;
 }
 
+static int verb_help(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        return help();
+}
+
 static int parse_argv(int argc, char *argv[]) {
         enum {
                 ARG_ESP_PATH = 0x100,
@@ -432,8 +436,7 @@ static int parse_argv(int argc, char *argv[]) {
                 switch (c) {
 
                 case 'h':
-                        help(0, NULL, NULL);
-                        return 0;
+                        return help();
 
                 case ARG_VERSION:
                         return version();
@@ -672,7 +675,7 @@ static int parse_argv(int argc, char *argv[]) {
 
 static int bootctl_main(int argc, char *argv[]) {
         static const Verb verbs[] = {
-                { "help",                VERB_ANY, VERB_ANY, 0,            help                     },
+                { "help",                VERB_ANY, VERB_ANY, 0,            verb_help                },
                 { "status",              VERB_ANY, 1,        VERB_DEFAULT, verb_status              },
                 { "install",             VERB_ANY, 1,        0,            verb_install             },
                 { "update",              VERB_ANY, 1,        0,            verb_install             },
