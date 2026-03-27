@@ -906,6 +906,7 @@ foreach option : ['adm-gid',
                   'video-gid',
                   'wheel-gid',
                   'systemd-journal-gid',
+                  'systemd-imds-uid',
                   'systemd-network-uid',
                   'systemd-resolve-uid',
                   'systemd-timesync-uid']
@@ -1538,6 +1539,12 @@ endif
 conf.set('DEFAULT_DNSSEC_MODE',
          'DNSSEC_' + default_dnssec.underscorify().to_upper())
 conf.set_quoted('DEFAULT_DNSSEC_MODE_STR', default_dnssec)
+
+have = get_option('imds').require(
+        conf.get('HAVE_LIBCURL') == 1,
+        error_message : 'curl required').allowed()
+conf.set10('ENABLE_IMDS', have)
+conf.set('IMDS_NETWORK_DEFAULT', 'IMDS_NETWORK_@0@'.format(get_option('imds-network')).to_upper())
 
 have = get_option('importd').require(
         conf.get('HAVE_LIBCURL') == 1 and
@@ -2375,6 +2382,7 @@ subdir('src/hostname')
 subdir('src/hwdb')
 subdir('src/id128')
 subdir('src/import')
+subdir('src/imds') # Note, we are not alphabetically here, since we want to use a variable from src/import/ here
 subdir('src/integritysetup')
 subdir('src/journal')
 subdir('src/journal-remote')
@@ -2964,6 +2972,45 @@ if meson.version().version_compare('>=1.4.0')
         endforeach
 endif
 
+spatch = find_program('spatch', required : false)
+if spatch.found()
+        # Directories excluded from coccinelle checks until their warnings are fixed.
+        # Remove directories from this list as they are cleaned up.
+        coccinelle_exclude = [
+                'src/basic/',
+                'src/core/',
+                'src/import/',
+                'src/journal/',
+                'src/libc/',
+                'src/libsystemd/',
+                'src/libsystemd-network/',
+                'src/network/',
+                'src/nspawn/',
+                'src/nss-systemd/',
+                'src/resolve/',
+                'src/shared/',
+                'src/test/',
+        ]
+
+        coccinelle_src_dirs = run_command(
+                'sh', '-c', 'printf "%s\n" src/*/',
+                check : true,
+        ).stdout().strip().split('\n')
+
+        foreach dir : coccinelle_src_dirs
+                if dir not in coccinelle_exclude
+                        test(
+                                'coccinelle-@0@'.format(fs.name(dir)),
+                                check_coccinelle_sh,
+                                args : [meson.project_source_root() / dir,
+                                        meson.project_source_root() / 'coccinelle'],
+                                suite : 'coccinelle',
+                                timeout : 120,
+                        )
+                endif
+        endforeach
+endif
+
 symbol_analysis_exes = []
 foreach name, exe : executables_by_name
         symbol_analysis_exes += exe
@@ -3080,7 +3127,8 @@ summary({
         'default user $PATH'                        : default_user_path != '' ? default_user_path : '(same as system services)',
         'systemd service watchdog'                  : service_watchdog == '' ? 'disabled' : service_watchdog,
         'time epoch'                                : f'@time_epoch@ (@alt_time_epoch@)',
-        'TPM2 nvpcr base'                           : run_command(sh, '-c', 'printf 0x%x @0@'.format(get_option('tpm2-nvpcr-base')), check : true).stdout()
+        'TPM2 nvpcr base'                           : run_command(sh, '-c', 'printf 0x%x @0@'.format(get_option('tpm2-nvpcr-base')), check : true).stdout(),
+        'IMDS networking'                           : get_option('imds-network'),
 })
 
 # TODO:
@@ -3145,6 +3193,7 @@ foreach tuple : [
         ['homed'],
         ['hostnamed'],
         ['hwdb'],
+        ['imds'],
         ['importd'],
         ['initrd'],
         ['kernel-install'],
