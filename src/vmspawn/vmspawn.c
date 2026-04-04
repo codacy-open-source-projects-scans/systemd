@@ -130,7 +130,10 @@ static char *arg_slice = NULL;
 static char **arg_property = NULL;
 static char *arg_cpus = NULL;
 static uint64_t arg_ram = UINT64_C(2) * U64_GB;
+static uint64_t arg_ram_max = 0;
+static unsigned arg_ram_slots = 0;
 static int arg_kvm = -1;
+static bool arg_cxl = false;
 static int arg_vsock = -1;
 static unsigned arg_vsock_cid = VMADDR_CID_ANY;
 static int arg_tpm = -1;
@@ -229,8 +232,11 @@ static int help(void) {
                "                           scsi-cd; default: virtio-blk)\n"
                "\n%3$sHost Configuration:%4$s\n"
                "     --cpus=CPUS           Configure number of CPUs in guest\n"
-               "     --ram=BYTES           Configure guest's RAM size\n"
+               "     --ram=BYTES[:MAXBYTES[:SLOTS]]\n"
+               "                           Configure guest's RAM size (and max/slots for\n"
+               "                           hotplug)\n"
                "     --kvm=BOOL            Enable use of KVM\n"
+               "     --cxl=BOOL            Enable use of CXL\n"
                "     --vsock=BOOL          Override autodetection of VSOCK support\n"
                "     --vsock-cid=CID       Specify the CID to use for the guest's VSOCK support\n"
                "     --tpm=BOOL            Enable use of a virtual TPM\n"
@@ -326,6 +332,42 @@ static int parse_environment(void) {
         return 0;
 }
 
+static int parse_ram(const char *s) {
+        _cleanup_free_ char *ram = NULL, *ram_max = NULL, *ram_slots = NULL;
+        int r;
+
+        assert(s);
+
+        const char *p = s;
+        r = extract_many_words(&p, ":", EXTRACT_DONT_COALESCE_SEPARATORS, &ram, &ram_max, &ram_slots);
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse --ram=%s: %m", s);
+        if (r == 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse --ram=%s", s);
+        if (!isempty(p))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Unexpected trailing data in --ram=%s", s);
+
+        r = parse_size(ram, 1024, &arg_ram);
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse --ram=%s: %m", s);
+
+        if (!isempty(ram_max)) {
+                r = parse_size(ram_max, 1024, &arg_ram_max);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to parse --ram=%s: %m", s);
+        } else
+                arg_ram_max = 0;
+
+        if (!isempty(ram_slots)) {
+                r = safe_atou(ram_slots, &arg_ram_slots);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to parse --ram=%s: %m", s);
+        } else
+                arg_ram_slots = 0;
+
+        return 0;
+}
+
 static int parse_argv(int argc, char *argv[]) {
         int r;
 
@@ -340,6 +382,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_CPUS,
                 ARG_RAM,
                 ARG_KVM,
+                ARG_CXL,
                 ARG_VSOCK,
                 ARG_VSOCK_CID,
                 ARG_TPM,
@@ -398,6 +441,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "ram",               required_argument, NULL, ARG_RAM               },
                 { "qemu-mem",          required_argument, NULL, ARG_RAM               }, /* Compat alias */
                 { "kvm",               required_argument, NULL, ARG_KVM               },
+                { "cxl",               required_argument, NULL, ARG_CXL               },
                 { "qemu-kvm",          required_argument, NULL, ARG_KVM               }, /* Compat alias */
                 { "vsock",             required_argument, NULL, ARG_VSOCK             },
                 { "qemu-vsock",        required_argument, NULL, ARG_VSOCK             }, /* Compat alias */
@@ -518,15 +562,24 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case ARG_RAM:
-                        r = parse_size(optarg, 1024, &arg_ram);
+                        r = parse_ram(optarg);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to parse --ram=%s: %m", optarg);
+                                return r;
                         break;
 
                 case ARG_KVM:
                         r = parse_tristate_argument_with_auto("--kvm=", optarg, &arg_kvm);
                         if (r < 0)
                                 return r;
+                        break;
+
+                case ARG_CXL:
+                        r = parse_boolean_argument("--cxl=", optarg, &arg_cxl);
+                        if (r < 0)
+                                return r;
+                        if (arg_cxl && !ARCHITECTURE_SUPPORTS_CXL)
+                                return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
+                                                       "CXL not supported on %s.", architecture_to_string(native_architecture()));
                         break;
 
                 case ARG_VSOCK:
@@ -993,6 +1046,12 @@ static int parse_argv(int argc, char *argv[]) {
         if (!strv_isempty(arg_bind_user_groups) && strv_isempty(arg_bind_user))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Cannot use --bind-user-group= without --bind-user=");
 
+        if (arg_ram_max > 0 && arg_ram_max < arg_ram)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Maximum RAM size must be greater than or equal to initial RAM size");
+
+        if (arg_ram_slots > 0 && arg_ram_max == 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Memory hotplug slots require a maximum RAM size");
+
         if (arg_ephemeral && arg_extra_drives.n_drives > 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Cannot use --ephemeral with --extra-drive=");
 
@@ -1142,6 +1201,8 @@ static int vmspawn_dispatch_vsock_connections(sd_event_source *source, int fd, u
         sd_event *event;
         int r;
 
+        assert(source);
+        assert(fd >= 0);
         assert(userdata);
 
         if (revents != EPOLLIN) {
@@ -1328,6 +1389,7 @@ fallback:
 }
 
 static int on_child_exit(sd_event_source *s, const siginfo_t *si, void *userdata) {
+        assert(s);
         assert(si);
 
         /* Let's first do some logging about the exit status of the child. */
@@ -1364,6 +1426,9 @@ static int on_child_exit(sd_event_source *s, const siginfo_t *si, void *userdata
 static int cmdline_add_vsock(char ***cmdline, int vsock_fd) {
         int r;
 
+        assert(cmdline);
+        assert(vsock_fd >= 0);
+
         r = strv_extend(cmdline, "-smbios");
         if (r < 0)
                 return r;
@@ -1387,19 +1452,14 @@ static int cmdline_add_kernel_cmdline(char ***cmdline, const char *kernel, const
         int r;
 
         assert(cmdline);
+        assert(smbios_dir);
 
         if (strv_isempty(arg_kernel_cmdline_extra))
                 return 0;
 
         KernelImageType type = _KERNEL_IMAGE_TYPE_INVALID;
         if (kernel) {
-                r = inspect_kernel(
-                                AT_FDCWD,
-                                kernel,
-                                &type,
-                                /* ret_cmdline= */ NULL,
-                                /* ret_uname= */ NULL,
-                                /* ret_pretty_name= */ NULL);
+                r = inspect_kernel(AT_FDCWD, kernel, &type);
                 if (r < 0)
                         return log_error_errno(r, "Failed to determine '%s' kernel image type: %m", kernel);
         }
@@ -1491,6 +1551,7 @@ static int start_tpm(
         assert(scope);
         assert(swtpm);
         assert(runtime_dir);
+        assert(sd_socket_activate);
 
         _cleanup_free_ char *scope_prefix = NULL;
         r = unit_name_to_prefix(scope, &scope_prefix);
@@ -1558,6 +1619,7 @@ static int start_systemd_journal_remote(
         int r;
 
         assert(scope);
+        assert(sd_socket_activate);
 
         _cleanup_free_ char *scope_prefix = NULL;
         r = unit_name_to_prefix(scope, &scope_prefix);
@@ -1633,33 +1695,30 @@ static int discover_root(char **ret) {
 
 static int find_virtiofsd(char **ret) {
         int r;
-        _cleanup_free_ char *virtiofsd = NULL;
 
         assert(ret);
 
-        r = find_executable("virtiofsd", &virtiofsd);
-        if (r < 0 && r != -ENOENT)
+        r = find_executable("virtiofsd", ret);
+        if (r >= 0)
+                return 0;
+        if (r != -ENOENT)
                 return log_error_errno(r, "Error while searching for virtiofsd: %m");
 
-        if (!virtiofsd) {
-                FOREACH_STRING(file, "/usr/libexec/virtiofsd", "/usr/lib/virtiofsd") {
-                        if (access(file, X_OK) >= 0) {
-                                virtiofsd = strdup(file);
-                                if (!virtiofsd)
-                                        return log_oom();
-                                break;
-                        }
+        FOREACH_STRING(file, "/usr/libexec/virtiofsd", "/usr/lib/virtiofsd") {
+                if (access(file, X_OK) >= 0) {
+                        _cleanup_free_ char *copy = strdup(file);
+                        if (!copy)
+                                return log_oom();
 
-                        if (!IN_SET(errno, ENOENT, EACCES))
-                                return log_error_errno(errno, "Error while searching for virtiofsd: %m");
+                        *ret = TAKE_PTR(copy);
+                        return 0;
                 }
+
+                if (!IN_SET(errno, ENOENT, EACCES))
+                        return log_error_errno(errno, "Error while searching for virtiofsd: %m");
         }
 
-        if (!virtiofsd)
-                return log_error_errno(SYNTHETIC_ERRNO(ENOENT), "Failed to find virtiofsd binary.");
-
-        *ret = TAKE_PTR(virtiofsd);
-        return 0;
+        return log_error_errno(SYNTHETIC_ERRNO(ENOENT), "Failed to find virtiofsd binary.");
 }
 
 static int start_virtiofsd(
@@ -1870,22 +1929,20 @@ static int bind_user_setup(
 
 static int kernel_cmdline_maybe_append_root(void) {
         int r;
-        bool cmdline_contains_root = strv_find_startswith(arg_kernel_cmdline_extra, "root=")
-                        || strv_find_startswith(arg_kernel_cmdline_extra, "mount.usr=");
 
-        if (!cmdline_contains_root) {
-                _cleanup_free_ char *root = NULL;
+        if (strv_find_startswith(arg_kernel_cmdline_extra, "root=") ||
+            strv_find_startswith(arg_kernel_cmdline_extra, "mount.usr="))
+                return 0;
 
-                r = discover_root(&root);
-                if (r < 0)
-                        return r;
+        _cleanup_free_ char *root = NULL;
+        r = discover_root(&root);
+        if (r < 0)
+                return r;
 
-                log_debug("Determined root file system %s from dissected image", root);
+        log_debug("Determined root file system '%s' from dissected image", root);
 
-                r = strv_consume(&arg_kernel_cmdline_extra, TAKE_PTR(root));
-                if (r < 0)
-                        return log_oom();
-        }
+        if (strv_consume(&arg_kernel_cmdline_extra, TAKE_PTR(root)) < 0)
+                return log_oom();
 
         return 0;
 }
@@ -2313,6 +2370,12 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                         return r;
         }
 
+        if (arg_cxl) {
+                r = qemu_config_key(config_file, "cxl", "on");
+                if (r < 0)
+                        return r;
+        }
+
         if (arg_directory || arg_runtime_mounts.n_mounts != 0) {
                 r = qemu_config_key(config_file, "memory-backend", "mem");
                 if (r < 0)
@@ -2334,6 +2397,16 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                                 "size", mem);
         if (r < 0)
                 return r;
+
+        if (arg_ram_max > 0) {
+                r = qemu_config_keyf(config_file, "maxmem", "%" PRIu64 "M", DIV_ROUND_UP(arg_ram_max, U64_MB));
+                if (r < 0)
+                        return r;
+
+                r = qemu_config_keyf(config_file, "slots", "%u", arg_ram_slots > 0 ? arg_ram_slots : 1u);
+                if (r < 0)
+                        return r;
+        }
 
         r = qemu_config_section(config_file, "object", "rng0",
                                 "qom-type", "rng-random",
@@ -2750,19 +2823,18 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
 
                 destroy_path = mfree(destroy_path); /* disarm auto-destroy */
 
-                r = qemu_config_section(config_file, "global", /* id= */ NULL,
-                                        "driver", "ICH9-LPC",
-                                        "property", "disable_s3",
-                                        "value", "1");
-                if (r < 0)
-                        return r;
-
-                r = qemu_config_section(config_file, "global", /* id= */ NULL,
-                                        "driver", "cfi.pflash01",
-                                        "property", "secure",
-                                        "value", "on");
-                if (r < 0)
-                        return r;
+                /* Mark the UEFI variable store pflash as requiring SMM access. This
+                 * prevents the guest OS from writing to pflash directly, ensuring all
+                 * variable updates go through the firmware's validation checks. Without
+                 * this, secure boot keys could be overwritten by the OS. */
+                if (ARCHITECTURE_SUPPORTS_SMM) {
+                        r = qemu_config_section(config_file, "global", /* id= */ NULL,
+                                                "driver", "cfi.pflash01",
+                                                "property", "secure",
+                                                "value", "on");
+                        if (r < 0)
+                                return r;
+                }
 
                 r = qemu_config_section(config_file, "drive", "ovmf-vars",
                                         "file", state,
