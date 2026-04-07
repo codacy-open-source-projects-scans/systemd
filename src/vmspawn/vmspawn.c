@@ -51,6 +51,7 @@
 #include "log.h"
 #include "machine-bind-user.h"
 #include "machine-credential.h"
+#include "machine-register.h"
 #include "main-func.h"
 #include "mkdir.h"
 #include "namespace-util.h"
@@ -89,7 +90,6 @@
 #include "utf8.h"
 #include "vmspawn-mount.h"
 #include "vmspawn-qemu-config.h"
-#include "vmspawn-register.h"
 #include "vmspawn-scope.h"
 #include "vmspawn-settings.h"
 #include "vmspawn-util.h"
@@ -150,7 +150,7 @@ static bool arg_firmware_describe = false;
 static Set *arg_firmware_features_include = NULL;
 static Set *arg_firmware_features_exclude = NULL;
 static char *arg_forward_journal = NULL;
-static bool arg_register = true;
+static int arg_register = -1;
 static bool arg_keep_unit = false;
 static sd_id128_t arg_uuid = {};
 static char **arg_kernel_cmdline_extra = NULL;
@@ -220,8 +220,8 @@ static int help(void) {
                "  -q --quiet               Do not show status information\n"
                "     --no-pager            Do not pipe output into a pager\n"
                "     --no-ask-password     Do not prompt for password\n"
-               "     --user                Interact with user manager\n"
-               "     --system              Interact with system manager\n"
+               "     --system              Run in the system service manager scope\n"
+               "     --user                Run in the user service manager scope\n"
                "\n%3$sImage:%4$s\n"
                "  -D --directory=PATH      Root directory for the VM\n"
                "  -x --ephemeral           Run VM with snapshot of the disk or directory\n"
@@ -665,7 +665,7 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case ARG_REGISTER:
-                        r = parse_boolean_argument("--register=", optarg, &arg_register);
+                        r = parse_tristate_argument_with_auto("--register=", optarg, &arg_register);
                         if (r < 0)
                                 return r;
 
@@ -2234,7 +2234,7 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
 
         /* Registration always happens on the system bus */
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *system_bus = NULL;
-        if (arg_register || arg_runtime_scope == RUNTIME_SCOPE_SYSTEM) {
+        if (arg_register != 0 || arg_runtime_scope == RUNTIME_SCOPE_SYSTEM) {
                 r = sd_bus_default_system(&system_bus);
                 if (r < 0)
                         return log_error_errno(r, "Failed to open system bus: %m");
@@ -2246,21 +2246,23 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                 (void) sd_bus_set_allow_interactive_authorization(system_bus, arg_ask_password);
         }
 
-        /* Scope allocation happens on the user bus if we are unpriv, otherwise system bus. */
+        /* Scope allocation and machine registration happen on the user bus if we are unpriv, otherwise system bus. */
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *user_bus = NULL;
         _cleanup_(sd_bus_unrefp) sd_bus *runtime_bus = NULL;
-        if (arg_runtime_scope == RUNTIME_SCOPE_SYSTEM)
-                runtime_bus = sd_bus_ref(system_bus);
-        else {
-                r = sd_bus_default_user(&user_bus);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to open system bus: %m");
+        if (arg_register != 0 || !arg_keep_unit) {
+                if (arg_runtime_scope == RUNTIME_SCOPE_SYSTEM)
+                        runtime_bus = sd_bus_ref(system_bus);
+                else {
+                        r = sd_bus_default_user(&user_bus);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to open user bus: %m");
 
-                r = sd_bus_set_close_on_exit(user_bus, false);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to disable close-on-exit behaviour: %m");
+                        r = sd_bus_set_close_on_exit(user_bus, false);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to disable close-on-exit behaviour: %m");
 
-                runtime_bus = sd_bus_ref(user_bus);
+                        runtime_bus = sd_bus_ref(user_bus);
+                }
         }
 
         bool use_kvm = arg_kvm > 0;
@@ -2322,33 +2324,32 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
         if (asprintf(&mem, "%" PRIu64 "M", DIV_ROUND_UP(arg_ram, U64_MB)) < 0)
                 return log_oom();
 
-        /* Create runtime directory for the QEMU config file and other state */
-        _cleanup_free_ char *runtime_dir = NULL;
+        /* Create our runtime directory. We need this for the QEMU config file, TPM state, virtiofsd
+         * sockets, runtime mounts, and SSH key material. */
+        _cleanup_free_ char *runtime_dir = NULL, *runtime_dir_suffix = NULL;
         _cleanup_(rm_rf_physical_and_freep) char *runtime_dir_destroy = NULL;
-        {
-                _cleanup_free_ char *subdir = NULL;
 
-                if (asprintf(&subdir, "systemd/vmspawn.%" PRIx64, random_u64()) < 0)
-                        return log_oom();
+        runtime_dir_suffix = path_join("systemd/vmspawn", arg_machine);
+        if (!runtime_dir_suffix)
+                return log_oom();
 
-                r = runtime_directory(arg_runtime_scope, subdir, &runtime_dir);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to lookup runtime directory: %m");
-                if (r > 0) { /* We need to create our own runtime dir */
-                        r = mkdir_p(runtime_dir, 0755);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to create runtime directory '%s': %m", runtime_dir);
+        r = runtime_directory_generic(arg_runtime_scope, runtime_dir_suffix, &runtime_dir);
+        if (r < 0)
+                return log_error_errno(r, "Failed to determine runtime directory: %m");
 
-                        /* We created this, hence also destroy it */
-                        runtime_dir_destroy = TAKE_PTR(runtime_dir);
+        /* If a previous vmspawn instance was killed without cleanup (e.g. SIGKILL), the directory may
+         * already exist with stale contents. This is harmless: varlink's sockaddr_un_unlink() removes stale
+         * sockets before bind(), and other files (QEMU config, SSH keys) are created fresh. This matches
+         * nspawn's approach of not proactively cleaning stale runtime directories. */
+        r = mkdir_p(runtime_dir, 0755);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create runtime directory '%s': %m", runtime_dir);
 
-                        runtime_dir = strdup(runtime_dir_destroy);
-                        if (!runtime_dir)
-                                return log_oom();
-                }
+        runtime_dir_destroy = strdup(runtime_dir);
+        if (!runtime_dir_destroy)
+                return log_oom();
 
-                log_debug("Using runtime directory: %s", runtime_dir);
-        }
+        log_debug("Using runtime directory: %s", runtime_dir);
 
         /* Build a QEMU config file for -readconfig. Items that can be expressed as QemuOpts sections go
          * here; things that require cmdline-only switches (e.g. -kernel, -smbios, -nographic, --add-fd)
@@ -3517,12 +3518,20 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                 log_debug("Executing: %s", joined);
         }
 
+        _cleanup_close_ int child_pty = -EBADF;
+        if (master >= 0) {
+                child_pty = pty_open_peer(master, O_RDWR|O_CLOEXEC|O_NOCTTY);
+                if (child_pty < 0)
+                        return log_error_errno(child_pty, "Failed to open PTY slave: %m");
+        }
+
         _cleanup_(pidref_done) PidRef child_pidref = PIDREF_NULL;
         r = pidref_safe_fork_full(
                         qemu_binary,
-                        /* stdio_fds= */ NULL,
+                        child_pty >= 0 ? (const int[]) { child_pty, child_pty, child_pty } : NULL,
                         pass_fds, n_pass_fds,
-                        FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_CLOEXEC_OFF|FORK_RLIMIT_NOFILE_SAFE,
+                        FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_CLOEXEC_OFF|FORK_RLIMIT_NOFILE_SAFE|
+                        (child_pty >= 0 ? FORK_REARRANGE_STDIO : 0),
                         &child_pidref);
         if (r < 0)
                 return r;
@@ -3539,6 +3548,7 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
         }
 
         /* Close relevant fds we passed to qemu in the parent. We don't need them anymore. */
+        child_pty = safe_close(child_pty);
         child_vsock_fd = safe_close(child_vsock_fd);
         tap_fd = safe_close(tap_fd);
 
@@ -3562,7 +3572,7 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
         }
 
         bool scope_allocated = false;
-        if (!arg_keep_unit && (!arg_register || arg_runtime_scope != RUNTIME_SCOPE_SYSTEM)) {
+        if (!arg_keep_unit && (arg_register == 0 || arg_runtime_scope != RUNTIME_SCOPE_SYSTEM)) {
                 r = allocate_scope(
                                 runtime_bus,
                                 arg_machine,
@@ -3586,52 +3596,34 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                         return log_error_errno(r, "Failed to get our own unit: %m");
         }
 
-        bool registered_system = false, registered_runtime = false;
-        if (arg_register) {
+        MachineRegistrationContext machine_ctx = {
+                .scope      = arg_runtime_scope == RUNTIME_SCOPE_SYSTEM ? RUNTIME_SCOPE_SYSTEM : _RUNTIME_SCOPE_INVALID,
+                .system_bus = system_bus,
+                .user_bus   = runtime_bus,
+        };
+        if (arg_register != 0) {
                 char vm_address[STRLEN("vsock/") + DECIMAL_STR_MAX(unsigned)];
                 xsprintf(vm_address, "vsock/%u", child_cid);
-                r = register_machine(
-                                system_bus,
-                                arg_machine,
-                                arg_uuid,
-                                "systemd-vmspawn",
-                                &child_pidref,
-                                arg_directory,
-                                child_cid,
-                                child_cid != VMADDR_CID_ANY ? vm_address : NULL,
-                                ssh_private_key_path,
-                                !arg_keep_unit && arg_runtime_scope == RUNTIME_SCOPE_SYSTEM,
-                                RUNTIME_SCOPE_SYSTEM);
-                if (r < 0) {
-                        /* if privileged the request to register definitely failed */
-                        if (arg_runtime_scope == RUNTIME_SCOPE_SYSTEM)
-                                return r;
 
-                        log_notice_errno(r, "Failed to register machine in system context, will try in user context.");
-                } else
-                        registered_system = true;
+                const MachineRegistration reg = {
+                        .name                 = arg_machine,
+                        .id                   = arg_uuid,
+                        .service              = "systemd-vmspawn",
+                        .class                = "vm",
+                        .pidref               = &child_pidref,
+                        .root_directory       = arg_directory,
+                        .vsock_cid            = child_cid,
+                        .ssh_address          = child_cid != VMADDR_CID_ANY ? vm_address : NULL,
+                        .ssh_private_key_path = ssh_private_key_path,
+                        .allocate_unit        = !arg_keep_unit,
+                };
 
-                if (arg_runtime_scope == RUNTIME_SCOPE_USER) {
-                        r = register_machine(
-                                        runtime_bus,
-                                        arg_machine,
-                                        arg_uuid,
-                                        "systemd-vmspawn",
-                                        &child_pidref,
-                                        arg_directory,
-                                        child_cid,
-                                        child_cid != VMADDR_CID_ANY ? vm_address : NULL,
-                                        ssh_private_key_path,
-                                        !arg_keep_unit,
-                                        RUNTIME_SCOPE_USER);
-                        if (r < 0) {
-                                if (!registered_system) /* neither registration worked: fail */
-                                        return r;
-
-                                log_notice_errno(r, "Failed to register machine in user context, but succeeded in system context, will proceed.");
-                        } else
-                                registered_runtime = true;
-                }
+                r = register_machine_with_fallback_and_log(
+                                &machine_ctx,
+                                &reg,
+                                /* graceful= */ arg_register < 0);
+                if (r < 0)
+                        return r;
         }
 
         /* Report that the VM is now set up */
@@ -3734,10 +3726,7 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
         if (scope_allocated)
                 terminate_scope(runtime_bus, arg_machine);
 
-        if (registered_system)
-                (void) unregister_machine(system_bus, arg_machine);
-        if (registered_runtime)
-                (void) unregister_machine(runtime_bus, arg_machine);
+        unregister_machine_with_fallback_and_log(&machine_ctx, arg_machine);
 
         if (use_vsock) {
                 if (exit_status == INT_MAX) {
