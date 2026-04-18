@@ -1918,11 +1918,15 @@ static void config_select_default_entry(Config *config) {
         }
 
         /* select the first suitable entry */
-        for (i = 0; i < config->n_entries; i++)
+        for (i = 0; i < config->n_entries; i++) {
+                if (config->entries[i]->profile > 0)
+                        continue; /* For now, never select any non-default profile */
+
                 if (LOADER_TYPE_MAY_AUTO_SELECT(config->entries[i]->type)) {
                         config->idx_default = i;
                         return;
                 }
+        }
 
         /* If no configured entry to select from was found, enable the menu. */
         config->idx_default = 0;
@@ -2715,7 +2719,12 @@ static EFI_STATUS expand_path(
                 if (IN_SET(err, EFI_NOT_FOUND, EFI_INVALID_PARAMETER))
                         continue; /* Skip over LoadFile() handles that after all don't consider themselves
                                    * appropriate for this kind of path */
-                if (err != EFI_BUFFER_TOO_SMALL) {
+                if (!IN_SET(err, EFI_SUCCESS, EFI_BUFFER_TOO_SMALL)) {
+                        /* NB: firmwares are supposed to return EFI_BUFFER_TOO_SMALL whenever we pass a NULL
+                         * buffer. But for compatibility with quirky firmwares let's be lenient for the
+                         * special case of a zero sized file: the firmware might return EFI_SUCCESS here and
+                         * initialize the size to zero, as a buffer is not actually necessary for that
+                         * case. */
                         log_warning_status(err, "Failed to get file via LoadFile() protocol, ignoring: %m");
                         continue;
                 }
