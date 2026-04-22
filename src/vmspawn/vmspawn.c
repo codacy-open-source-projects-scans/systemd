@@ -851,7 +851,12 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 OPTION_LONG("ssh-key-type", "TYPE", "Choose what type of SSH key to pass"):
-                        if (!string_is_safe(arg))
+                        if (isempty(arg)) {
+                                arg_ssh_key_type = mfree(arg_ssh_key_type);
+                                break;
+                        }
+
+                        if (!string_is_safe(arg, STRING_ALLOW_GLOBS))
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid value for --ssh-key-type=: %s", arg);
 
                         r = free_and_strdup_warn(&arg_ssh_key_type, arg);
@@ -4000,6 +4005,10 @@ static int verify_arguments(void) {
                 if (arg_grow_image)
                         log_warning("--grow-image has no effect with --image-disk-type=scsi-cd (CD-ROMs are read-only).");
         }
+
+        if (arg_grow_image && arg_image_format == IMAGE_FORMAT_QCOW2)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "--grow-image is not supported for qcow2 images, use 'qemu-img resize FILE SIZE'.");
 
         return 0;
 }
