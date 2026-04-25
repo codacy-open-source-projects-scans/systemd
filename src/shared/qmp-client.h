@@ -54,9 +54,15 @@ bool qmp_client_is_idle(QmpClient *c);
 /* True iff the connection is dead. Stable terminal state — once set, it stays set. */
 bool qmp_client_is_disconnected(QmpClient *c);
 
-/* Async send. Returns 0 on send (callback will fire later), negative errno on failure. */
+void* qmp_client_set_userdata(QmpClient *c, void *userdata);
+void* qmp_client_get_userdata(QmpClient *c);
+
+/* Async send. Returns 0 on send (callback will fire later), negative errno on failure. If
+ * ret_slot is non-NULL, returns a reference to a QmpSlot which can be used to cancel the call
+ * (by unreffing it before the reply arrives). */
 int qmp_client_invoke(
                 QmpClient *client,
+                QmpSlot **ret_slot,
                 const char *command,
                 QmpClientArgs *args,
                 qmp_command_callback_t callback,
@@ -76,11 +82,15 @@ void qmp_client_bind_event(QmpClient *c, qmp_event_callback_t callback, void *us
 void qmp_client_bind_disconnect(QmpClient *c, qmp_disconnect_callback_t callback, void *userdata);
 int qmp_client_set_description(QmpClient *c, const char *description);
 sd_event* qmp_client_get_event(QmpClient *c);
-unsigned qmp_client_next_fdset_id(QmpClient *client);
+uint64_t qmp_client_next_fdset_id(QmpClient *client);
 
-QmpClient* qmp_client_unref(QmpClient *p);
-
+DECLARE_TRIVIAL_REF_UNREF_FUNC(QmpClient, qmp_client);
 DEFINE_TRIVIAL_CLEANUP_FUNC(QmpClient *, qmp_client_unref);
+
+DECLARE_TRIVIAL_REF_UNREF_FUNC(QmpSlot, qmp_slot);
+DEFINE_TRIVIAL_CLEANUP_FUNC(QmpSlot *, qmp_slot_unref);
+
+QmpClient* qmp_slot_get_client(QmpSlot *slot);
 
 /* Returns true iff any object entry in schema (result of query-qmp-schema) has a member with this
  * name. QEMU's introspection replaces type names with opaque numeric ids, so lookup-by-type-name is
