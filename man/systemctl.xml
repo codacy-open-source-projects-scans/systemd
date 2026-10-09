@@ -418,6 +418,13 @@ Jan 12 10:46:45 example.com bluetoothd[8900]: gatt-time-server: Input/output err
           <listitem>
             <para>Start (activate) one or more units specified on the command line.</para>
 
+            <para>When more than one unit is specified, the units are enqueued in a single job transaction.
+            This ensures that ordering dependencies (<varname>After=</varname>/<varname>Before=</varname>)
+            configured between the listed units are honored, regardless of the order in which they are given
+            on the command line. The same applies to <command>stop</command>, <command>restart</command> and
+            the reload/restart variants below. If a single transaction cannot be put together, separate
+            transactions will be submitted separately instead as a fallback.</para>
+
             <para>Note that unit glob patterns expand to names of units currently in memory. Units which are
             not active and are not in a failed state usually are not in memory, and will not be matched by
             any pattern. In addition, in case of instantiated units, systemd is often unaware of the instance
@@ -506,6 +513,12 @@ Jan 12 10:46:45 example.com bluetoothd[8900]: gatt-time-server: Input/output err
           <listitem><para>Enqueue start/stop/restart/reload jobs for all units that have the respective
           <literal>needs-*</literal> markers set. When a unit marked for reload does not support reload,
           restart will be queued. Those properties can be set using <command>set-property Markers=…</command>.</para>
+
+          <para>Note that <literal>needs-restart</literal> and <literal>needs-reload</literal> use
+          <command>try-restart</command>/<literal>try-reload</literal> semantics: inactive units are not started.
+          This differs from <command>reload-or-restart</command> without <option>--marked</option>, which
+          starts units that are not yet running. Markers such as <literal>needs-start</literal> still
+          enqueue an unconditional start job.</para>
 
           <para>Unless <option>--no-block</option> is used, <command>systemctl</command> will wait for the
           queued jobs to finish.</para>
@@ -727,8 +740,8 @@ Jan 12 10:46:45 example.com bluetoothd[8900]: gatt-time-server: Input/output err
           (e.g.: with <option>RootImage=</option>, <option>PrivateMounts=</option>, etc.). This command
           supports bind-mounting directories, regular files, device nodes, <constant>AF_UNIX</constant>
           socket nodes, as well as FIFOs.  The bind mount is ephemeral, and it is undone as soon as the
-          current unit process exists. Note that the namespace mentioned here, where the bind mount will be
-          added to, is the one where the main service process runs. Other processes (those exececuted by
+          current unit process exits. Note that the namespace mentioned here, where the bind mount will be
+          added to, is the one where the main service process runs. Other processes (those executed by
           <option>ExecReload=</option>, <option>ExecStartPre=</option>, etc.) run in distinct namespaces.
           </para>
 
@@ -754,15 +767,14 @@ Jan 12 10:46:45 example.com bluetoothd[8900]: gatt-time-server: Input/output err
           <option>RootImage=</option>/<option>RootDirectory=</option>). The following argument, if any, is
           interpreted as a colon-separated tuple of partition name and comma-separated list of mount options
           for that partition. The format is the same as the service <option>MountImages=</option>
-          setting. When combined with the <option>--read-only</option> switch, a ready-only mount is
+          setting. When combined with the <option>--read-only</option> switch, a read-only mount is
           created. When combined with the <option>--mkdir</option> switch, the destination path is first
           created before the mount is applied.</para>
 
           <para>Note that this option is currently only supported for units that run within a mount namespace
           (i.e. with <option>RootImage=</option>, <option>PrivateMounts=</option>, etc.). Note that the
-          namespace mentioned here where the image mount will be added to, is the one where the main service
-          process runs. Note that the namespace mentioned here, where the bind mount will be
-          added to, is the one where the main service process runs. Other processes (those exececuted by
+          namespace mentioned here, where the image mount will be added to, is the one where the main
+          service process runs. Other processes (those executed by
           <option>ExecReload=</option>, <option>ExecStartPre=</option>, etc.) run in distinct namespaces.
           </para>
 
@@ -1499,17 +1511,6 @@ Jan 12 10:46:45 example.com bluetoothd[8900]: gatt-time-server: Input/output err
             systemd listens on behalf of user configuration will stay
             accessible.</para>
 
-            <para>When unit aliasing is introduced during reload (e.g., converting
-            <filename>b.service</filename> to a symlink pointing to
-            <filename>a.service</filename>), the running state of the canonical
-            unit (<filename>a.service</filename>) is preserved. The old serialized
-            state of the now-aliased unit is discarded to prevent stale data from
-            corrupting the canonical unit's live state. Dependencies referencing
-            the alias name are automatically resolved to the canonical unit, and
-            the dependency graph is rebuilt from unit files, ensuring consistency.
-            If the now-aliased unit had running processes, they are abandoned and
-            will no longer be tracked by the service manager.</para>
-
             <para>This command should not be confused with the
             <command>reload</command> command.</para>
           </listitem>
@@ -1999,7 +2000,8 @@ Jan 12 10:46:45 example.com bluetoothd[8900]: gatt-time-server: Input/output err
           <para>The argument is a comma-separated list of unit types such as <option>service</option> and
           <option>socket</option>. When units are listed with <command>list-units</command>,
           <command>list-dependencies</command>, <command>show</command>, or <command>status</command>,
-          only units of the specified types will be shown. By default, units of all types are shown.</para>
+          only units of the specified types will be shown. By default, units of all types are shown.
+          Use <option>--type=</option> to reset the filter.</para>
 
           <para>As a special case, if one of the arguments is <option>help</option>, a list of allowed values
           will be printed and the program will exit.</para>
@@ -2011,9 +2013,10 @@ Jan 12 10:46:45 example.com bluetoothd[8900]: gatt-time-server: Input/output err
 
         <listitem>
           <para>The argument is a comma-separated list of unit LOAD, SUB, or ACTIVE states. When listing
-          units with <command>list-units</command>, <command>list-dependencies</command>, <command>show</command>
-          or <command>status</command>, show only those in the specified states. Use <option>--state=failed</option>
-          or <option>--failed</option> to show only failed units.</para>
+          units with <command>list-units</command>, <command>list-dependencies</command>,
+          <command>show</command> or <command>status</command>, show only those in the specified states. Use
+          <option>--state=failed</option> or <option>--failed</option> to show only failed units. Use
+          <option>--state=</option> to reset the filter.</para>
 
           <para>As a special case, if one of the arguments is <option>help</option>, a list of allowed values
           will be printed and the program will exit.</para>
@@ -2587,10 +2590,12 @@ Jan 12 10:46:45 example.com bluetoothd[8900]: gatt-time-server: Input/output err
           <constant>all</constant> as a shortcut for specifying all six resource types. If this option is not
           specified defaults to the combination of <constant>cache</constant>, <constant>runtime</constant>
           and <constant>fdstore</constant>, i.e. the three kinds of resources that are generally considered
-          to be redundant and can be reconstructed on next invocation. Note that the explicit removal of the
-          <constant>fdstore</constant> resource type is only useful if the
-          <varname>FileDescriptorStorePreserve=</varname> option is enabled, since the file descriptor store
-          is otherwise cleaned automatically when the unit is stopped.</para>
+          to be redundant and can be reconstructed on next invocation. The empty argument can be used to
+          reset to this default.</para>
+
+          <para>Note that the explicit removal of the <constant>fdstore</constant> resource type is only
+          useful if the <varname>FileDescriptorStorePreserve=</varname> option is enabled, since the file
+          descriptor store is otherwise cleaned automatically when the unit is stopped.</para>
 
           <xi:include href="version-info.xml" xpointer="v243"/>
         </listitem>
@@ -2802,11 +2807,40 @@ Jan 12 10:46:45 example.com bluetoothd[8900]: gatt-time-server: Input/output err
           <para>When used with <command>kexec</command>, append the specified string to the kernel command
           line options of the kexec kernel. The kernel command line is taken from the boot loader entry of
           the currently booted kernel (as selected automatically when no kexec kernel is preloaded, see
-          <command>kexec</command> above). This string is appended verbatim, separated from the existing
-          options by a single space. <command>systemctl kexec</command> will fail if this option is specified
-          when a kexec kernel is already loaded.</para>
+          <command>kexec</command> above). This string is appended, separated from the existing
+          options by a single space. This option may be specified more than once, in which case the
+          strings are appended in the order given. <command>systemctl kexec</command> will fail if this
+          option is specified when a kexec kernel is already loaded.</para>
+
+          <para>The kexec kernel command line is assembled in a fixed order, independent of the order in
+          which the options are specified on the command line: first the command line from the boot loader
+          entry, then the command line of the currently running kernel (if
+          <option>--kernel-cmdline-reuse</option> is used), and finally the strings specified with
+          <option>--kernel-cmdline=</option>. Afterwards, arguments that are exactly identical and appear
+          more than once are removed, keeping the last occurrence. Note that only byte-for-byte identical
+          arguments are deduplicated: for example <literal>foo=bar</literal> and
+          <literal>foo=quux</literal> are both kept, as they are not identical (the latter takes effect, as
+          the kernel uses the last assignment of a given parameter).</para>
 
           <xi:include href="version-info.xml" xpointer="v261"/>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--kernel-cmdline-reuse</option></term>
+
+        <listitem>
+          <para>Like <option>--kernel-cmdline=</option>, but instead of taking the string to append as an
+          argument, the command line of the currently running kernel is reused. This is useful to boot the
+          kexec kernel with the same command line options the running system was booted with, including any
+          modifications applied at boot time.
+          As with <option>--kernel-cmdline=</option>, the reused command line is added to the command line
+          taken from the boot loader entry, and <command>systemctl kexec</command> will fail if this option
+          is specified when a kexec kernel is already loaded. This option may be combined with
+          <option>--kernel-cmdline=</option>; see <option>--kernel-cmdline=</option> above for the order in
+          which the various command line sources are combined and deduplicated.</para>
+
+          <xi:include href="version-info.xml" xpointer="v262"/>
         </listitem>
       </varlistentry>
 
@@ -2923,6 +2957,19 @@ Jan 12 10:46:45 example.com bluetoothd[8900]: gatt-time-server: Input/output err
           action will be shown, which can be canceled by passing an empty string or <literal>cancel</literal>.
           <literal>auto</literal> will schedule the action according to maintenance window or one minute in
           the future.</para>
+
+          <para>The specified timestamp is a lower bound only: it declares the earliest point in time the
+          requested action may take place, i.e. the action is executed as soon as possible, but not before the
+          given timestamp. It is <emphasis>not</emphasis> a condition that is checked, and specifying a
+          timestamp in the past is not an error: the action is then executed immediately. This is intentional,
+          as the alternative would be racy and surprising — consider <option>--when=now</option>, which by the
+          time the request is processed necessarily refers to the past, or
+          <option>--when=+50ms</option>, which might well already have elapsed due to scheduling latencies
+          before the request is dispatched. In both cases the requested action is still carried out, as
+          the user asked for it.</para>
+
+          <para>If a timestamp in the past shall not result in the action being executed, this must be checked
+          for explicitly before invoking <command>systemctl</command>.</para>
 
           <xi:include href="version-info.xml" xpointer="v254"/>
         </listitem>

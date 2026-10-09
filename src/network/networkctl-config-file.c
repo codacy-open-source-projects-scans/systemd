@@ -14,7 +14,7 @@
 #include "extract-word.h"
 #include "fd-util.h"
 #include "log.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "netlink-util.h"
 #include "network-util.h"
 #include "networkctl.h"
@@ -411,7 +411,7 @@ static int reload_daemons(ReloadFlags flags) {
                 if (!networkd_is_running())
                         log_debug("systemd-networkd is not running, skipping reload.");
                 else
-                        RET_GATHER(ret, reload_networkd());
+                        RET_GATHER(ret, reload_networkd(/* reconfigure_links= */ true));
         }
 
         return ret;

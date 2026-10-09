@@ -1,11 +1,13 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "shared-forward.h"
-
-int dlopen_libssl(int log_level);
+#include "dlopen-note.h"
+#include "forward.h"
 
 #if HAVE_OPENSSL
+#ifndef SYSTEMD_CFLAGS_MARKER_LIBOPENSSL
+#  error "missing libopenssl_cflags in meson dependency."
+#endif
 
 #  include <openssl/ssl.h>              /* IWYU pragma: export */
 
@@ -42,5 +44,7 @@ extern DLSYM_PROTOTYPE(TLS_client_method);
         sym_SSL_CTX_ctrl((ctx), SSL_CTRL_SET_MIN_PROTO_VERSION, (version), NULL)
 
 DEFINE_TRIVIAL_CLEANUP_FUNC_FULL_RENAME(SSL*, sym_SSL_free, SSL_freep, NULL);
-
+DEFINE_TRIVIAL_CLEANUP_FUNC_FULL_RENAME(SSL_CTX*, sym_SSL_CTX_free, SSL_CTX_freep, NULL);
 #endif
+
+int dlopen_libssl(int log_level) _dlopen_loader_;

@@ -16,7 +16,7 @@
 #include "hexdecoct.h"
 #include "io-util.h"
 #include "iovec-util.h"
-#include "label.h"
+#include "label-util.h"
 #include "log.h"
 #include "mkdir.h"
 #include "nulstr-util.h"
@@ -219,7 +219,8 @@ static int write_string_file_atomic_at(
                 const char *fn,
                 const char *line,
                 WriteStringFileFlags flags,
-                const struct timespec *ts) {
+                const struct timespec *ts,
+                LabelContext *label_context) {
 
         _cleanup_fclose_ FILE *f = NULL;
         _cleanup_free_ char *p = NULL;
@@ -235,7 +236,7 @@ static int write_string_file_atomic_at(
 
         bool call_label_ops_post = false;
         if (FLAGS_SET(flags, WRITE_STRING_FILE_LABEL)) {
-                r = label_ops_pre(dir_fd, fn, mode);
+                r = label_ops_pre(dir_fd, fn, mode, label_context);
                 if (r < 0)
                         return r;
 
@@ -243,7 +244,7 @@ static int write_string_file_atomic_at(
         }
 
         r = fopen_temporary_at(dir_fd, fn, &f, &p);
-        int k = call_label_ops_post ? label_ops_post(f ? fileno(f) : dir_fd, f ? NULL : fn, /* created= */ !!f) : 0;
+        int k = call_label_ops_post ? label_ops_post(f ? fileno(f) : dir_fd, f ? NULL : fn, /* created= */ !!f, label_context) : 0;
         /* If fopen_temporary_at() failed in the above, propagate the error code, and ignore failures in
          * label_ops_post(). */
         if (r < 0)
@@ -276,13 +277,14 @@ static int write_string_file_atomic_at(
         return 0;
 }
 
-int write_string_file_full(
+int write_string_file_full_label(
                 int dir_fd,
                 const char *fn,
                 const char *line,
                 WriteStringFileFlags flags,
                 const struct timespec *ts,
-                const char *label_fn) {
+                const char *label_fn,
+                LabelContext *label_context) {
 
         bool made_file = false;
         _cleanup_fclose_ FILE *f = NULL;
@@ -307,7 +309,7 @@ int write_string_file_full(
                 assert(fn);
                 assert(flags & WRITE_STRING_FILE_CREATE);
 
-                r = write_string_file_atomic_at(dir_fd, fn, line, flags, ts);
+                r = write_string_file_atomic_at(dir_fd, fn, line, flags, ts, label_context);
                 if (r < 0)
                         goto fail;
 
@@ -326,7 +328,7 @@ int write_string_file_full(
                 bool call_label_ops_post = false;
 
                 if (FLAGS_SET(flags, WRITE_STRING_FILE_LABEL|WRITE_STRING_FILE_CREATE)) {
-                        r = label_ops_pre(dir_fd, label_fn ?: fn, mode);
+                        r = label_ops_pre(dir_fd, label_fn ?: fn, mode, label_context);
                         if (r < 0)
                                 goto fail;
 
@@ -345,7 +347,7 @@ int write_string_file_full(
                 if (call_label_ops_post)
                         /* If openat_report_new() failed in the above, propagate the error code, and ignore
                          * failures in label_ops_post(). */
-                        RET_GATHER(r, label_ops_post(fd >= 0 ? fd : dir_fd, fd >= 0 ? NULL : fn, made_file));
+                        RET_GATHER(r, label_ops_post(fd >= 0 ? fd : dir_fd, fd >= 0 ? NULL : fn, made_file, label_context));
         }
         if (r < 0)
                 goto fail;
@@ -400,6 +402,26 @@ int write_string_filef(
         return write_string_file(fn, p, flags);
 }
 
+int write_string_filef_at(
+                int dir_fd,
+                const char *fn,
+                WriteStringFileFlags flags,
+                const char *format, ...) {
+
+        _cleanup_free_ char *p = NULL;
+        va_list ap;
+        int r;
+
+        va_start(ap, format);
+        r = vasprintf(&p, format, ap);
+        va_end(ap);
+
+        if (r < 0)
+                return -ENOMEM;
+
+        return write_string_file_at(dir_fd, fn, p, flags);
+}
+
 int write_base64_file_at(
                 int dir_fd,
                 const char *fn,
@@ -420,15 +442,29 @@ int read_one_line_file_at(int dir_fd, const char *filename, char **ret) {
         _cleanup_fclose_ FILE *f = NULL;
         int r;
 
-        assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
+        assert(wildcard_fd_is_valid(dir_fd));
         assert(filename);
         assert(ret);
 
-        r = fopen_unlocked_at(dir_fd, filename, "re", 0, &f);
+        r = fopen_unlocked_at(dir_fd, filename, "re", /* open_flags= */ 0, &f);
         if (r < 0)
                 return r;
 
         return read_line(f, LONG_LINE_MAX, ret);
+}
+
+int read_boolean_file_at(int dir_fd, const char *filename) {
+        _cleanup_free_ char *s = NULL;
+        int r;
+
+        assert(wildcard_fd_is_valid(dir_fd));
+        assert(filename);
+
+        r = read_one_line_file_at(dir_fd, filename, &s);
+        if (r < 0)
+                return r;
+
+        return parse_boolean(s);
 }
 
 int verify_file_at(int dir_fd, const char *fn, const char *blob, bool accept_extra_nl) {
@@ -754,7 +790,9 @@ int read_full_stream_full(
                 if (feof(f))
                         break;
 
-                if (size != SIZE_MAX && !FLAGS_SET(flags, READ_FULL_FILE_FAIL_WHEN_LARGER)) { /* If we got asked to read some specific size, we already sized the buffer right, hence leave */
+                if (size != SIZE_MAX && !FLAGS_SET(flags, READ_FULL_FILE_FAIL_WHEN_LARGER)) {
+                        /* If we got asked to read some specific size, we already sized the buffer right,
+                         * hence leave. */
                         assert(l == size);
                         break;
                 }
@@ -798,9 +836,9 @@ int read_full_stream_full(
         }
 
         if (!ret_size) {
-                /* Safety check: if the caller doesn't want to know the size of what we just read it will rely on the
-                 * trailing NUL byte. But if there's an embedded NUL byte, then we should refuse operation as otherwise
-                 * there'd be ambiguity about what we just read. */
+                /* Safety check: if the caller doesn't want to know the size of what we just read it will
+                 * rely on the trailing NUL byte. But if there's an embedded NUL byte, then we should refuse
+                 * operation as otherwise there'd be ambiguity about what we just read. */
 
                 if (memchr(buf, 0, l)) {
                         r = -EBADMSG;
@@ -1010,13 +1048,19 @@ static int xfopenat_regular(int dir_fd, const char *path, const char *mode, int 
 
         /* A combination of fopen() with openat() */
 
-        assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
+        assert(wildcard_fd_is_valid(dir_fd));
         assert(mode);
         assert(ret);
 
         if (dir_fd == AT_FDCWD && path && open_flags == 0)
                 f = fopen(path, mode);
-        else {
+        else if (dir_fd == XAT_FDROOT && path && open_flags == 0) {
+                _cleanup_free_ char *j = strjoin("/", path);
+                if (!j)
+                        return -ENOMEM;
+
+                f = fopen(j, mode);
+        } else {
                 _cleanup_close_ int fd = -EBADF;
                 int mode_flags;
 
@@ -1051,7 +1095,7 @@ static int xfopenat_unix_socket(int dir_fd, const char *path, const char *bind_n
         FILE *f;
         int r;
 
-        assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
+        assert(wildcard_fd_is_valid(dir_fd));
         assert(ret);
 
         sk = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0);
@@ -1099,7 +1143,7 @@ int xfopenat_full(
         FILE *f = NULL;  /* avoid false maybe-uninitialized warning */
         int r;
 
-        assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
+        assert(wildcard_fd_is_valid(dir_fd));
         assert(mode);
         assert(ret);
 
@@ -1253,7 +1297,7 @@ static int search_and_fopen_internal(
         assert(path);
         assert(mode || !ret_file);
 
-        r = search_and_open(
+        r = search_and_open_internal(
                         path,
                         mode ? fopen_mode_to_flags(mode) : 0,
                         root,
@@ -1669,7 +1713,7 @@ int write_data_file_atomic_at(
 
         int r;
 
-        assert(dir_fd >= 0 || IN_SET(dir_fd, AT_FDCWD, XAT_FDROOT));
+        assert(wildcard_fd_is_valid(dir_fd));
 
         /* This is a cousin of write_string_file_atomic(), but operates with arbitrary struct iovec binary
          * data (rather than strings), works without FILE* streams, and does direct syscalls instead. */

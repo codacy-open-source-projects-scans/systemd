@@ -118,15 +118,191 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   That requires distros to enable CONFIG_ACPI_FPDT, and have kernels v5.12 for
   x86 and v6.2 for arm.
 
-- Remove support for deprecated FactoryReset EFI variable in
-  systemd-repart, replaced by FactoryResetRequest (was planned for v260).
-
 - Consider removing root=gpt-auto, and push people to use root=dissect instead.
 
 - remove any trace of "cpuacct" cgroup controller, it's a cgroupv1 thing.
   similar "devices"
 
+- drop socket_xattr_supported() once our baseline is kernel 7.0
+
 ## Features
+
+- sysext: condition confext/sysext on machine tags, too
+
+- sysupdate: add health check logic, revert updates if fail
+
+- sysupdate: run things in a loop always, to deal with stepping stones, and
+  adding new transfer files. finish, when stable.
+
+- sysupdate: add flag field for features and components, to require a restart
+  of the update loop once they have been updated.
+
+- confext/sysext: add policy file concept: json files that encode for relevant
+  confext/sysext ddis rules when to enable them, i.e. version checks. also use
+  it for the garbage collector
+
+- confext/sysext: mark system as refusing refreshes until reboot if
+  confext/sysext says it require a reboot
+
+- cryptsetup: add a new switch which makes it wait for the keyfile to
+  appear. use inotify/mount watching for that. usecase: system waits at boot
+  for some key to be supplied, possibly delivered via confext or so. This could
+  be useful in particular in CoCo scenarios where a disk encryption key is only
+  handed out once an attestation run completed, and might be delivered to the
+  node asynchronously.
+
+- acquire a TSA from time stamping server, include it in report
+
+- **report:**
+  - implement metrics provider in logind: report number of active
+    sessions, and number of sessions since boot.
+  - implement metrics provider in journald that reports number of log messages
+    received since boot, by log priority
+  - allow to compile statically (together with the basic and cgroup
+    backends)
+  - make sure backends can also be invoked via forking off
+  - allow metrics providers to indicate which reported values mean
+    "nothing"/"invalid"/"zero"/"please-suppress". Then use that to reduce noise
+    in systemd-report output.
+  - implement metrics provider that reports bound open IP ports
+  - metrics from pid1: suppress metrics form units that are inactive and have nothing to report
+  - pass filtering hints to services, so that they can also be applied server-side, not just client side
+  - add "hint-suppress-zero" flag (which suppresses all metrics which are zero)
+  - add "hint-object" parameter (which only queries info about certain object)
+  - backends for: nvme/smart disk health counters, lldp neighbors, deployment
+    timestamp
+
+- bootctl set-tries for setting retry counters on boot entries
+
+- implement enough of PCP in a new sd-pcp-client library that networkd can use
+  to punch holes for wireguard into common NAT routers. use that in networkd. alternatively: just use libjuice
+
+- measure an uapi16 manifest of /etc/ during early boot (so that
+  pre-initialized /etc/ can be detected when systems are enrolled into some
+  subsystem)
+
+- optionally turn off import of imds on non-firstboot creds (so that IMDS can
+  be considered an attack vector, except for TOFU)
+
+- store workload identity OIDC server contact info in cloud imds hwdb.
+
+- systemd-analyze unit-shell-me-harder that has both host and unit trees around
+  but mostly lives in unit namespaces
+
+- os-release consumption at boot: version validation, and maybe in os-release
+
+- ed25519 authentication for sd-boot upgrades for the dm-verity key logic
+
+- in sysupdate resolve %C or so as specifier in transfer fields to the value of
+  a specific machine tag channel= or so.
+
+- make vmspawn parse UKIs for direct kernel boot
+
+- portabled driving by system credential
+
+- nspawn: optionally provide a /dev/tpm0 + /dev/tpmrm0 that is backed by swtpm,
+  much like we do in vmspawn. let's us minimize differences between
+  environments systemd runs in.
+
+- nspawn/vmspawn: add a concept how we can hand into the payload some proof
+  that it is running on a certain host, which it can then include in the report,
+  and which allows us to put together a map about which node runs as payload of
+  which other node. in particular useful for transient nodes, as it gives them
+  a better location
+
+- add a small varlink service that wraps the raw sftp logic (without ssh) after a
+  varlink protocol upgrade, which enables varlink clients to do file transfers,
+  which is in particular useful when accessing a system via http varlink proxy
+
+- add a small varlink service that allocates a pty and then does ptyfwd stuff
+  after a protocol upgrade on the incoming connection. Then spawn a shell/getty
+  on it. This enables varlink clients to acquire a fully featured ssh-like
+  interactive tty/shell via varlink, which is again useful via http varlink
+  proxy.
+
+- add something like podman's conmon as a native systemd subsystem:
+  i.e. allocate ptys, that can be bound to stdio/console of containers and VMs,
+  that maintain a bit of a scrollback buffer, and one can reconnect to
+  later. fun idea: might even make /dev/tty1 and friends accessible via
+  /dev/vcsa1 under the same protocol. this subsystem should potentially be the
+  same as the varlink ssh-like thing listed above.
+
+- maybe introduce a new ansi sequence that allows propagate SIGWINCH
+  inline. Idea would be: to enable inline notification of window sizes client
+  sends a new, to be defined ANSI sequence with its current assumption of
+  terminal size. Server compares it with current state. If the same it sends
+  nothing immediately, but does send exactly one update if it changes, and
+  disables the logic. If not the same sends correction immediately, and
+  disables the logic. Client has to reissue sequence immediately after getting
+  notification to get live updates. Benefit of all of this: better terminal
+  experience if we just forward terminal bytes through a serial link/stream
+  connection, as terminal sizes will be properly propagated. Write a UAPI spec
+  for all this. ptyfwd could translate turn upstream SIGWINCH into upstream
+  sequences of this type, so that every step of the way we get the right
+  behaviour.
+
+- implement "varlinkctl trace" or so, that watches socket traffic on a group of
+  processes (select by pid, select by cgroup, select by all machine), and shows
+  traffic of all sockets marked via the new varlink socket xattrs. Use BPF for
+  all of that of course.
+
+- add tooling for generating dictionary-based hostnames
+
+- do not pull dbus daemon/broker anymore, instead lazy activate it. Given how
+  the Varlinkifcation has progressed various non-desktop usescase might not
+  need D-Bus running at all anymore.
+
+- format-table: introduce the concept of a "title" for a table, which remains
+  closely associated with the table. in most cases where want to output
+  multiple tables from the same tool we want to separate things with a title,
+  hence we might as well associate the title with the table itself, and
+  streamline a few things.
+
+- sysupdate: offer reading transfer files/components/features optionally from
+  some JSON fragment rather than transfer files, so that we can update it
+  independently from any DDI, and it needs no activation cycle. Why? so that
+  making additional transfers/components/features available can be done without
+  reloading confext/sysext, and out-band with other configuration changes.
+
+- sysupdate: go through all components, and update them all, one by one.
+
+- pcrextend: we probably should measure /etc/machine-info during boot somehow
+
+- pcrextend: we should measure something when we enter developer mode, by some
+  definition of developer mode.
+
+- firstboot: optionally accept credentials at firstboot without authentication
+
+- firstboot/sysinstall: add simple interface for prompting users to enable
+  "features" exposed by sysupdate.
+
+- a tool that can prep credentials, put them in the ESP, for provisioning
+  systems for SBC or UEFI/HTTP boot. Should be doing what sysinstall does with
+  the credentials, and maybe even *be* sysinstall.
+
+- make sure we always pass O_NOFOLLOW on O_CREAT
+
+- xopenat(): maybe imply O_NOFOLLOW on O_CREAT
+
+- StorageProvider interface + storagectl
+  - hook-up in systemd-nspawn
+  - hook-up in service manager (BindVolume=)
+  - introduce a locking concept: right now all access to volumes is fully
+    shared. Let's add a basic locking concept: supporting backends can take an
+    additional locking flag (which has to be combined with Varlink's "more"),
+    in which case access would only be handed out to one client at a time, with
+    the lock's lifetime synced up with the Varlink connection lifetime.
+  - introduce a volume lifecycle concept: optionally support volumes whose
+    whole lifecycle is associated with the varlink connections they are tied
+    to: when the last varlink connection that acquired them goes away, the
+    volume is auto-destroyed. Would be exposed via a new flag on the Acquire
+    call, similar to the locking logic above.
+
+- clean up credential naming a bit: let's say encrypted creds always should
+  carry .cred suffix, and unencrypted should not.
+
+- clean up naming of sidecar files in sd-stub: let's put global ones strictly
+  into /loader/extras/
 
 - a small tool that can do basic btrfs raid policy mgmt. i.e. gets started as
   part of the initial transaction for some btrfs raid fs, waits for some time,
@@ -134,16 +310,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   are not showing up, then counts down, eventually set a flag somewhere, and
   retriggers the fs is was invoked for, which causes the udev rules to rerun
   that assemble the btrfs raid, but this time force degraded assembly.
-
-- add a report backend that simply exposes a bunch of static files that are
-  symlinked to some dir {/run,/etc/,/var/lib/}systemd/report-files/ or so as
-  facts. Use that for exposing SSH keys and suchlike.
-
-- report generators for:
-  - ip addresses
-  - imds address
-  - tpm event log
-  - open IP ports
 
 - a way for container managers to turn off getty starting via $container_headless= or so...
 
@@ -160,6 +326,16 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   booting and so on. Then, when dissecting DDI allow specifying a purpose to
   use as additional search condition. Use case: images that combined a sysext
   partition with a portable service partition in one.
+
+- **systemd-sysinstall:**
+  - read installation definition from json file
+  - polkit support in sysinstall
+  - sysinstall: permit driving installer via credentials
+  - add --offline=no mode where we talk to socket based services rather than forking off
+  - if a user doesn't pick a locale during boot into installer, don't ask again after install, because we suppressed credential propagation
+
+- repart: add MatchLabel= which matches against partition label, so that we
+  truly can install different images in parallel
 
 - add "systemctl wait" or so, which does what "systemd-run --wait" does, but
   for all units. It should be both a way to pin units into memory as well as a
@@ -186,8 +362,8 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   - download list + report updates in motd – but do not auto update
   - download list + download new version – but do not apply it
   - download list + download new version + apply it – but do not reboot
-  - download list + donwload new version + apply it + reboot
-  Other things the policy shoudl contain is when to place the reboot.
+  - download list + download new version + apply it + reboot
+  Other things the policy should contain is when to place the reboot.
   This would all decouple the updating of the package list from the application
   of it. Which is great for "countme" style stuff.
 
@@ -323,7 +499,7 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 
 - add bus API to retrieve current unit file contents (i.e. implement "systemctl cat" on the bus only)
 
-- Add ConditionDirectoryNotEmpty= handle non-absoute paths as a search path or add
+- Add ConditionDirectoryNotEmpty= handle non-absolute paths as a search path or add
   ConditionConfigSearchPathNotEmpty= or different syntax? See the discussion starting at
   https://github.com/systemd/systemd/pull/15109#issuecomment-607740136.
 
@@ -348,7 +524,7 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   when it is otherwise off
 
 - add growvol and makevol options for /etc/crypttab, similar to
-  x-systemd.growfs and x-systemd-makefs.
+  x-systemd.growfs and x-systemd.makefs.
 
 - Add knob to cryptsetup, to trigger automatic reboot on failure to unlock
   disk. Enable this by default for rootfs, also in gpt-auto-generator
@@ -584,7 +760,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 - clean up date formatting and parsing so that all absolute/relative timestamps we format can also be parsed
 
 - **complete varlink introspection comments:**
-  - io.systemd.Hostname
   - io.systemd.ManagedOOM
   - io.systemd.Network
   - io.systemd.PCRLock
@@ -679,11 +854,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 - sysext: make systemd-{sys,conf}ext-sysroot.service work in the split `/var`
   configuration.
 
-- introduce a concept of /etc/machine-info "TAGS=" field that allows tagging
-  machines with zero, one or more roles, states or other forms of
-  categorization. Then, add a way of using this in sysupdate to automatically
-  enable certain transfers, one for each role.
-
 - sd-varlink: add fully async modes of the protocol upgrade stuff
 
 - repart: maybe remove iso9660/eltorito superblock from disk when booting via
@@ -698,15 +868,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   should be able to safely try another attempt when the bus call LoadUnit() is invoked.
 
 - ddi must be listed as block device fstype
-
-- define a generic "report" varlink interface, which services can implement to
-  provide health/statistics data about themselves. then define a dir somewhere
-  in /run/ where components can bind such sockets. Then make journald, logind,
-  and pid1 itself implement this and expose various stats on things there. Then
-  issue parallel calls to these interfaces from the systemd-report tool,
-  combine into one json document, and include measurement logs and tpm
-  quote. tpm quote should protect the json doc via the nonce field
-  studd. Allow shipping this off elsewhere for analyze.
 
 - define a JSON format for units, separating out unit definitions from unit
   runtime state. Then, expose it:
@@ -780,18 +941,7 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 
 - drop nss-myhostname in favour of nss-resolve?
 
-- drop NV_ORDERLY flag from the product uuid nvpcr. Effect of the flag is that
-  it pushes the thing into TPM RAM, but a TPM usually has very little of that,
-  less than NVRAM. hence setting the flag amplifies space issues. Unsetting the
-  flag increases wear issues on the NVRAM, however, but this should be limited
-  for the product uuid nvpcr, since its only changed once per boot. this needs
-  to be configurable by nvpcr however, as other nvpcrs are different,
-  i.e. verity one receives many writes during system uptime quite
-  possibly. (also, NV_ORDERLY makes stuff faster, and dropping it costs
-  possibly up to 100ms supposedly)
-
 - **EFI:**
-  - honor language efi variables for default language selection (if there are any?)
   - honor timezone efi variables for default timezone selection (if there are any?)
 
 - enable LockMLOCK to take a percentage value relative to physical memory
@@ -1037,7 +1187,7 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   inspiration from IMA log)
 
 - Hook up journald's FSS logic with TPM2: seal the verification disk by
-  time-based policy, so that the verification key can remain on host and ve
+  time-based policy, so that the verification key can remain on host and be
   validated via TPM.
 
 - Hook up systemd-journal-upload with RESTART_RESET=1 logic (should probably
@@ -1118,14 +1268,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 - in pid1: include ExecStart= cmdlines (and other Exec*= cmdlines) in polkit
   request, so that policies can match against command lines.
 
-- in sd-boot and sd-stub measure the SMBIOS vendor strings to some PCR (at
-  least some subset of them that look like systemd stuff), because apparently
-  some firmware does not, but systemd honours it. avoid duplicate measurement
-  by sd-boot and sd-stub by adding LoaderFeatures/StubFeatures flag for this,
-  so that sd-stub can avoid it if sd-boot already did it.
-
-- in sd-id128: also parse UUIDs in RFC4122 URN syntax (i.e. chop off urn:uuid: prefix)
-
 - in sd-stub: optionally add support for a new PE section .keyring or so that
   contains additional certificates to include in the Mok keyring, extending
   what shim might have placed there. why? let's say I use "ukify" to build +
@@ -1174,14 +1316,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   over to do all cgroupfs access only via that structure's fd.
 
 - introduce a new group to own TPM devices
-
-- introduce a small "systemd-installer" tool or so, that glues
-  systemd-repart-as-installer and bootctl-install into one. Would just
-  interactively ask user for target disk (with completion and so on), and then do
-  two varlink calls to the the two tools with the right parameters. To support
-  "offline" operation, optionally invoke the two tools directly as child
-  processes with varlink communication over socketpair(). This all should be
-  useful as blueprint for graphical installers which should do the same.
 
 - introduce an option (or replacement) for "systemctl show" that outputs all
   properties as JSON, similar to busctl's new JSON output. In contrast to that
@@ -1492,33 +1626,11 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 
 - man: the documentation of Restart= currently is very misleading and suggests the tools from ExecStartPre= might get restarted.
 
-- maybe add a "systemd-report" tool, that generates a TPM2-backed "report" of
-  current system state, i.e. a combination of PCR information, local system
-  time and TPM clock, running services, recent high-priority log
-  messages/coredumps, system load/PSI, signed by the local TPM chip, to form an
-  enhanced remote attestation quote. Use case: a simple orchestrator could use
-  this: have the report tool upload these reports every 3min somewhere. Then
-  have the orchestrator collect these reports centrally over a 3min time
-  window, and use them to determine what which node should now start/stop what,
-  and generate a small confext for each node, that uses Uphold= to pin services
-  on each node.  The confext would be encrypted using the asymmetric encryption
-  proposed above, so that it can only be activated on the specific host, if the
-  software is in a good state, and within a specific time frame. Then run a
-  loop on each node that sends report to orchestrator and then sysupdate to
-  update confext.  Orchestrator would be stateless, i.e. operate on desired
-  config and collected reports in the last 3min time window only, and thus can
-  be trivially scaled up since all instances of the orchestrator should come to
-  the same conclusions given the same inputs of reports/desired workload info.
-  Could also be used to deliver Wireguard secrets and thus to clients, thus
-  permitting zero-trust networking: secrets are rolled over via confext updates,
-  and via the time window TPM logic invalidated if node doesn't keep itself
-  updated, or becomes corrupted in some way.
-
 - maybe add a new standard slice where process that are started in the initrd
   and stick around for the whole system runtime (i.e. root fs storage daemons,
   the bpf loader daemon discussed above, and such) are placed. maybe
   protected.slice or so? Then write docs that suggest that services like this
-  set Slice=protected.sice, RefuseManualStart=yes, RefuseManualStop=yes and a
+  set Slice=protected.slice, RefuseManualStart=yes, RefuseManualStop=yes and a
   couple of other things.
 
 - maybe add call sd_journal_set_block_timeout() or so to set SO_SNDTIMEO for
@@ -1603,10 +1715,10 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 - Maybe introduce an InodeRef structure inspired by PidRef, which references a
   specific inode, and combines: a path, an O_PATH fd, and possibly a FID into
   one. Why? We often pass around path and fd separately in chaseat() and similar
-  calls. Because passing around both separately is cumbersome we sometimes only
-  one pass one, once the other and sometimes both. It would make the code a lot
-  simpler if we could path both around at the same time in a simple way, via an
-  InodeRef which *both* pins the inode via an fd, *and* gives us a friendly
+  calls. Because passing around both separately is cumbersome we sometimes pass
+  only one, sometimes the other, and sometimes both. It would make the code a
+  lot simpler if we could pass both around at the same time in a simple way, via
+  an InodeRef which *both* pins the inode via an fd, *and* gives us a friendly
   name for it.
 
 - maybe introduce an OSC sequence that signals when we ask for a password, so
@@ -1657,10 +1769,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 - maybe: in PID1, when we detect we run in an initrd, make superblock read-only
   early on, but provide opt-out via kernel cmdline.
 
-- measure all log-in attempts into a new nvpcr
-
-- measure credentials picked up from SMBIOS to some suitable PCR
-
 - measure GPT and LUKS headers somewhere when we use them (i.e. in
   systemd-gpt-auto-generator/systemd-repart and in systemd-cryptsetup?)
 
@@ -1672,8 +1780,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 - Merge systemd-creds options --uid= (which accepts user names) and --user.
 
 - merge unit_kill_common() and unit_kill_context()
-
-- MessageQueueMessageSize= (and suchlike) should use parse_iec_size().
 
 - mount /tmp/ and /var/tmp with a uidmap applied that blocks out "nobody" user
   among other things such as dynamic uid ranges for containers and so on. That
@@ -1812,7 +1918,7 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 
 - oci: add support for "importctl import-oci" which implements the "OCI layout"
   spec (i.e. acquiring via local fs access), as opposed to the current
-  "importctl pull-oci" which focusses on the "OCI image spec", i.e. downloads
+  "importctl pull-oci" which focuses on the "OCI image spec", i.e. downloads
   from the web (i.e. acquiring via URLs).
 
 - oci: add support for blake hashes for layers
@@ -1823,8 +1929,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   and use it for validating DDIs and credentials. Maybe upload it to the kernel
   keyring, so that the kernel does this validation for us for verity and kernel
   modules
-
-- on first login of a user, measure its identity to some nvpcr
 
 - on shutdown: move utmp, wall, audit logic all into PID 1 (or logind?)
 
@@ -1845,9 +1949,9 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 - pam_systemd: on interactive logins, maybe show SUPPORT_END information at
   login time, à la motd
 
-- pam_systemd_home: add module parameter to control whether to only accept
-  only password or only pcks11/fido2 auth, and then use this to hook nicely
-  into two of the three PAM stacks gdm provides.
+- pam_systemd_home: add module parameter to control whether to accept only
+  password or only pkcs11/fido2 auth, and then use this to hook nicely into two
+  of the three PAM stacks gdm provides.
   See discussion at https://github.com/authselect/authselect/pull/311
 
 - paranoia: whenever we process passwords, call mlock() on the memory
@@ -1938,6 +2042,11 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   - lock image configured with RootDirectory=/RootImage= using the usual nspawn semantics while the unit is up
   - find a way how we can reload unit file configuration for
     specific units only, without reloading the whole of systemd
+  - figure out why 'systemctl set-property --runtime avahi-daemon.service TimeoutStartSec=150'
+    fails with org.freedesktop.DBus.Error.PropertyReadOnly
+  - report org.freedesktop.DBus.Error.PropertyReadOnly better than
+    "Cannot set property JobTimeoutUSec, or unknown property."
+  - allow 'systemctl start --property=…' ?
 
 - **PidRef conversion work:**
   - cg_pid_get_xyz()
@@ -1999,7 +2108,7 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 - ptyfwd: use osc context information in vmspawn/nspawn/… to optionally only
   listen to ^]]] key when no further vmspawn/nspawn context is allocated
 
-- ptyfwd: usec osc context information to propagate status messages from
+- ptyfwd: use osc context information to propagate status messages from
   vmspawn/nspawn to service manager's "status" string, reporting what is
   currently in the fg
 
@@ -2072,14 +2181,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 - report: have something that requests cloud workload identity bearer tokens
   and includes it in the report
 
-- **report:**
-  - plug "facts" into systemd-report too, i.e. stuff that is more static, such as hostnames, ssh keys and so on.
-  - pass filtering hints to services, so that they can also be applied server-side, not just client side
-  - metrics from pid1: suppress metrics form units that are inactive and have nothing to report
-  - add "hint-suppress-zero" flag (which suppresses all metrics which are zero)
-  - add "hint-object" parameter (which only queries info about certain object)
-  - make systemd-report a varlink service
-
 - Reset TPM2 DA bit on each successful boot
 
 - **resolved:**
@@ -2147,10 +2248,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   for the measurement log.
 
 - run0: maybe enable utmp for run0 sessions, so that they are easily visible.
-
-- sd-boot/sd-stub: install a uefi "handle" to a sidecar dir of bls type #1
-  entries with an "uki" or "uki-url" stanza, and make sd-stub look for
-  that. That way we can parameterize type #1 entries nicely.
 
 - **sd-boot:**
   - do something useful if we find exactly zero entries (ignoring items
@@ -2304,8 +2401,8 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   PR_SET_DUMPABLE so that it cannot be ptraced from the host. Should have
   CAP_SYS_BPF as only service around.
 
-- SIGRTMIN+18 and memory pressure handling should still be added to: hostnamed,
-  localed, oomd, timedated.
+- SIGRTMIN+18 and memory pressure handling should still be added to: localed,
+  oomd, timedated.
 
 - socket units: allow creating a udev monitor socket with ListenDevices= or so,
   with matches, then activate app through that passing socket over
@@ -2332,6 +2429,12 @@ SPDX-License-Identifier: LGPL-2.1-or-later
     as mass storage devices on systems that have a USB controller that can
     operate in device mode
   - add NVMe authentication
+
+- **sigpwr.target** doesn't do anything useful. Consider hooking it up to
+  poweroff.target.
+
+- Provide a fallback in **rescue.service** that prints a fixed message
+  if sulogin-shell could not be started.
 
 - support boot into nvme-over-tcp: add generator that allows specifying nvme
   devices on kernel cmdline + credentials. Also maybe add interactive mode
@@ -2416,9 +2519,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   the dropped in certs and encrypted with machine pubkey, and pass to machine.
   Machine is then able to authenticate you, and confidentiality is guaranteed.
 
-- systemd-cryptenroll: add --firstboot or so, that will interactively ask user
-  whether recovery key shall be enrolled and do so
-
 - systemd-dissect: add --cat switch for dumping files such as /etc/os-release
 
 - systemd-dissect: show available versions inside of a disk image, i.e. if
@@ -2470,10 +2570,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
     that we can sanely copy ESP contents, /usr/ images, and then set up btrfs
     raid for the root fs to extend/mirror the existing install. This would be
     very similar to the concept of live-install-through-btrfs-migration.
-  - add --installer or so, that will interactively ask for a
-    target disk, maybe ask for confirmation, and install something on disk. Then,
-    hook that into installer.target or so, so that it can be used to
-    install/replicate installs
   - should probably enable btrfs' "temp_fsid" feature for all file
     systems it creates, as we have no interest in RAID for repart, and it should
     make sure that we can mount them trivially everywhere.
@@ -2535,9 +2631,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   runs it in a new namespace and then just executes the selected binary within
   it. Could be useful to run one-off binaries inside a sysext as a CLI tool.
 
-- systemd-tmpfiles: add concept for conditionalizing lines on factory reset
-  boot, or on first boot.
-
 - systemd-tpm2-setup should support a mode where we refuse booting if the SRK
   changed. (Must be opt-in, to not break systems which are supposed to be
   migratable between PCs)
@@ -2545,8 +2638,9 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 - systemd-tpm2-support: add a some logic that detects if system is in DA
   lockout mode, and queries the user for TPM recovery PIN then.
 
-- systemd: add storage API via varlink, where everyone can drop a socket in a
-  dir, similar, do the same thing for networking
+- add a networking provider API, inspired by the StorageProvider. Make networkd
+  a provider that exposes interfaces for adding tap, tun, veth via the api,
+  base this on .netdev logic somehow.
 
 - $SYSTEMD_EXECPID that the service manager sets should
   be augmented with $SYSTEMD_EXECPIDFD (and similar for
@@ -2565,7 +2659,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   - download multiple arbitrary patterns from same source
   - SHA256SUMS format with bearer tokens for each resource to download
   - decrypt SHA256SUMS with key from tpm
-  - clean up stuff on disk that disappears from SHA256SUMS
   - turn http backend stuff int plugin via varlink
   - for each transfer support looking at multiple sources,
     pick source with newest entry. If multiple sources have the same entry, use
@@ -2597,9 +2690,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   with success notifications from nspawn payloads. When this is enabled,
   automatically support reverting back to older OS version images if newer ones
   fail to boot.
-
-- **test/:**
-  - add unit tests for config_parse_device_allow()
 
 - The bind(AF_UNSPEC) construct (for resetting sockets to their initial state)
   should be blocked in many cases because it punches holes in many sandboxes.
@@ -2646,8 +2736,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   DHCP/HTTP base EFI boot.
 
 - **tmpfiles:**
-  - allow time-based cleanup in r and R too
-  - instead of ignoring unknown fields, reject them.
   - creating new directories/subvolumes/fifos/device nodes
     should not follow symlinks. None of the other adjustment or creation
     calls follow symlinks.
@@ -2656,10 +2744,18 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   - teach tmpfiles.d m/M to move / atomic move + symlink old -> new
   - add new line type for setting btrfs subvolume attributes (i.e. rw/ro)
   - tmpfiles: add new line type for setting fcaps
-  - add -n as shortcut for --dry-run in tmpfiles & sysusers & possibly other places
   - add new line type for moving files from some source dir to some
     target dir. then use that to move sysexts/confexts and stuff from initrd
     tmpfs to /run/, so that host can pick things up.
+  - allow conditionalizing on factory reset boot, or on first boot.
+  - when cleaning up directories, take care of btrfs subvolumes too
+    (ID 927 gen 217573 top level 256 path var/tmp/.#test-btrfs4e8ef947c1122031
+     ID 928 gen 217573 top level 927 path var/tmp/.#test-btrfs4e8ef947c1122031/rec
+     ID 929 gen 217574 top level 928 path var/tmp/.#test-btrfs4e8ef947c1122031/rec/sv2
+     ID 930 gen 217575 top level 928 path var/tmp/.#test-btrfs4e8ef947c1122031/rec/sv3
+     ID 931 gen 217576 top level 930 path var/tmp/.#test-btrfs4e8ef947c1122031/rec/sv3/sub
+     ID 932 gen 217577 top level 928 path var/tmp/.#test-btrfs4e8ef947c1122031/rec/dir/sv4
+     ID 933 gen 217578 top level 932 path var/tmp/.#test-btrfs4e8ef947c1122031/rec/dir/sv4/dir/sv5)
 
 - To mimic the new tpm2-measure-pcr= crypttab option and tpm2-measure-nvpcr=
   veritytab option, add the same to integritytab (measuring the HMAC key if one
@@ -2714,10 +2810,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   - reimport udev db after MOVE events for devices without dev_t
   - re-enable ProtectClock= once only cgroupsv2 is supported.
     See f562abe2963bad241d34e0b308e48cf114672c84.
-
-- **udevadm: to make symlink querying with udevadm nicer:**
-  - do not enable the pager for queries like 'udevadm info -q symlink -r'
-  - add mode with newlines instead of spaces (for grep)?
 
 - udevd: extend memory pressure logic: also kill any idle worker processes
 
@@ -2779,7 +2871,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   - coredumpctl
   - systemd-bless-boot
   - systemd-measure
-  - systemd-cryptenroll (to allow UIs to enroll FIDO2 keys and such)
   - systemd-dissect
   - systemd-sysupdate
   - systemd-analyze
@@ -2932,8 +3023,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   data in the image, make sure the image filename actually matches this, so
   that images cannot be misused.
 
-- when no locale is configured, default to UEFI's PlatformLang variable
-
 - when switching root from initrd to host, set the machine_id env var so that
   if the host has no machine ID set yet we continue to use the random one the
   initrd had set.
@@ -2946,6 +3035,9 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 
 - whenever we receive fds via SCM_RIGHTS make sure none got dropped due to the
   reception limit the kernel silently enforces.
+
+- after option+verb introspection is added, add a test to verify that the
+  list in proc-cmdline.c matches the actual option list in systemd and shutdown.
 
 - write a document explaining how to write correct udev rules. Mention things
   such as:

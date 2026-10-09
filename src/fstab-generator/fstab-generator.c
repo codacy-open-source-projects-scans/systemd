@@ -14,6 +14,7 @@
 #include "bus-util.h"
 #include "chase.h"
 #include "creds-util.h"
+#include "dlopen-note.h"
 #include "efi-loader.h"
 #include "env-util.h"
 #include "errno-util.h"
@@ -340,6 +341,7 @@ static int write_dependency(
                 const char *where,
                 const char *opts,
                 const char *filter,
+                const char *suffix,
                 const char* const *unit_settings) {
 
         _cleanup_strv_free_ char **unit_names = NULL;
@@ -359,7 +361,9 @@ static int write_dependency(
         STRV_FOREACH(s, unit_names) {
                 _cleanup_free_ char *mangled = NULL;
 
-                r = unit_name_mangle_with_suffix(*s, "as dependency", 0, ".mount", &mangled);
+                r = suffix ?
+                        unit_name_mangle_with_suffix(*s, "as dependency", 0, suffix, &mangled) :
+                        unit_name_mangle(*s, 0, &mangled);
                 if (r < 0)
                         return log_error_errno(r, "Failed to generate dependency unit name for '%s': %m", where);
 
@@ -375,22 +379,24 @@ static int write_dependency(
 
 static int write_after(FILE *f, const char *where, const char *opts) {
         return write_dependency(f, where, opts,
-                                "x-systemd.after\0", STRV_MAKE_CONST("After"));
+                                "x-systemd.after\0", /* suffix= */ ".mount", STRV_MAKE_CONST("After"));
 }
 
 static int write_requires_after(FILE *f, const char *where, const char *opts) {
         return write_dependency(f, where, opts,
-                                "x-systemd.requires\0", STRV_MAKE_CONST("Requires", "After"));
+                                "x-systemd.requires\0", /* suffix= */ ".mount",
+                                STRV_MAKE_CONST("Requires", "After"));
 }
 
 static int write_wants_after(FILE *f, const char *where, const char *opts) {
         return write_dependency(f, where, opts,
-                                "x-systemd.wants\0", STRV_MAKE_CONST("Wants", "After"));
+                                "x-systemd.wants\0", /* suffix= */ ".mount",
+                                STRV_MAKE_CONST("Wants", "After"));
 }
 
 static int write_before(FILE *f, const char *where, const char *opts) {
         return write_dependency(f, where, opts,
-                                "x-systemd.before\0", STRV_MAKE_CONST("Before"));
+                                "x-systemd.before\0", /* suffix= */ ".mount", STRV_MAKE_CONST("Before"));
 }
 
 static int write_mounts_for(
@@ -425,6 +431,11 @@ static int write_mounts_for(
         return 0;
 }
 
+static int write_on_failure(FILE *f, const char *where, const char *opts) {
+        return write_dependency(f, where, opts,
+                                "x-systemd.onfailure\0", /* suffix= */ NULL, STRV_MAKE_CONST("OnFailure"));
+}
+
 static int write_extra_dependencies(FILE *f, const char *where, const char *opts) {
         int r;
 
@@ -456,6 +467,10 @@ static int write_extra_dependencies(FILE *f, const char *where, const char *opts
 
         r = write_mounts_for(f, where, opts,
                              "x-systemd.wants-mounts-for\0", "WantsMountsFor");
+        if (r < 0)
+                return r;
+
+        r = write_on_failure(f, where, opts);
         if (r < 0)
                 return r;
 
@@ -704,7 +719,7 @@ static int add_mount(
                 if (r < 0) {
                         if (r != -EOPNOTSUPP)
                                 return r;
-                } else {
+                } else if (r > 0) {
                         r = generator_hook_up_quotaon(dest, where, target_unit);
                         if (r < 0)
                                 return r;
@@ -801,7 +816,7 @@ static int do_daemon_reload(void) {
 
                 k = bus_call_method(bus, bus_systemd_mgr, "StartUnit", &error, NULL, "ss", unit, "replace");
                 if (k < 0) {
-                        log_error_errno(k, "Failed to (re)start %s: %s", unit, bus_error_message(&error, r));
+                        log_error_errno(k, "Failed to (re)start %s: %s", unit, bus_error_message(&error, k));
                         RET_GATHER(r, k);
                 }
         }
@@ -1239,6 +1254,26 @@ static int add_sysroot_mount(void) {
         if (extra_opts)
                 if (!strextend_with_separator(&combined_options, ",", extra_opts))
                         return log_oom();
+
+        /* A bind mount inherits the mount flags (nosuid, nodev, noexec, …) of the file system the source
+         * directory is located on. The source typically lives below /run/ (e.g. a freshly unpacked tar image
+         * in /run/machines/), which is mounted nosuid,nodev, and these flags would then propagate to our root
+         * file system, breaking suid binaries (e.g. sudo) and device nodes. Since this is supposed to become a
+         * regular OS root file system, default to dev,suid,exec instead, unless the user explicitly requested
+         * otherwise. */
+        if (bind) {
+                static const char* const defaults[] = {
+                        "suid", "suid\0" "nosuid\0",
+                        "dev",  "dev\0"  "nodev\0",
+                        "exec", "exec\0" "noexec\0",
+                        NULL,
+                };
+
+                STRV_FOREACH_PAIR(add, test, defaults)
+                        if (!fstab_test_option(combined_options, *test))
+                                if (!strextend_with_separator(&combined_options, ",", *add))
+                                        return log_oom();
+        }
 
         log_debug("Found entry what=%s where=/sysroot type=%s opts=%s", what, strna(fstype), strempty(combined_options));
 
@@ -1709,6 +1744,11 @@ static int run_generator(void) {
 }
 
 static int run(int argc, char **argv) {
+        LIBCRYPTO_NOTE(suggested);
+        LIBMOUNT_NOTE(recommended);
+        LIBSELINUX_NOTE(recommended);
+        TPM2_NOTE(suggested);
+
         arg_sysroot_check = invoked_as(argv, "systemd-sysroot-fstab-check");
 
         if (arg_sysroot_check) {

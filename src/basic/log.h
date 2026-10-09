@@ -5,7 +5,7 @@
 #include <string.h>
 #include <syslog.h>
 
-#include "basic-forward.h"
+#include "forward.h"
 
 typedef enum LogTarget{
         LOG_TARGET_CONSOLE,
@@ -63,11 +63,14 @@ void log_show_time(bool b);
 bool log_get_show_time(void) _pure_;
 void log_show_tid(bool b);
 bool log_get_show_tid(void) _pure_;
+void log_show_executable(bool b);
+bool log_get_show_executable(void) _pure_;
 
 int log_show_color_from_string(const char *e);
 int log_show_location_from_string(const char *e);
 int log_show_time_from_string(const char *e);
 int log_show_tid_from_string(const char *e);
+int log_show_executable_from_string(const char *e);
 
 /* Functions below that open and close logs or configure logging based on the
  * environment should not be called from library code — this is always a job
@@ -273,6 +276,15 @@ int log_emergency_level(void);
         log_struct_iovec_internal(level, error, PROJECT_FILE, __LINE__, __func__, iovec, n_iovec)
 #define log_struct_iovec(level, iovec, n_iovec) log_struct_iovec_errno(level, 0, iovec, n_iovec)
 
+/* Like log_struct(), but with log_once() semantics */
+#define log_struct_once(level, ...)                                     \
+        ({                                                              \
+                if (ONCE)                                               \
+                        log_struct(level, __VA_ARGS__);                 \
+                else if (LOG_PRI(level) != LOG_DEBUG)                   \
+                        log_struct(LOG_DEBUG, __VA_ARGS__);             \
+        })
+
 /* This modifies the buffer passed! */
 #define log_dump(level, buffer)                                         \
         log_dump_internal(level, 0, PROJECT_FILE, __LINE__, __func__, buffer)
@@ -380,6 +392,8 @@ int log_syntax_parse_error_internal(
 void log_setup(void);
 
 const char* _log_set_prefix(const char *prefix, bool force);
+
+void log_prefix_swap(const char **prefix);
 static inline const char* _log_unset_prefixp(const char **p) {
         assert(p);
         _log_set_prefix(*p, true);

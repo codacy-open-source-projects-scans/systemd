@@ -11,6 +11,7 @@ executables += [
                 ],
                 'dependencies' : [
                         libopenssl_cflags,
+                        tpm2_cflags,
                 ],
         },
         libexec_template + {
@@ -20,6 +21,10 @@ executables += [
                         'ENABLE_BOOTLOADER',
                         'HAVE_OPENSSL',
                         'HAVE_TPM2',
+                ],
+                'dependencies' : [
+                        libopenssl_cflags,
+                        tpm2_cflags,
                 ],
         },
         libexec_template + {
@@ -39,12 +44,17 @@ executables += [
                         'HAVE_OPENSSL',
                         'HAVE_TPM2',
                 ],
+                'dependencies' : [
+                        libopenssl_cflags,
+                        tpm2_cflags,
+                ],
         },
 ]
 
 if conf.get('ENABLE_BOOTLOADER') == 1 and conf.get('HAVE_OPENSSL') == 1 and conf.get('HAVE_TPM2') == 1
         nvpcrs = [ 'cryptsetup',
                    'hardware',
+                   'login',
                    'verity']
         foreach n : nvpcrs
                 custom_target(

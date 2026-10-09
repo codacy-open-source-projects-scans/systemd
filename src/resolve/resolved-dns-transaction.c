@@ -326,6 +326,8 @@ int dns_transaction_new(
                 r = hashmap_replace(s->transactions_by_key, first->key, first);
                 if (r < 0) {
                         LIST_REMOVE(transactions_by_key, first, t);
+                        hashmap_remove(s->manager->dns_transactions, UINT_TO_PTR(t->id));
+                        t->id = 0;
                         return r;
                 }
         }
@@ -786,8 +788,20 @@ static int dns_transaction_emit_tcp(DnsTransaction *t) {
 
                         assert(t->server);
                         r = dnstls_stream_connect_tls(s, t->server);
-                        if (r < 0)
+                        if (r < 0) {
+                                /* If libcrypto is not available treat this like a TLS connection loss, so
+                                 * that opportunistic DNS-over-TLS downgrades to plaintext instead of
+                                 * re-selecting a TLS feature level and failing on every attempt. */
+                                if (r == -EOPNOTSUPP) {
+                                        log_struct_once(LOG_WARNING,
+                                                        LOG_MESSAGE_ID(SD_MESSAGE_MISSING_DEPENDENCY_STR),
+                                                        LOG_ITEM("FEATURE=DNS-over-TLS"),
+                                                        LOG_MESSAGE("DNS-over-TLS has been requested but the required TLS libraries (libssl/libcrypto) are not installed."));
+                                        dns_server_packet_lost(t->server, IPPROTO_TCP, t->current_feature_level);
+                                        return -ECONNREFUSED;
+                                }
                                 return r;
+                        }
                 }
 #endif
 
@@ -1798,9 +1812,16 @@ static int dns_transaction_prepare(DnsTransaction *t, usec_t ts) {
                 /* For the initial attempt or when no stale data is requested, disable serve stale
                  * and answer the question from the cache (honors ttl property).
                  * On the second attempt, if StaleRetentionSec is greater than zero,
-                 * try to answer the question using stale date (honors until property) */
+                 * try to answer the question using stale data (honors until property).
+                 *
+                 * Serving stale data is a fallback for unicast DNS, where a retry means the configured
+                 * server did not respond. The link-local protocols have no such server: a retry there
+                 * means no peer answered, and for mDNS RFC 6762 treats TTL expiry as a presence signal.
+                 * Hence never serve stale data on those scopes. */
                 uint64_t query_flags = t->query_flags;
-                if (t->n_attempts == 1 || t->scope->manager->stale_retention_usec == 0)
+                if (t->n_attempts == 1 ||
+                    t->scope->protocol != DNS_PROTOCOL_DNS ||
+                    t->scope->manager->stale_retention_usec == 0)
                         query_flags |= SD_RESOLVED_NO_STALE;
 
                 r = dns_cache_lookup(

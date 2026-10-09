@@ -4,16 +4,18 @@
  * Copyright © 2009 Scott James Remnant <scott@netsplit.com>
  */
 
-#include <getopt.h>
 #include <unistd.h>
 
 #include "sd-bus.h"
 #include "sd-event.h"
+#include "sd-json.h"
 #include "sd-login.h"
 #include "sd-messages.h"
 
 #include "alloc-util.h"
+#include "build.h"
 #include "bus-util.h"
+#include "options.h"
 #include "path-util.h"
 #include "string-util.h"
 #include "strv.h"
@@ -22,66 +24,58 @@
 #include "udevadm.h"
 #include "udevadm-util.h"
 #include "unit-def.h"
+#include "verbs.h"
 #include "virt.h"
 
 static usec_t arg_timeout_usec = 120 * USEC_PER_SEC;
 static const char *arg_exists = NULL;
 
-static int help(void) {
-        printf("%s settle [OPTIONS]\n\n"
-               "Wait for pending udev events.\n\n"
-               "  -h --help                 Show this help\n"
-               "  -V --version              Show package version\n"
-               "  -t --timeout=SEC          Maximum time to wait for events\n"
-               "  -E --exit-if-exists=FILE  Stop waiting if file exists\n",
-               program_invocation_short_name);
-
-        return 0;
-}
-
 static int parse_argv(int argc, char *argv[]) {
-        static const struct option options[] = {
-                { "timeout",        required_argument, NULL, 't' },
-                { "exit-if-exists", required_argument, NULL, 'E' },
-                { "version",        no_argument,       NULL, 'V' },
-                { "help",           no_argument,       NULL, 'h' },
-                { "seq-start",      required_argument, NULL, 's' }, /* removed */
-                { "seq-end",        required_argument, NULL, 'e' }, /* removed */
-                { "quiet",          no_argument,       NULL, 'q' }, /* removed */
-                {}
-        };
+        int r;
 
-        int c, r;
+        assert(argc >= 0);
+        assert(argv);
 
-        while ((c = getopt_long(argc, argv, "t:E:Vhs:e:q", options, NULL)) >= 0) {
+        OptionParser opts = { argc, argv, .namespace = "udevadm-settle" };
+
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
-                case 't':
-                        r = parse_sec(optarg, &arg_timeout_usec);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to parse timeout value '%s': %m", optarg);
-                        break;
-                case 'E':
-                        if (!path_is_valid(optarg))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid path: %s", optarg);
 
-                        arg_exists = optarg;
+                OPTION_NAMESPACE("udevadm-settle"): {}
+
+                OPTION_COMMON_HELP:
+                        return command_print_verb_help("settle");
+
+                OPTION_COMMON_VERSION_WITH_V:
+                        return version_only();
+
+                OPTION('t', "timeout", "SEC", "Maximum time to wait for events"):
+                        r = parse_sec(opts.arg, &arg_timeout_usec);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse timeout value '%s': %m", opts.arg);
                         break;
-                case 'V':
-                        return print_version();
-                case 'h':
-                        return help();
-                case 's':
-                case 'e':
-                case 'q':
+
+                OPTION('E', "exit-if-exists", "FILE", "Stop waiting if file exists"):
+                        if (!path_is_valid(opts.arg))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid path: %s", opts.arg);
+
+                        arg_exists = opts.arg;
+                        break;
+
+                OPTION('s', "seq-start", "ARG", NULL): {} /* removed */
+                OPTION('e', "seq-end", "ARG", NULL): {} /* removed */
+                OPTION('q', "quiet", NULL, NULL): /* removed */
                         return log_info_errno(SYNTHETIC_ERRNO(EINVAL),
                                               "Option -%c no longer supported.",
-                                              c);
-                case '?':
-                        return -EINVAL;
-                default:
-                        assert_not_reached();
+                                              opts.opt->short_code);
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
-        }
+
+        if (option_parser_get_n_args(&opts) > 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "This subprogram takes no positional arguments.");
 
         return 1;
 }

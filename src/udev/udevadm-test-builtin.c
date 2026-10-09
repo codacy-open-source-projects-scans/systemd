@@ -1,65 +1,62 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
-#include <getopt.h>
-#include <stdio.h>
+#include "sd-json.h"
 
+#include "build.h"
 #include "device-private.h"
 #include "device-util.h"
 #include "log.h"
+#include "options.h"
 #include "udev-builtin.h"
 #include "udevadm.h"
 #include "udevadm-util.h"
+#include "verbs.h"
 
 static sd_device_action_t arg_action = SD_DEVICE_ADD;
 static const char *arg_command = NULL;
 static const char *arg_syspath = NULL;
 
-static int help(void) {
-        printf("%s test-builtin [OPTIONS] COMMAND DEVPATH\n\n"
-               "Test a built-in command.\n\n"
-               "  -h --help               Print this message\n"
-               "  -V --version            Print version of the program\n"
-               "  -a --action=ACTION|help Set action string\n"
-               "\nCommands:\n",
-               program_invocation_short_name);
-
-        udev_builtin_list();
-
-        return 0;
-}
-
 static int parse_argv(int argc, char *argv[]) {
-        static const struct option options[] = {
-                { "action",  required_argument, NULL, 'a' },
-                { "version", no_argument,       NULL, 'V' },
-                { "help",    no_argument,       NULL, 'h' },
-                {}
-        };
+        int r;
 
-        int r, c;
+        assert(argc >= 0);
+        assert(argv);
 
-        while ((c = getopt_long(argc, argv, "a:Vh", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv, .namespace = "udevadm-test-builtin" };
+
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
-                case 'a':
-                        r = parse_device_action(optarg, &arg_action);
+
+                OPTION_NAMESPACE("udevadm-test-builtin"): {}
+
+                OPTION_COMMON_HELP:
+                        r = command_print_verb_help("test-builtin");
+                        if (r < 0)
+                                return r;
+
+                        help_section("Commands");
+                        udev_builtin_list();
+                        return 0;
+
+                OPTION_COMMON_VERSION_WITH_V:
+                        return version_only();
+
+                OPTION('a', "action", "ACTION|help", "Set action string"):
+                        r = parse_device_action(opts.arg, &arg_action);
                         if (r <= 0)
                                 return r;
                         break;
-                case 'V':
-                        return print_version();
-                case 'h':
-                        return help();
-                case '?':
-                        return -EINVAL;
-                default:
-                        assert_not_reached();
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
-        if (argc != optind + 2)
+        if (option_parser_get_n_args(&opts) != 2)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Expected two arguments: command string and device path.");
 
-        arg_command = ASSERT_PTR(argv[optind]);
-        arg_syspath = ASSERT_PTR(argv[optind+1]);
+        char **args = option_parser_get_args(&opts);
+        arg_command = ASSERT_PTR(args[0]);
+        arg_syspath = ASSERT_PTR(args[1]);
         return 1;
 }
 

@@ -2,31 +2,37 @@
 
 #include <sys/stat.h>
 #include <sysexits.h>
+#include <unistd.h>
 
+#include "sd-id128.h"
+#include "sd-json.h"
 #include "sd-messages.h"
 
 #include "alloc-util.h"
+#include "boot-entry.h"
 #include "build.h"
 #include "conf-files.h"
 #include "constants.h"
+#include "creds-util.h"
 #include "crypto-util.h"
+#include "dlopen-note.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "format-table.h"
 #include "fs-util.h"
 #include "hexdecoct.h"
 #include "log.h"
 #include "main-func.h"
 #include "mkdir.h"
-#include "options.h"
 #include "parse-util.h"
-#include "pretty-print.h"
+#include "path-util.h"
 #include "set.h"
+#include "sort-util.h"
 #include "string-util.h"
 #include "strv.h"
 #include "tmpfile-util.h"
 #include "tpm2-util.h"
+#include "verbs.h"
 
 static char *arg_tpm2_device = NULL;
 static bool arg_early = false;
@@ -34,41 +40,17 @@ static bool arg_graceful = false;
 
 STATIC_DESTRUCTOR_REGISTER(arg_tpm2_device, freep);
 
+COMMAND(
+        "systemd-tpm2-setup\0",
+        "Set up the TPM2 Storage Root Key (SRK) and Endorsement Key (EK), and initialize NvPCRs.",
+        .man_pages = "systemd-tpm2-setup(8)\0",
+);
+
 #define TPM2_SRK_PEM_PERSISTENT_PATH "/var/lib/systemd/tpm2-srk-public-key.pem"
 #define TPM2_SRK_PEM_RUNTIME_PATH "/run/systemd/tpm2-srk-public-key.pem"
 
 #define TPM2_SRK_TPM2B_PUBLIC_PERSISTENT_PATH "/var/lib/systemd/tpm2-srk-public-key.tpm2b_public"
 #define TPM2_SRK_TPM2B_PUBLIC_RUNTIME_PATH "/run/systemd/tpm2-srk-public-key.tpm2b_public"
-
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        _cleanup_(table_unrefp) Table *options = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-tpm2-setup", "8", &link);
-        if (r < 0)
-                return log_oom();
-
-        r = option_parser_get_help_table(&options);
-        if (r < 0)
-                return r;
-
-        printf("%s [OPTIONS...]\n"
-               "\n%sSet up the TPM2 Storage Root Key (SRK), and initialize NvPCRs.%s\n"
-               "\n%sOptions:%s\n",
-               program_invocation_short_name,
-               ansi_highlight(),
-               ansi_normal(),
-               ansi_underline(),
-               ansi_normal());
-
-        r = table_print_or_warn(options);
-        if (r < 0)
-                return r;
-
-        printf("\nSee the %s for details.\n", link);
-        return 0;
-}
 
 static int parse_argv(int argc, char *argv[]) {
         int r;
@@ -78,11 +60,11 @@ static int parse_argv(int argc, char *argv[]) {
 
         OptionParser opts = { argc, argv };
 
-        FOREACH_OPTION(c, &opts, /* on_error= */ return c)
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return help();
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();
@@ -106,6 +88,9 @@ static int parse_argv(int argc, char *argv[]) {
                 OPTION_LONG("graceful", NULL, "Exit gracefully if no TPM2 device is found"):
                         arg_graceful = true;
                         break;
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
         if (option_parser_get_n_args(&opts) != 0)
@@ -321,7 +306,7 @@ static int setup_srk(void) {
                 return log_error_errno(r, "Failed to open SRK public key file '%s' for writing: %m", pem_path);
 
         if (sym_PEM_write_PUBKEY(f, tpm2_key.pkey) <= 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to write SRK public key file '%s'.", pem_path);
+                return log_openssl_errors(LOG_ERR, "Failed to write SRK public key file '%s'.", pem_path);
 
         if (fchmod(fileno(f), 0444) < 0)
                 return log_error_errno(errno, "Failed to adjust access mode of SRK public key file '%s' to 0444: %m", pem_path);
@@ -366,17 +351,78 @@ static int setup_srk(void) {
         return 0;
 }
 
+static int cleanup_one_old_nvpcr_cred(const char *path) {
+        int r;
+
+        assert(path);
+
+        r = RET_NERRNO(unlink(path));
+        if (r == -ENOENT)
+                return 0;
+        if (r < 0)
+                return log_debug_errno(r, "Failed to unlink old NvPCR anchor secret credential '%s', ignoring: %m", path);
+
+        log_debug("Removed old NvPCR anchor secret credential '%s'.", path);
+        return 0;
+}
+
+static int cleanup_old_nvpcr_creds(void) {
+        int r;
+
+        if (arg_early)
+                return 0;
+
+        int j = cleanup_one_old_nvpcr_cred("/var/lib/systemd/nvpcr/nvpcr-anchor.cred");
+
+        _cleanup_free_ char *dir = NULL;
+        r = get_global_boot_credentials_path(&dir);
+        if (r <= 0)
+                return r;
+
+        sd_id128_t machine_id;
+        r = sd_id128_get_machine(&machine_id);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to read machine ID, not removing old NvPCR anchor secret boot credential: %m");
+
+        BootEntryTokenType entry_token_type = BOOT_ENTRY_TOKEN_AUTO;
+        _cleanup_free_ char *entry_token = NULL;
+        r = boot_entry_token_ensure(
+                        /* root= */ NULL,
+                        /* conf_root= */ NULL,
+                        machine_id,
+                        /* machine_id_is_random= */ false,
+                        &entry_token_type,
+                        &entry_token);
+        if (r < 0)
+                return r;
+
+        _cleanup_free_ char *fname = strjoin("nvpcr-anchor.", entry_token, ".cred");
+        if (!fname)
+                return log_oom();
+
+        if (!filename_is_valid(fname))
+                return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE),
+                                       "'%s' is not a valid file name, not removing old NvPCR anchor secret boot credential.", fname);
+
+        _cleanup_free_ char *joined = path_join(dir, fname);
+        if (!joined)
+                return log_oom();
+
+        RET_GATHER(j, cleanup_one_old_nvpcr_cred(joined));
+
+        return j;
+}
+
 typedef struct SetupNvPCRContext {
         Tpm2Context *tpm2_context;
-        struct iovec anchor_secret;
-        size_t n_already, n_anchored, n_failed;
+        size_t n_already, n_initialized, n_failed, n_skipped;
+        bool nv_space_exhausted; /* Set once the TPM ran out of NV index space, so we skip the rest. */
         Set *done;
 } SetupNvPCRContext;
 
 static void setup_nvpcr_context_done(SetupNvPCRContext *c) {
         assert(c);
 
-        iovec_done_erase(&c->anchor_secret);
         c->tpm2_context = tpm2_context_unref(c->tpm2_context);
         c->done = set_free(c->done);
 }
@@ -393,38 +439,39 @@ static int setup_nvpcr_one(
         if (set_contains(c->done, name))
                 return 0;
 
-        r = tpm2_nvpcr_initialize(c->tpm2_context, /* session= */ NULL, name, &c->anchor_secret);
-        if (r == -EUNATCH) {
-                assert(!iovec_is_set(&c->anchor_secret));
-
-                /* If we get EUNATCH this means we actually need to initialize this NvPCR
-                 * now, and haven't provided the anchor secret yet. Hence acquire it now. */
-
-                r = tpm2_nvpcr_acquire_anchor_secret(&c->anchor_secret, /* sync_secondary= */ !arg_early);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to acquire anchor secret: %m");
-
-                r = tpm2_nvpcr_initialize(c->tpm2_context, /* session= */ NULL, name, &c->anchor_secret);
+        /* If the TPM already ran out of NV index space, don't even try to allocate further NvPCRs. As
+         * NvPCRs are processed in order of priority (most important first), everything still pending is
+         * less important than what already didn't fit. */
+        if (c->nv_space_exhausted) {
+                log_debug("TPM NV index space already exhausted, skipping allocation of NvPCR '%s'.", name);
+                c->n_skipped++;
+                return 0;
         }
+
+        r = tpm2_nvpcr_initialize(c->tpm2_context, /* session= */ NULL, name);
         if (r == -EOPNOTSUPP) {
                 c->n_failed++;
                 return log_struct_errno(LOG_ERR, r,
                                         LOG_MESSAGE("The TPM does not correctly support NV indexes in NT_EXTEND mode, unable to allocate NvPCR '%s': %m", name),
                                         LOG_MESSAGE_ID(SD_MESSAGE_TPM_NVPCR_UNSUPPORTED_STR));
         }
-        if (r == -ENOSPC) {
-                c->n_failed++;
-                return log_struct_errno(LOG_ERR, r,
-                                        LOG_MESSAGE("The TPM's NV index space is exhausted, unable to allocate NvPCR '%s': %m", name),
+        if (r == -ENOBUFS) {
+                /* The TPM's NV index space is exhausted. Remember this so we skip the remaining (less
+                 * important) NvPCRs, and report it gracefully at the end rather than failing the boot.
+                 * Logged at notice level, not error. */
+                c->nv_space_exhausted = true;
+                c->n_skipped++;
+                return log_struct_errno(LOG_NOTICE, r,
+                                        LOG_MESSAGE("The TPM's NV index space is exhausted, skipping allocation of NvPCR '%s' and any less important ones: %m", name),
                                         LOG_MESSAGE_ID(SD_MESSAGE_TPM_NVINDEX_EXHAUSTED_STR));
         }
         if (r < 0) {
                 c->n_failed++;
-                return log_error_errno(r, "Failed to extend NvPCR index with anchor secret: %m");
+                return log_error_errno(r, "Failed to initialize NvPCR index: %m");
         }
 
         if (r > 0)
-                c->n_anchored++;
+                c->n_initialized++;
         else
                 c->n_already++;
 
@@ -434,9 +481,35 @@ static int setup_nvpcr_one(
         return 0;
 }
 
+typedef struct NvPCREntry {
+        const char *name;       /* points into the strv 'l' in setup_nvpcr() */
+        uint64_t priority;
+} NvPCREntry;
+
+static int nvpcr_entry_compare(const NvPCREntry *a, const NvPCREntry *b) {
+        int r;
+
+        assert(a);
+        assert(b);
+
+        /* Lower priority value means more important, hence allocate it first. Break ties by name
+         * (ascending) so the resulting order is fully deterministic. */
+        r = CMP(a->priority, b->priority);
+        if (r != 0)
+                return r;
+
+        return strcmp(a->name, b->name);
+}
+
 static int setup_nvpcr(void) {
         _cleanup_(setup_nvpcr_context_done) SetupNvPCRContext c = {};
         int r;
+
+        /* NvPCRs can only be initialized from the initrd. */
+        if (!arg_early) {
+                log_debug("Skipping NvPCR setup in later boot phase.");
+                return 0;
+        }
 
         _cleanup_strv_free_ char **l = NULL;
         r = conf_files_list_nulstr(
@@ -448,8 +521,33 @@ static int setup_nvpcr(void) {
         if (r < 0)
                 return log_error_errno(r, "Failed to find .nvpcr files: %m");
 
+        /* Pair each NvPCR name with its allocation priority, then sort, so that we allocate the most
+         * important NvPCRs first. This matters when the TPM's NV index space is too small to fit all of
+         * them: we then degrade gracefully, skipping the least important NvPCRs. */
+        size_t n = strv_length(l);
+        _cleanup_free_ NvPCREntry *entries = new(NvPCREntry, n);
+        if (!entries)
+                return log_oom();
+
+        for (size_t i = 0; i < n; i++) {
+                uint64_t priority = TPM2_NVPCR_PRIORITY_DEFAULT;
+
+                r = tpm2_nvpcr_get_index(l[i], /* ret_nv_index= */ NULL, &priority);
+                if (r < 0)
+                        /* If we can't read the definition, assume the default priority and let the
+                         * per-NvPCR error path in setup_nvpcr_one() report the actual problem. */
+                        log_warning_errno(r, "Failed to read priority of NvPCR '%s', assuming default priority %" PRIu64 ": %m", l[i], priority);
+
+                entries[i] = (NvPCREntry) {
+                        .name = l[i],
+                        .priority = priority,
+                };
+        }
+
+        typesafe_qsort(entries, n, nvpcr_entry_compare);
+
         int ret = 0;
-        STRV_FOREACH(i, l) {
+        FOREACH_ARRAY(e, entries, n) {
                 if (!c.tpm2_context) {
                         /* Inability to contact the TPM shall be fatal for us */
                         r = tpm2_context_new_or_warn(arg_tpm2_device, &c.tpm2_context);
@@ -457,37 +555,66 @@ static int setup_nvpcr(void) {
                                 return r;
                 }
 
+                log_debug("Setting up NvPCR '%s' (priority %" PRIu64 ").", e->name, e->priority);
+
                 /* But if we fail to initialize some NvPCR, we go on */
-                RET_GATHER(ret, setup_nvpcr_one(&c, *i));
+                RET_GATHER(ret, setup_nvpcr_one(&c, e->name));
         }
 
-        if (c.n_already > 0 && c.n_anchored == 0 && !arg_early)
-                /* If we didn't anchor anything right now, but we anchored something earlier, then it might
-                 * have happened in the initrd, and thus the anchor ID was not committed to /var/ or the ESP
-                 * yet. Hence, let's explicitly do so now, to catch up. */
-                RET_GATHER(ret, tpm2_nvpcr_acquire_anchor_secret(/* ret= */ NULL, /* sync_secondary= */ true));
+        if (c.nv_space_exhausted)
+                log_notice("Skipped %zu lowest-priority NvPCR(s) because the TPM's NV index space is exhausted, proceeding anyway.", c.n_skipped);
 
         if (c.n_failed > 0)
                 log_warning("%zu NvPCRs failed to initialize, proceeding anyway.", c.n_failed);
 
-        if (c.n_anchored > 0) {
+        if (c.n_initialized > 0) {
                 if (c.n_already == 0)
-                        log_info("%zu NvPCRs initialized.", c.n_anchored);
+                        log_info("%zu NvPCRs initialized.", c.n_initialized);
                 else
-                        log_info("%zu NvPCRs initialized. (%zu NvPCRs were already initialized.)", c.n_anchored, c.n_already);
+                        log_info("%zu NvPCRs initialized. (%zu NvPCRs were already initialized.)", c.n_initialized, c.n_already);
         } else if (c.n_already > 0)
                 log_info("%zu NvPCRs already initialized.", c.n_already);
-        else if (c.n_failed == 0)
+        else if (c.n_failed == 0 && c.n_skipped == 0)
                 log_debug("No NvPCRs defined, nothing initialized.");
 
         /* Turn some errors into recognizable ones, which we can catch with
          * SuccessExitStatus= in the service unit file. */
         if (ret == -EOPNOTSUPP)
                 return EX_UNAVAILABLE;   /* e.g. no NvPCR support in TPM */
-        if (ret == -ENOSPC)
+        if (ret == -ENOBUFS)
                 return EX_CANTCREAT;     /* NV index space on TPM exhausted */
 
         return ret;
+}
+
+static int setup_ek(void) {
+        _cleanup_(tpm2_context_unrefp) Tpm2Context *c = NULL;
+        int r;
+
+        /* We don't need to create an EK during the early phase. */
+        if (arg_early) {
+                log_debug("Skipping EK setup in early boot phase.");
+                return 0;
+        }
+
+        r = tpm2_context_new_or_warn(arg_tpm2_device, &c);
+        if (r < 0)
+                return r;
+
+        r = tpm2_get_or_create_ek(c, /* session= */ NULL, /* ret_public= */ NULL, /* ret_name= */ NULL, /* ret_qname= */ NULL, /* ret_handle= */ NULL);
+        if (r == -EDEADLK) {
+                log_struct_errno(LOG_INFO, r,
+                                 LOG_MESSAGE("Insufficient permissions to access TPM, not generating EK."),
+                                 LOG_MESSAGE_ID(SD_MESSAGE_EK_ENROLLMENT_NEEDS_AUTHORIZATION_STR));
+                return EX_PROTOCOL; /* Special return value which means "Insufficient permissions to access TPM,
+                                     * cannot generate EK". This isn't really an error when called at boot. */
+        }
+        if (r == -EOPNOTSUPP)
+                return EX_UNAVAILABLE; /* eg, no valid EK certificate. */
+        if (r < 0)
+                return r;
+
+        return 0;
 }
 
 static int run(int argc, char *argv[]) {
@@ -504,21 +631,36 @@ static int run(int argc, char *argv[]) {
                 return EXIT_SUCCESS;
         }
 
+        LIBBLKID_NOTE(recommended);
+        LIBCRYPTO_NOTE(required);
+        TPM2_NOTE(required);
+
         r = dlopen_libcrypto(LOG_ERR);
+        if (r < 0)
+                return r;
+
+        r = dlopen_tpm2(LOG_ERR);
         if (r < 0)
                 return r;
 
         umask(0022);
 
-        /* Execute both jobs, and then return unlisted errors preferably, and listed errors
+        (void) cleanup_old_nvpcr_creds();
+
+        /* Execute all jobs, and then return unlisted errors preferably, and listed errors
          * (i.e. EX_UNAVAILABLE, EX_CANTCREAT, EX_PROTOCOL) otherwise. */
         r = setup_srk();
-        int k = setup_nvpcr();
+        int j = setup_nvpcr();
+        int k = setup_ek();
         if (r < 0)
                 return r;
+        if (j < 0)
+                return j;
         if (k < 0)
                 return k;
-        return r != EXIT_SUCCESS ? r : k;
+        if (r != EXIT_SUCCESS)
+                return r;
+        return j != EXIT_SUCCESS ? j : k;
 }
 
 DEFINE_MAIN_FUNCTION_WITH_POSITIVE_FAILURE(run);

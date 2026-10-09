@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+#include "forward.h"
 #include "runtime-scope.h"
-#include "shared-forward.h"
 #include "string-util.h"
 
 typedef struct PortableMetadata {
@@ -111,6 +111,7 @@ int portable_get_state(
                 sd_bus_error *error);
 
 int portable_get_profiles(RuntimeScope scope, char ***ret);
+int portable_profile_validate(RuntimeScope scope, const char *profile, sd_bus_error *reterr_error);
 
 void portable_changes_free(PortableChange *array, size_t n);
 

@@ -81,13 +81,27 @@ EFI_ARCHES: list[str] = sum(EFI_ARCH_MAP.values(), [])
 DEFAULT_CONFIG_DIRS = ['/etc/systemd', '/run/systemd', '/usr/local/lib/systemd', '/usr/lib/systemd']
 DEFAULT_CONFIG_FILE = 'ukify.conf'
 
+# https://datatracker.ietf.org/doc/html/rfc5280 ub-common-name; bytes, not chars
+COMMON_NAME_MAX_LEN = 64
+INITRD_PCR_POLICY: tuple[list[str], str] = (['enter-initrd'], 'initrd')
+
+
+def terminal_is_dumb() -> bool:
+    return (
+        not sys.stdout.isatty()
+        or not sys.stderr.isatty()
+        or os.getenv('TERM', '') == 'dumb'
+        or bool(os.getenv('NO_COLOR'))
+    )
+
 
 class Style:
-    bold = '\033[0;1;39m' if sys.stderr.isatty() else ''
-    gray = '\033[0;38;5;245m' if sys.stderr.isatty() else ''
-    red = '\033[31;1m' if sys.stderr.isatty() else ''
-    yellow = '\033[33;1m' if sys.stderr.isatty() else ''
-    reset = '\033[0m' if sys.stderr.isatty() else ''
+    bold = '\033[0;1;39m' if not terminal_is_dumb() else ''
+    gray = '\033[0;38;5;245m' if not terminal_is_dumb() else ''
+    red = '\033[31;1m' if not terminal_is_dumb() else ''
+    yellow = '\033[33;1m' if not terminal_is_dumb() else ''
+    blue = '\033[34;1m' if not terminal_is_dumb() else ''
+    reset = '\033[0m' if not terminal_is_dumb() else ''
 
 
 def guess_efi_arch() -> str:
@@ -291,10 +305,13 @@ class UkifyConfig:
     pcrpkey: Optional[Path]
     pcrsig: Union[str, Path, None]
     join_pcrsig: Optional[Path]
-    phase_path_groups: Optional[list[str]]
+    phase_path_groups: Optional[list[list[str]]]
+    policyrefs: Optional[list[str]]
+    sign_initrd_pcrs: bool
     policy_digest: bool
     profile: Optional[str]
     sb_cert: Union[str, Path, None]
+    sb_cert_common_name: Optional[str]
     sb_cert_name: Optional[str]
     sb_cert_validity: int
     sb_certdir: Path
@@ -419,6 +436,11 @@ DEFAULT_SECTIONS_TO_SHOW = {
     '.profile': 'text',
 }  # fmt: skip
 
+# Sections that may legitimately appear more than once within a single profile: they carry one entry
+# per hardware variant and the firmware picks the matching one at boot. 'inspect --json' therefore
+# always reports them as a list, and add_section() allows them to repeat.
+MULTI_INSTANCE_SECTIONS = ('.dtbauto', '.efifw')
+
 
 @dataclasses.dataclass
 class Section:
@@ -460,7 +482,7 @@ class Section:
 
     @classmethod
     def parse_output(cls, s: str) -> 'Section':
-        if not (m := re.match(r'([a-zA-Z0-9_.]+):(text|binary)(?:@(.+))?', s)):
+        if not (m := re.fullmatch(r'([a-zA-Z0-9_.]+):(text|binary)(?:@(.+))?', s)):
             raise ValueError(f'Cannot parse section spec: {s!r}')
 
         name, ttype, out = m.groups()
@@ -490,9 +512,8 @@ class UKI:
             if s.name == '.profile':
                 start = i + 1
 
-        multiple_allowed_sections = ['.dtbauto', '.efifw']
         if any(
-            section.name == s.name for s in self.sections[start:] if s.name not in multiple_allowed_sections
+            section.name == s.name for s in self.sections[start:] if s.name not in MULTI_INSTANCE_SECTIONS
         ):
             raise ValueError(f'Duplicate section {section.name}')
 
@@ -599,7 +620,7 @@ class SystemdSbSign(SignTool):
         )
         cmd = [
             tool,
-            "sign",
+            'sign',
             '--private-key', opts.sb_key,
             '--certificate', opts.sb_cert,
             *(
@@ -630,7 +651,13 @@ class SystemdSbSign(SignTool):
 
 
 def parse_banks(s: str) -> list[str]:
-    banks = re.split(r',|\s+', s)
+    s = s.strip()
+    if not s:
+        return []
+    # Allow a single trailing comma, but reject any other empty entry.
+    banks = re.split(r'\s*,\s*|\s+', s.removesuffix(',').rstrip())
+    if '' in banks:
+        raise argparse.ArgumentTypeError(f'Empty entry in PCR bank list {s!r}')
     # TODO: do some sanity checking here
     return banks
 
@@ -647,7 +674,8 @@ KNOWN_PHASES = (
 
 def parse_phase_paths(s: str) -> list[str]:
     # Split on commas or whitespace here. Commas might be hard to parse visually.
-    paths = re.split(r',|\s+', s)
+    # Allow a single trailing comma. Other empty entries are rejected below as unknown phases.
+    paths = re.split(r'\s*,\s*|\s+', s.strip().removesuffix(',').rstrip())
 
     for path in paths:
         for phase in path.split(':'):
@@ -697,7 +725,10 @@ def check_cert_and_keys_nonexistent(opts: UkifyConfig) -> None:
     # Raise if any of the keys and certs are found on disk
     paths: Iterator[Union[str, Path, None]] = itertools.chain(
         (opts.sb_key, opts.sb_cert),
-        *((priv_key, pub_key, cert) for priv_key, pub_key, cert, _ in key_path_groups(opts)),
+        *(
+            (priv_key, pub_key, cert)
+            for priv_key, pub_key, cert, _, _ in key_path_groups(opts, include_extra=False)
+        ),
     )
     for path in paths:
         if path and Path(path).exists():
@@ -735,7 +766,29 @@ def combine_signatures(pcrsigs: list[dict[str, str]]) -> str:
     return json.dumps(combined)
 
 
-def key_path_groups(opts: UkifyConfig) -> Iterator[tuple[str, Optional[str], Optional[str], Optional[str]]]:
+def apply_pcr_signatures(pcrsig: dict[str, Any], signatures: dict[str, Any]) -> None:
+    for (bank, policies), (input_bank, input_policies) in itertools.product(
+        pcrsig.items(), signatures.items()
+    ):
+        if input_bank != bank:
+            continue
+        for policy, input_policy in itertools.product(policies, input_policies):
+            if 'tbs' in policy and 'tbs' in input_policy:
+                match = policy['tbs'] == input_policy['tbs']
+            else:
+                match = (policy['pol'], policy.get('ref')) == (
+                    input_policy['pol'],
+                    input_policy.get('ref'),
+                )
+
+            if match:
+                policy['sig'] = input_policy['sig']
+
+
+def key_path_groups(
+    opts: UkifyConfig,
+    include_extra: bool,
+) -> Iterator[tuple[str, Optional[str], Optional[str], Optional[list[str]], Optional[str]]]:
     if not opts.pcr_private_keys:
         return
 
@@ -743,14 +796,26 @@ def key_path_groups(opts: UkifyConfig) -> Iterator[tuple[str, Optional[str], Opt
     pub_keys = opts.pcr_public_keys or []
     certs = opts.pcr_certificates or []
     pp_groups = opts.phase_path_groups or []
+    policyrefs = opts.policyrefs or []
 
     yield from itertools.zip_longest(
         opts.pcr_private_keys,
         pub_keys[:n_priv],
         certs[:n_priv],
         pp_groups[:n_priv],
+        policyrefs[:n_priv],
         fillvalue=None,
     )
+
+    # When requested, emit an extra signing group that reuses the first PCR signing key to produce
+    # a signed PCR policy that can only be used from the initrd.
+    if opts.sign_initrd_pcrs and include_extra:
+        yield (
+            opts.pcr_private_keys[0],
+            pub_keys[0] if pub_keys else None,
+            certs[0] if certs else None,
+            *INITRD_PCR_POLICY,
+        )
 
 
 def pe_strip_section_name(name: bytes) -> str:
@@ -810,39 +875,47 @@ def call_systemd_measure(uki: UKI, opts: UkifyConfig, profile_start: int = 0) ->
             if dtbauto is not None:
                 to_measure[dtbauto.name] = dtbauto
 
-            pp_groups = opts.phase_path_groups or []
-
-            cmd = [
-                measure_tool,
-                'calculate' if opts.measure else 'policy-digest',
-                '--json',
-                opts.json,
-                *(f'--{s.name.removeprefix(".")}={s.content}' for s in to_measure.values()),
-                *(f'--bank={bank}' for bank in banks),
-                # For measurement, the keys are not relevant, so we can lump all the phase paths
-                # into one call to systemd-measure calculate.
-                *(f'--phase={phase_path}' for phase_path in itertools.chain.from_iterable(pp_groups)),
+            policy_groups: list[tuple[list[str], str]] = [
+                (list(itertools.chain.from_iterable(opts.phase_path_groups or [])), ''),
             ]
+            if opts.policy_digest and opts.sign_initrd_pcrs:
+                policy_groups += [INITRD_PCR_POLICY]
 
-            # The JSON object will be used for offline signing, include the public key
-            # so that the fingerprint is included too. In case a certificate is passed, use the
-            # right parameter so that systemd-measure can extract the public key from it.
-            if opts.policy_digest:
-                if opts.pcr_public_keys:
-                    cmd += ['--public-key', opts.pcr_public_keys[0]]
-                elif opts.pcr_certificates:
-                    cmd += ['--certificate', opts.pcr_certificates[0]]
-                    if opts.certificate_provider:
-                        cmd += ['--certificate-source', f'provider:{opts.certificate_provider}']
+            for phase_paths, policyref in policy_groups:
+                cmd = [
+                    measure_tool,
+                    'calculate' if opts.measure else 'policy-digest',
+                    '--json',
+                    opts.json,
+                    *(f'--{s.name.removeprefix(".")}={s.content}' for s in to_measure.values()),
+                    *(f'--bank={bank}' for bank in banks),
+                    # For measurement, the keys are not relevant, so we can lump all the phase paths
+                    # into one call to systemd-measure calculate.
+                    *(f'--phase={phase_path}' for phase_path in phase_paths),
+                ]
 
-            print('+', shell_join(cmd), file=sys.stderr)
-            output = subprocess.check_output(cmd, text=True)  # type: ignore
+                # The JSON object will be used for offline signing, include the public key
+                # so that the fingerprint is included too. In case a certificate is passed, use the
+                # right parameter so that systemd-measure can extract the public key from it.
+                if opts.policy_digest:
+                    if opts.pcr_public_keys:
+                        cmd += [f'--public-key={opts.pcr_public_keys[0]}']
+                    elif opts.pcr_certificates:
+                        cmd += [f'--certificate={opts.pcr_certificates[0]}']
+                        if opts.certificate_provider:
+                            cmd += [f'--certificate-source=provider:{opts.certificate_provider}']
 
-            if opts.policy_digest:
-                pcrsig = json.loads(output)
-                pcrsigs += [pcrsig]
-            else:
-                print(output)
+                    if policyref:
+                        cmd += [f'--policyref={policyref}']
+
+                print('+', shell_join(cmd), file=sys.stderr)
+                output = subprocess.check_output(cmd, text=True)  # type: ignore
+
+                if opts.policy_digest:
+                    pcrsig = json.loads(output)
+                    pcrsigs += [pcrsig]
+                else:
+                    print(output)
 
         if opts.policy_digest:
             combined = combine_signatures(pcrsigs)
@@ -870,7 +943,7 @@ def call_systemd_measure(uki: UKI, opts: UkifyConfig, profile_start: int = 0) ->
                 *(f'--bank={bank}' for bank in banks),
             ]
 
-            for priv_key, pub_key, cert, group in key_path_groups(opts):
+            for priv_key, pub_key, cert, group, ref in key_path_groups(opts, include_extra=True):
                 extra = [f'--private-key={priv_key}']
                 if opts.signing_engine is not None:
                     assert pub_key or cert
@@ -895,6 +968,8 @@ def call_systemd_measure(uki: UKI, opts: UkifyConfig, profile_start: int = 0) ->
                     extra += [f'--certificate-source=provider:{opts.certificate_provider}']
 
                 extra += [f'--phase={phase_path}' for phase_path in group or ()]
+                if ref is not None:
+                    extra += [f'--policyref={ref}']
 
                 print('+', shell_join(cmd + extra), file=sys.stderr)  # type: ignore
                 output = subprocess.check_output(cmd + extra, text=True)  # type: ignore
@@ -1097,19 +1172,12 @@ def pe_add_sections(opts: UkifyConfig, uki: UKI, output: str) -> None:
                     .rstrip(b'\x00')
                     .decode()
                 )
-                for (bank, sigs), (input_bank, input_sigs) in itertools.product(
-                    j.items(), signatures.items()
-                ):
-                    if input_bank != bank:
-                        continue
-                    for sig, input_sig in itertools.product(sigs, input_sigs):
-                        if sig['pol'] == input_sig['pol']:
-                            sig['sig'] = input_sig['sig']
+                apply_pcr_signatures(j, signatures)
 
                 encoded = json.dumps(j).encode()
                 if len(encoded) > section.SizeOfRawData:
                     raise PEError(
-                        f'Not enough space in existing section .pcrsig of size {section.SizeOfRawData} to append new data of size {len(encoded)}'  # noqa: E501
+                        f'Not enough space in existing section .pcrsig of size {section.SizeOfRawData} to append new data of size {len(encoded)}'
                     )
                 section.Misc_VirtualSize = len(encoded)
                 # bytes(n) results in an array of n zeroes
@@ -1175,8 +1243,8 @@ NULL_DEVICE = b'\0' * DEVICE_STRUCT_SIZE
 DEVICE_TYPE_DEVICETREE = 1
 DEVICE_TYPE_UEFI_FW = 2
 
-# Keep in sync with efifirmware.h
-FWHEADERMAGIC = 'feeddead'
+# Keep in sync with src/boot/efi-firmware.h
+FWHEADERMAGIC = 0xFEEDDEAD
 EFIFW_HEADER_SIZE = 4 + 4 + 4 + 4
 
 
@@ -1282,38 +1350,27 @@ def parse_efifw_dir(path: Path) -> bytes:
     for fw in path.iterdir():
         payload_blob += fw.read_bytes()
 
-    payload_len = len(payload_blob)
-    if payload_len == 0:
+    if len(payload_blob) == 0:
         raise ValueError(f'{fw} is a zero byte file!')
 
-    dirname = path.parts[-1]
     # firmware id is the name of the directory the firmware bundle is in,
     # terminated by NULL.
-    fwid = b'' + dirname.encode() + b'\0'
-    fwid_len = len(fwid)
-    magic = bytes.fromhex(FWHEADERMAGIC)
+    fwid = path.absolute().name.encode() + b'\0'
 
-    efifw_header_blob = b''
-    efifw_header_blob += struct.pack('<p', magic)
-    efifw_header_blob += struct.pack('<I', EFIFW_HEADER_SIZE)
-    efifw_header_blob += struct.pack('<I', fwid_len)
-    efifw_header_blob += struct.pack('<I', payload_len)
+    efifw_header_blob = struct.pack('<IIII', FWHEADERMAGIC, EFIFW_HEADER_SIZE, len(fwid), len(payload_blob))
 
-    efifw_blob = b''
-    efifw_blob += efifw_header_blob + fwid + payload_blob
-
-    return efifw_blob
+    return efifw_header_blob + fwid + payload_blob
 
 
-STUB_SBAT = """\
+STUB_SBAT = '''\
 sbat,1,SBAT Version,sbat,1,https://github.com/rhboot/shim/blob/main/SBAT.md
 uki,1,UKI,uki,1,https://uapi-group.org/specifications/specs/unified_kernel_image/
-"""
+'''
 
-ADDON_SBAT = """\
+ADDON_SBAT = '''\
 sbat,1,SBAT Version,sbat,1,https://github.com/rhboot/shim/blob/main/SBAT.md
 uki-addon,1,UKI Addon,addon,1,https://www.freedesktop.org/software/systemd/man/latest/systemd-stub.html
-"""
+'''
 
 
 def make_uki(opts: UkifyConfig) -> None:
@@ -1338,8 +1395,10 @@ def make_uki(opts: UkifyConfig) -> None:
                 print(f'{linux} is not a valid PE file and cannot be decompressed either', file=sys.stderr)
             else:
                 print(f'{linux} is compressed and cannot be loaded by UEFI, decompressing', file=sys.stderr)
-                linux = Path(tempfile.NamedTemporaryFile(prefix='linux-decompressed').name)
-                linux.write_bytes(decompressed)
+                linux_decompressed = tempfile.NamedTemporaryFile(prefix='linux-decompressed')
+                linux_decompressed.write(decompressed)
+                linux_decompressed.flush()
+                linux = Path(linux_decompressed.name)
 
     if linux and sign_args_present:
         assert opts.signtool is not None
@@ -1363,7 +1422,7 @@ def make_uki(opts: UkifyConfig) -> None:
 
     pcrpkey: Union[bytes, Path, None] = opts.pcrpkey
     if pcrpkey is None:
-        keyutil_tool = find_tool('systemd-keyutil', '/usr/lib/systemd/systemd-keyutil')
+        keyutil_tool = find_tool('systemd-keyutil', '/usr/lib/systemd/systemd-keyutil', opts=opts)
         cmd = [keyutil_tool, 'extract-public']
 
         if opts.pcr_public_keys and len(opts.pcr_public_keys) == 1:
@@ -1498,7 +1557,7 @@ def make_uki(opts: UkifyConfig) -> None:
 
         if names[0] != '.profile':
             raise ValueError(
-                f'Expected .profile section as first valid section in PE profile binary {profile} but got {names[0]}'  # noqa: E501
+                f'Expected .profile section as first valid section in PE profile binary {profile} but got {names[0]}'
             )
 
         if names.count('.profile') > 1:
@@ -1655,12 +1714,24 @@ def generate_keys(opts: UkifyConfig) -> None:
     # This will generate keys and certificates and write them to the paths that
     # are specified as input paths.
     if opts.sb_key and opts.sb_cert:
-        fqdn = socket.getfqdn()
+        # The length of CN must not exceed 64 bytes
+        if opts.sb_cert_common_name is not None:
+            cn = opts.sb_cert_common_name
+            if len(cn) == 0:
+                raise ValueError('--secureboot-certificate-common-name= must not be empty')
 
-        cn = f'SecureBoot signing key on host {fqdn}'
-        if len(cn) > 64:
-            # The length of CN must not exceed 64 bytes
-            cn = cn[:61] + '...'
+            # Older cryptography versions (checked 41) don't check that by themselves.
+            # Newer (at least 49) do, but with a much less useful error message, so keep this extra check.
+            if len(cn.encode()) > COMMON_NAME_MAX_LEN:
+                raise ValueError(
+                    f'--secureboot-certificate-common-name= is longer than {COMMON_NAME_MAX_LEN} bytes: {cn!r}'
+                )
+        else:
+            fqdn = socket.getfqdn()
+
+            cn = f'SecureBoot signing key on host {fqdn}'
+            if len(cn) > COMMON_NAME_MAX_LEN:
+                cn = cn[: COMMON_NAME_MAX_LEN - 3] + '...'
 
         key_pem, cert_pem = generate_key_cert_pair(
             common_name=cn,
@@ -1674,7 +1745,7 @@ def generate_keys(opts: UkifyConfig) -> None:
 
         work = True
 
-    for priv_key, pub_key, _, _ in key_path_groups(opts):
+    for priv_key, pub_key, _, _, _ in key_path_groups(opts, include_extra=False):
         priv_key_pem, pub_key_pem = generate_priv_pub_key_pair()
 
         print(f'Writing private key for PCR signing to {priv_key}', file=sys.stderr)
@@ -1688,21 +1759,22 @@ def generate_keys(opts: UkifyConfig) -> None:
 
     if not work:
         raise ValueError(
-            'genkey: --secureboot-private-key=/--secureboot-certificate= or --pcr-private-key/--pcr-public-key must be specified'  # noqa: E501
+            'genkey: --secureboot-private-key=/--secureboot-certificate= or --pcr-private-key/--pcr-public-key must be specified'
         )
 
 
 def inspect_section(
     opts: UkifyConfig,
     section: pefile.SectionStructure,
-) -> tuple[str, Optional[dict[str, Union[int, str]]]]:
-    name = pe_strip_section_name(section.Name)
-
-    # find the config for this section in opts and whether to show it
+    name: str,
+    force: bool = False,
+) -> Optional[dict[str, Union[int, str]]]:
+    # find the config for this section in opts and whether to show it ('force' is used for the
+    # '.profile' delimiters, which must always appear in the JSON profile structure)
     config = opts.sections_by_name.get(name, None)
-    show = config or opts.all or (name in DEFAULT_SECTIONS_TO_SHOW and not opts.sections)
+    show = force or config or opts.all or (name in DEFAULT_SECTIONS_TO_SHOW and not opts.sections)
     if not show:
-        return name, None
+        return None
 
     ttype = config.output_mode if config else DEFAULT_SECTIONS_TO_SHOW.get(name, 'binary')
 
@@ -1732,7 +1804,26 @@ def inspect_section(
             text = textwrap.indent(cast(str, struct['text']).rstrip(), ' ' * 4)
             print(f'  text:\n{text}')
 
-    return name, struct
+    return struct
+
+
+def add_section_to_profile(profile: dict[str, Any], name: str, desc: dict[str, Union[int, str]]) -> None:
+    # Sections in MULTI_INSTANCE_SECTIONS can occur multiple times within the same profile so always
+    # report them as a list even when there's a single entry. Every other section is unique within a
+    # profile and is reported as a plain object keyed by name. A repeat of such a section means the
+    # image is malformed; warn, but still report every instance by turning the entry into a list so
+    # nothing is dropped.
+    if name in MULTI_INSTANCE_SECTIONS:
+        profile.setdefault(name, [])
+        profile[name] += [desc]
+    elif name not in profile:
+        profile[name] = desc
+    else:
+        print(f'Unexpected duplicate {name!r} section, reporting all instances as a list', file=sys.stderr)
+        if isinstance(profile[name], list):
+            profile[name] += [desc]
+        else:
+            profile[name] = [profile[name], desc]
 
 
 def inspect_sections(opts: UkifyConfig) -> None:
@@ -1740,10 +1831,36 @@ def inspect_sections(opts: UkifyConfig) -> None:
 
     for file in opts.files:
         pe = pefile.PE(file, fast_load=True)
-        gen = (inspect_section(opts, section) for section in pe.sections)
-        descs = {key: val for (key, val) in gen if val}
-        if opts.json != 'off':
-            json.dump(descs, sys.stdout, indent=indent)
+
+        # A UKI is a flat list of PE sections with profile structure: the sections before the first
+        # '.profile' section belong to the base profile, and each subsequent '.profile' section
+        # introduces a further profile whose sections (up to the next '.profile') override the base
+        # ones. For JSON output the base profile's sections are reported by name at the root (so e.g.
+        # '.cmdline' refers to the base profile) and the further profiles as separate by-name objects
+        # in the '_profiles' list. That key is '_profiles' and not 'profiles' so it can never collide
+        # with a section of that name: PE section names are at most 8 bytes, so a 9-byte key is never
+        # a section name.
+        emit_json = opts.json != 'off'
+        base: dict[str, Any] = {}
+        profiles: list[dict[str, Any]] = []
+        profile = base  # sections fill the base profile until the first '.profile' delimiter
+
+        for section in pe.sections:
+            name = pe_strip_section_name(section.Name)
+            if emit_json and name == '.profile':
+                profile = {}
+                profiles += [profile]
+
+            # The '.profile' delimiter is forced into the structure so every profile object carries
+            # its identity, even when --section filters out the other sections.
+            desc = inspect_section(opts, section, name, force=emit_json and name == '.profile')
+            if desc and emit_json:
+                add_section_to_profile(profile, name, desc)
+
+        if emit_json:
+            if profiles:
+                base['_profiles'] = profiles
+            json.dump(base, sys.stdout, indent=indent)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1762,6 +1879,8 @@ class ConfigItem:
         old = getattr(namespace, dest, [])
         if old is None:
             old = []
+        if not isinstance(value, list):
+            value = [value]
         setattr(namespace, dest, value + old)
 
     @staticmethod
@@ -1822,7 +1941,7 @@ class ConfigItem:
             return True
         if s_l in {'0', 'false', 'no', 'n', 'f', 'off'}:
             return False
-        raise ValueError('f"Invalid boolean literal: {s!r}')
+        raise ValueError(f'Invalid boolean literal: {s!r}')
 
     # arguments for argparse.ArgumentParser.add_argument()
     name: Union[str, tuple[str, str]]
@@ -1859,6 +1978,17 @@ class ConfigItem:
         args = self._names()
         parser.add_argument(*args, **kwargs)
 
+    def parse_value(self, s: str) -> Any:
+        if self.action == argparse.BooleanOptionalAction:
+            # We need to handle this case separately: the options are called
+            # --foo and --no-foo, and no argument is parsed. But in the config
+            # file, we have Foo=yes or Foo=no.
+            return self.parse_boolean(s)
+        elif self.type:
+            return self.type(s)
+
+        return s
+
     def apply_config(
         self,
         namespace: argparse.Namespace,
@@ -1870,24 +2000,13 @@ class ConfigItem:
         assert f'{section}/{key}' == self.config_key
         dest = self.argparse_dest()
 
-        conv: Callable[[str], Any]
-        if self.action == argparse.BooleanOptionalAction:
-            # We need to handle this case separately: the options are called
-            # --foo and --no-foo, and no argument is parsed. But in the config
-            # file, we have Foo=yes or Foo=no.
-            conv = self.parse_boolean
-        elif self.type:
-            conv = self.type
-        else:
-            conv = lambda s: s  # noqa: E731
-
         # This is a bit ugly, but --initrd and --devicetree-auto are the only options
         # with multiple args on the command line and a space-separated list in the
         # config file.
         if self.name in ['--initrd', '--devicetree-auto']:
-            value = [conv(v) for v in value.split()]
+            value = [self.parse_value(v) for v in value.split()]
         else:
-            value = conv(value)
+            value = self.parse_value(value)
 
         self.config_push(namespace, group, dest, value)
 
@@ -2016,6 +2135,7 @@ CONFIG_ITEMS = [
         default=[],
         action='append',
         config_key='UKI/SBAT',
+        config_push=ConfigItem.config_list_prepend,
     ),
     ConfigItem(
         '--pcrpkey',
@@ -2116,23 +2236,30 @@ CONFIG_ITEMS = [
     ConfigItem(
         '--secureboot-private-key',
         dest='sb_key',
-        help='required by --signtool=sbsign|systemd-sbsign. Path to key file or engine/provider designation for SB signing',  # noqa: E501
+        help='required by --signtool=sbsign|systemd-sbsign. Path to key file or engine/provider designation for SB signing',
         config_key='UKI/SecureBootPrivateKey',
     ),
     ConfigItem(
         '--secureboot-certificate',
         dest='sb_cert',
         help=(
-            'required by --signtool=sbsign. sbsign needs a path to certificate file or engine-specific designation for SB signing'  # noqa: E501
+            'required by --signtool=sbsign. sbsign needs a path to certificate file or engine-specific designation for SB signing'
         ),
         config_key='UKI/SecureBootCertificate',
+    ),
+    ConfigItem(
+        '--secureboot-certificate-common-name',
+        metavar='CN',
+        dest='sb_cert_common_name',
+        help="common name of a certificate created by 'genkey'",
+        config_key='UKI/SecureBootCertificateCommonName',
     ),
     ConfigItem(
         '--secureboot-certificate-dir',
         dest='sb_certdir',
         default='/etc/pki/pesign',
         help=(
-            'required by --signtool=pesign. Path to nss certificate database directory for PE signing. Default is /etc/pki/pesign'  # noqa: E501
+            'required by --signtool=pesign. Path to nss certificate database directory for PE signing. Default is /etc/pki/pesign'
         ),
         config_key='UKI/SecureBootCertificateDir',
         config_push=ConfigItem.config_set,
@@ -2141,7 +2268,7 @@ CONFIG_ITEMS = [
         '--secureboot-certificate-name',
         dest='sb_cert_name',
         help=(
-            'required by --signtool=pesign. pesign needs a certificate nickname of nss certificate database entry to use for PE signing'  # noqa: E501
+            'required by --signtool=pesign. pesign needs a certificate nickname of nss certificate database entry to use for PE signing'
         ),
         config_key='UKI/SecureBootCertificateName',
     ),
@@ -2198,6 +2325,15 @@ CONFIG_ITEMS = [
         config_push=ConfigItem.config_set_group,
     ),
     ConfigItem(
+        '--policyref',
+        dest='policyrefs',
+        metavar='STRING',
+        action='append',
+        help='policy references to bind signatures to',
+        config_key='PCRSignature:/PolicyRef',
+        config_push=ConfigItem.config_set_group,
+    ),
+    ConfigItem(
         '--tools',
         type=Path,
         action='append',
@@ -2217,6 +2353,12 @@ CONFIG_ITEMS = [
         '--policy-digest',
         action=argparse.BooleanOptionalAction,
         help='print systemd-measure policy digests for the UKI',
+    ),
+    ConfigItem(
+        '--sign-initrd-pcrs',
+        action=argparse.BooleanOptionalAction,
+        help='additionally sign PCR policies that can only be satisfied from the initrd',
+        config_key='UKI/SignInitrdPCRs',
     ),
     ConfigItem(
         '--json',
@@ -2326,14 +2468,14 @@ def create_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description='Build and sign Unified Kernel Images',
         usage='\n  '
-        + textwrap.dedent("""\
-          ukify {b}build{e} [--linux=LINUX] [--initrd=INITRD] [options…]
-            ukify {b}genkey{e} [options…]
-            ukify {b}inspect{e} FILE… [options…]
-        """).format(b=Style.bold, e=Style.reset),
+        + textwrap.dedent('''\
+          %(prog)s {b}build{e} [--linux=LINUX] [--initrd=INITRD] [options…]
+            %(prog)s {b}genkey{e} [options…]
+            %(prog)s {b}inspect{e} FILE… [options…]
+        ''').format(b=Style.bold, e=Style.reset),
         allow_abbrev=False,
         add_help=False,
-        epilog='\n  '.join(('config file:', *config_example())),
+        epilog='\n  '.join((f'{Style.blue}config file:{Style.reset}', *config_example())),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
@@ -2393,6 +2535,7 @@ def finalize_options(opts: argparse.Namespace) -> None:
     n_pcr_pub = None if opts.pcr_public_keys is None else len(opts.pcr_public_keys)
     n_pcr_priv = None if opts.pcr_private_keys is None else len(opts.pcr_private_keys)
     n_phase_path_groups = None if opts.phase_path_groups is None else len(opts.phase_path_groups)
+    n_policyrefs = None if opts.policyrefs is None else len(opts.policyrefs)
     if opts.policy_digest and n_pcr_priv is not None:
         raise ValueError('--pcr-private-key= cannot be specified with --policy-digest')
     if (
@@ -2409,6 +2552,10 @@ def finalize_options(opts: argparse.Namespace) -> None:
         raise ValueError('--pcr-public-key= and --pcr-certificate= cannot be used at the same time')
     if n_phase_path_groups is not None and n_phase_path_groups != n_pcr_priv:
         raise ValueError('--phases= specifications must match --pcr-private-key=')
+    if n_policyrefs is not None and n_policyrefs != n_pcr_priv:
+        raise ValueError('--policyref= specifications must match --pcr-private-key=')
+    if opts.sign_initrd_pcrs and not (n_pcr_priv or opts.policy_digest):
+        raise ValueError('--sign-initrd-pcrs requires --pcr-private-key= or --policy-digest')
 
     opts.cmdline = resolve_at_path(opts.cmdline)
 
@@ -2458,7 +2605,7 @@ def finalize_options(opts: argparse.Namespace) -> None:
         # both param given, infer sbsign and in case it was given, ensure signtool=sbsign
         if opts.signtool and opts.signtool not in ('sbsign', 'systemd-sbsign'):
             raise ValueError(
-                f'Cannot provide --signtool={opts.signtool} with --secureboot-private-key= and --secureboot-certificate='  # noqa: E501
+                f'Cannot provide --signtool={opts.signtool} with --secureboot-private-key= and --secureboot-certificate='
             )
         if not opts.signtool:
             opts.signtool = 'sbsign'
@@ -2478,7 +2625,7 @@ def finalize_options(opts: argparse.Namespace) -> None:
 
     if opts.sign_kernel and not opts.sb_key and not opts.sb_cert_name:
         raise ValueError(
-            '--sign-kernel requires either --secureboot-private-key= and --secureboot-certificate= (for sbsign) or --secureboot-certificate-name= (for pesign) to be specified'  # noqa: E501
+            '--sign-kernel requires either --secureboot-private-key= and --secureboot-certificate= (for sbsign) or --secureboot-certificate-name= (for pesign) to be specified'
         )
 
     opts.profile = resolve_at_path(opts.profile)

@@ -102,40 +102,52 @@ int runtime_directory(RuntimeScope scope, const char *fallback_suffix, char **re
         return 1;
 }
 
-int runtime_directory_make(RuntimeScope scope, const char *subdir, char **ret_dir, char **ret_dir_destroy) {
-        _cleanup_free_ char *dir = NULL, *destroy = NULL;
+int runtime_directory_resolve(RuntimeScope scope, const char *suffix, const char *identifier, char **ret) {
+        _cleanup_free_ char *base = NULL, *dir = NULL;
         int r;
 
-        assert(subdir);
-        assert(ret_dir);
-        assert(ret_dir_destroy);
+        assert(suffix);
+        assert(identifier);
+        assert(ret);
 
-        /* Use runtime_directory() (not _generic()) so that when we run in a systemd service
-         * with RuntimeDirectory= set, we pick up $RUNTIME_DIRECTORY and place our stuff into the
-         * directory the service manager prepared for us. When the env var is unset, we fall back
-         * to the provided subdirectory under /run (or the $XDG_RUNTIME_DIR equivalent in user scope)
-         * and take care of creation and destruction ourselves. */
-        r = runtime_directory(scope, subdir, &dir);
+        /* This should not be able to escape the base directory, forbid ../ and similar */
+        if (!filename_is_valid(identifier))
+                return -EINVAL;
+
+        /* Resolve a runtime directory <base>/<identifier>. The base is $RUNTIME_DIRECTORY when we run as a
+         * systemd service with RuntimeDirectory= set (the service manager prepared it for us), otherwise the
+         * provided suffix under /run (or the $XDG_RUNTIME_DIR equivalent in user scope). The per-identifier
+         * subdirectory keeps concurrent instances from colliding even when they share a base directory, and
+         * lets them use short entry names within it. */
+        r = runtime_directory(scope, suffix, &base);
         if (r < 0)
                 return r;
 
-        if (r > 0) {
-                /* $RUNTIME_DIRECTORY was not set, so we got the fallback path and need to create and
-                 * clean up the directory ourselves. */
-                destroy = strdup(dir);
-                if (!destroy)
-                        return -ENOMEM;
+        dir = path_join(base, identifier);
+        if (!dir)
+                return -ENOMEM;
 
-                r = mkdir_p(dir, 0755);
-                if (r < 0)
-                        return r;
-        }
+        *ret = TAKE_PTR(dir);
+        return 0;
+}
 
-        /* When $RUNTIME_DIRECTORY is set the service manager created the directory for us and
-         * will destroy it (or preserve it, per RuntimeDirectoryPreserve=) when the service stops. */
+int runtime_directory_make(RuntimeScope scope, const char *suffix, const char *identifier, char **ret) {
+        _cleanup_free_ char *dir = NULL;
+        int r;
 
-        *ret_dir = TAKE_PTR(dir);
-        *ret_dir_destroy = TAKE_PTR(destroy);
+        assert(ret);
+
+        r = runtime_directory_resolve(scope, suffix, identifier, &dir);
+        if (r < 0)
+                return r;
+
+        /* We always create and destroy the subdirectory ourselves, the service manager only owns the base
+         * it handed us. The caller is expected to remove the subdirectory. */
+        r = mkdir_p(dir, 0755);
+        if (r < 0)
+                return r;
+
+        *ret = TAKE_PTR(dir);
 
         return 0;
 }
@@ -385,6 +397,12 @@ static int patch_root_prefix_strv(char **l, const char *root_dir) {
         return 0;
 }
 
+bool path_is_valid_search_path(const char *path) {
+        return isempty(path) ||
+                (isempty(startswith(path, ":")) &&
+                 !strstr(path, "::"));
+}
+
 static int get_paths_from_environ(const char *var, char ***ret) {
         const char *e;
         int r;
@@ -398,10 +416,11 @@ static int get_paths_from_environ(const char *var, char ***ret) {
                 return 0;
         }
 
+        if (!path_is_valid_search_path(e))
+                return -EINVAL;
+
         bool append = endswith(e, ":"); /* Whether to append the normal search paths after what's obtained
                                            from envvar */
-
-        /* FIXME: empty components in other places should be rejected. */
 
         r = path_split_and_make_absolute(e, ret);
         if (r < 0)
@@ -784,7 +803,7 @@ static const char* const user_env_generator_paths[] = {
         NULL,
 };
 
-char** generator_binary_paths_internal(RuntimeScope scope, bool env_generator) {
+int generator_binary_paths_internal(RuntimeScope scope, bool env_generator, char ***ret) {
         static const struct {
                 const char *env_name;
                 const char * const *paths[_RUNTIME_SCOPE_MAX];
@@ -806,6 +825,7 @@ char** generator_binary_paths_internal(RuntimeScope scope, bool env_generator) {
         int r;
 
         assert(IN_SET(scope, RUNTIME_SCOPE_SYSTEM, RUNTIME_SCOPE_USER));
+        assert(ret);
 
         const char *env_name = ASSERT_PTR((env_generator ? environment_generator : unit_generator).env_name);
         const char * const *generator_paths = ASSERT_PTR((env_generator ? environment_generator : unit_generator).paths[scope]);
@@ -813,13 +833,14 @@ char** generator_binary_paths_internal(RuntimeScope scope, bool env_generator) {
         /* First priority is whatever has been passed to us via env vars */
         r = get_paths_from_environ(env_name, &paths);
         if (r < 0)
-                return NULL;
+                return r;
 
         if (!paths || r > 0) {
                 r = strv_extend_strv(&paths, (char* const*) generator_paths, /* filter_duplicates= */ true);
                 if (r < 0)
-                        return NULL;
+                        return r;
         }
 
-        return TAKE_PTR(paths);
+        *ret = TAKE_PTR(paths);
+        return 0;
 }

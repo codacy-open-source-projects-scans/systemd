@@ -238,6 +238,8 @@ static CompletionResult pick_completion(const char *string, char *const*completi
         _cleanup_free_ char *found = NULL;
         bool partial = false;
 
+        assert(ret);
+
         string = strempty(string);
 
         STRV_FOREACH(c, completions) {
@@ -283,6 +285,7 @@ static void clear_by_backspace(size_t n) {
 
 int ask_string_full(
                 char **ret,
+                const char *prefill,
                 GetCompletionsCallback get_completions,
                 void *userdata,
                 const char *text, ...) {
@@ -293,16 +296,41 @@ int ask_string_full(
         assert(ret);
         assert(text);
 
+        _cleanup_free_ char *string = NULL;
+        size_t n = 0;
+
+        if (prefill) {
+                /* Prefill query with explicit data if specified */
+
+                string = strdup(prefill);
+                if (!string)
+                        return -ENOMEM;
+
+                n = strlen(string);
+
+        } else if (get_completions) {
+                /* Otherwise, figure out what string to preselect the query with */
+                _cleanup_strv_free_ char **completions = NULL;
+                r = get_completions("", GET_COMPLETIONS_PRESELECT, &completions, userdata);
+                if (r < 0)
+                        return r;
+
+                CompletionResult cr = pick_completion(string, completions, &string);
+                if (cr < 0)
+                        return cr;
+
+                n = strlen_ptr(string);
+        }
+
         /* Output the prompt */
         fputs(ansi_highlight(), stdout);
         va_start(ap, text);
         vprintf(text, ap);
         va_end(ap);
         fputs(ansi_normal(), stdout);
+        if (string)
+                fputs(string, stdout);
         fflush(stdout);
-
-        _cleanup_free_ char *string = NULL;
-        size_t n = 0;
 
         /* Do interactive logic only if stdin + stdout are connected to the same place. And yes, we could use
          * STDIN_FILENO and STDOUT_FILENO here, but let's be overly correct for once, after all libc allows
@@ -344,7 +372,7 @@ int ask_string_full(
 
                         _cleanup_strv_free_ char **completions = NULL;
                         if (get_completions) {
-                                r = get_completions(string, &completions, userdata);
+                                r = get_completions(string, /* flags= */ 0, &completions, userdata);
                                 if (r < 0)
                                         return r;
                         }
@@ -450,6 +478,7 @@ int ask_string_full(
 
 fallback:
         /* A simple fallback without TTY magic */
+        string = mfree(string);
         r = read_line(stdin, LONG_LINE_MAX, &string);
         if (r < 0)
                 return r;
@@ -501,6 +530,7 @@ int show_menu(char **x,
               bool with_numbers) {
 
         assert(n_columns > 0);
+        assert(column_width > 0);
 
         if (n_columns == SIZE_MAX)
                 n_columns = 3;
@@ -512,18 +542,20 @@ int show_menu(char **x,
                 size_t column_max = (columns()-1) / n_columns;
 
                 /* Subtract room for numbers */
-                if (with_numbers && column_max > 6)
-                        column_max -= 6;
+                if (with_numbers)
+                        column_max = LESS_BY(column_max, 6U);
 
                 /* If columns would get too tight let's make this a linear list instead. */
                 if (column_max < 10 && widest > 10) {
                         n_columns = 1;
                         column_max = columns()-1;
 
-                        if (with_numbers && column_max > 6)
-                                column_max -= 6;
+                        if (with_numbers)
+                                column_max = LESS_BY(column_max, 6U);
                 }
 
+                /* Never make this narrower than 10 characters */
+                column_max = MAX(column_max, 10U);
                 column_width = CLAMP(widest+1, 10U, column_max);
         }
 
@@ -534,8 +566,7 @@ int show_menu(char **x,
         if (break_lines > 2)
                 break_lines--;
 
-        /* The first page gets two extra lines, since we want to show
-         * a title */
+        /* The first page gets two extra lines, since we want to show a title */
         size_t break_modulo = break_lines;
         if (break_modulo > 3)
                 break_modulo -= 3;
@@ -545,17 +576,18 @@ int show_menu(char **x,
                 for (size_t j = 0; j < n_columns; j++) {
                         _cleanup_free_ char *e = NULL;
 
-                        if (j * per_column + i >= n)
+                        size_t p = j * per_column + i;
+                        if (p >= n)
                                 break;
 
-                        e = ellipsize(x[j * per_column + i], column_width, ellipsize_percentage);
+                        e = ellipsize(x[p], column_width, ellipsize_percentage);
                         if (!e)
                                 return -ENOMEM;
 
                         if (with_numbers)
                                 printf("%s%4zu)%s ",
                                        ansi_grey(),
-                                       j * per_column + i + 1,
+                                       p + 1,
                                        ansi_normal());
 
                         if (grey_prefix && startswith(e, grey_prefix)) {
@@ -852,16 +884,8 @@ int vt_disallocate(const char *tty_path) {
 }
 
 static int vt_default_utf8(void) {
-        _cleanup_free_ char *b = NULL;
-        int r;
-
         /* Read the default VT UTF8 setting from the kernel */
-
-        r = read_one_line_file("/sys/module/vt/parameters/default_utf8", &b);
-        if (r < 0)
-                return r;
-
-        return parse_boolean(b);
+        return read_boolean_file("/sys/module/vt/parameters/default_utf8");
 }
 
 static int vt_reset_keyboard(int fd) {
@@ -1022,7 +1046,7 @@ int lock_dev_console(void) {
         return TAKE_FD(fd);
 }
 
-int make_console_stdio(void) {
+int make_console_stdio(bool switch_to_text) {
         int fd, r;
 
         /* Make /dev/console the controlling terminal and stdin/stdout/stderr, if we can. If we can't use
@@ -1038,7 +1062,7 @@ int make_console_stdio(void) {
                         return log_error_errno(r, "Failed to make /dev/null stdin/stdout/stderr: %m");
 
         } else {
-                reset_dev_console_fd(fd, /* switch_to_text= */ true);
+                reset_dev_console_fd(fd, switch_to_text);
 
                 r = rearrange_stdio(fd, fd, fd); /* This invalidates 'fd' both on success and on failure. */
                 if (r < 0)
@@ -1653,6 +1677,8 @@ int openpt_allocate_in_namespace(
         _cleanup_close_ int pidnsfd = -EBADF, mntnsfd = -EBADF, usernsfd = -EBADF, rootfd = -EBADF, fd = -EBADF;
         _cleanup_close_pair_ int pair[2] = EBADF_PAIR;
         int r;
+
+        assert(pidref);
 
         r = pidref_namespace_open(pidref, &pidnsfd, &mntnsfd, /* ret_netns_fd= */ NULL, &usernsfd, &rootfd);
         if (r < 0)
@@ -2655,17 +2681,32 @@ int terminal_get_size(
         return r;
 }
 
+static int fd_is_vc(int fd) {
+        _cleanup_free_ char *name = NULL;
+        int r;
+
+        assert(fd >= 0);
+
+        r = getttyname_harder(fd, &name);
+        if (r < 0)
+                return r;
+
+        return tty_is_vc_resolve(name);
+}
+
 int terminal_fix_size(int input_fd, int output_fd) {
         unsigned rows, columns;
         int r;
 
-        /* Tries to update the current terminal dimensions to the ones reported via ANSI sequences.
-         *
-         * Why bother with this? The ioctl() information is often incorrect on serial terminals (since
-         * there's no handshake or protocol to determine the right dimensions in RS232), but since the ANSI
-         * sequences are interpreted by the final terminal instead of an intermediary tty driver they should
-         * be more accurate.
-         */
+        /* Don't ask a virtual console at all. There is no intermediary here that could be wrong about the
+         * dimensions: the kernel renders the screen itself, so its winsize is authoritative. */
+        r = fd_is_vc(input_fd);
+        if (r < 0)
+                log_debug_errno(r, "Failed to determine whether terminal is a virtual console, assuming it is not: %m");
+        else if (r > 0) {
+                log_debug("Not querying dimensions of a virtual console, kernel dimensions are authoritative.");
+                return 0;
+        }
 
         struct winsize ws = {};
         if (ioctl(output_fd, TIOCGWINSZ, &ws) < 0)

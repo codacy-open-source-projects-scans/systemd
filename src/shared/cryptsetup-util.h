@@ -2,10 +2,28 @@
 #pragma once
 
 #include "dlfcn-util.h"
-#include "shared-forward.h"
+#include "dlopen-note.h"
+#include "forward.h"
 
 #if HAVE_LIBCRYPTSETUP
+#ifndef SYSTEMD_CFLAGS_MARKER_LIBCRYPTSETUP
+#  error "missing libcryptsetup_cflags in meson dependency."
+#endif
+
 #include <libcryptsetup.h> /* IWYU pragma: export */
+
+/* Available since libcryptsetup 2.7. Always redeclare so DLSYM_PROTOTYPE's typeof() resolves on older
+ * headers; suppress the warning when newer libcryptsetup already declares them. */
+DISABLE_WARNING_REDUNDANT_DECLS;
+/* NOLINTBEGIN(readability-redundant-declaration) */
+extern int crypt_set_keyring_to_link(struct crypt_device *cd,
+                                     const char *key_description,
+                                     const char *old_key_description,
+                                     const char *key_type_desc,
+                                     const char *keyring_to_link_vk);
+extern int crypt_token_set_external_path(const char *path);
+/* NOLINTEND(readability-redundant-declaration) */
+REENABLE_WARNING;
 
 extern DLSYM_PROTOTYPE(crypt_activate_by_passphrase);
 extern DLSYM_PROTOTYPE(crypt_activate_by_signed_key);
@@ -33,6 +51,7 @@ extern DLSYM_PROTOTYPE(crypt_keyslot_destroy);
 extern DLSYM_PROTOTYPE(crypt_keyslot_max);
 extern DLSYM_PROTOTYPE(crypt_keyslot_status);
 extern DLSYM_PROTOTYPE(crypt_load);
+extern DLSYM_PROTOTYPE(crypt_logf);
 extern DLSYM_PROTOTYPE(crypt_metadata_locking);
 extern DLSYM_PROTOTYPE(crypt_persistent_flags_get);
 extern DLSYM_PROTOTYPE(crypt_persistent_flags_set);
@@ -43,9 +62,7 @@ extern DLSYM_PROTOTYPE(crypt_resume_by_volume_key);
 extern DLSYM_PROTOTYPE(crypt_set_data_device);
 extern DLSYM_PROTOTYPE(crypt_set_data_offset);
 extern DLSYM_PROTOTYPE(crypt_set_debug_level);
-#if HAVE_CRYPT_SET_KEYRING_TO_LINK
 extern DLSYM_PROTOTYPE(crypt_set_keyring_to_link);
-#endif
 extern DLSYM_PROTOTYPE(crypt_set_log_callback);
 extern DLSYM_PROTOTYPE(crypt_set_metadata_size);
 extern DLSYM_PROTOTYPE(crypt_set_pbkdf_type);
@@ -55,9 +72,7 @@ extern DLSYM_PROTOTYPE(crypt_token_external_path);
 extern DLSYM_PROTOTYPE(crypt_token_json_get);
 extern DLSYM_PROTOTYPE(crypt_token_json_set);
 extern DLSYM_PROTOTYPE(crypt_token_max);
-#if HAVE_CRYPT_TOKEN_SET_EXTERNAL_PATH
 extern DLSYM_PROTOTYPE(crypt_token_set_external_path);
-#endif
 extern DLSYM_PROTOTYPE(crypt_token_status);
 extern DLSYM_PROTOTYPE(crypt_volume_key_get);
 extern DLSYM_PROTOTYPE(crypt_volume_key_keyring);
@@ -75,13 +90,16 @@ void cryptsetup_enable_logging(struct crypt_device *cd);
 int cryptsetup_set_minimal_pbkdf(struct crypt_device *cd);
 
 int cryptsetup_get_token_as_json(struct crypt_device *cd, int idx, const char *verify_type, sd_json_variant **ret);
+/* Errors cryptsetup_get_token_as_json() returns for a token that is absent, of a different type, or
+ * unparseable, and callers should keep iterating other tokens. */
+#define ERRNO_IS_NEG_CRYPTSETUP_TOKEN_SKIP(r) IN_SET(r, -ENOENT, -EINVAL, -EMEDIUMTYPE, -EUCLEAN)
 int cryptsetup_add_token_json(struct crypt_device *cd, sd_json_variant *v);
 int cryptsetup_get_volume_key_prefix(struct crypt_device *cd, const char *volume_name, char **ret);
 int cryptsetup_get_volume_key_id(struct crypt_device *cd, const char *volume_name, const void *volume_key,
                                  size_t volume_key_size,  char **ret);
 #endif
 
-int dlopen_cryptsetup(int log_level);
+int dlopen_cryptsetup(int log_level) _dlopen_loader_;
 
 int cryptsetup_get_keyslot_from_token(sd_json_variant *v);
 

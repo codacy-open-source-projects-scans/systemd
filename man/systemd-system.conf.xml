@@ -533,6 +533,56 @@
       </varlistentry>
 
       <varlistentry>
+        <term><varname>RestrictFileSystemAccess=</varname></term>
+
+        <listitem><para>Takes a boolean argument or the special value <literal>exec</literal>. Defaults to
+        <literal>no</literal>. When enabled, PID 1 loads a BPF LSM program that enforces a deny-default
+        execution policy: only binaries residing on signed dm-verity block devices (and the initramfs during
+        early boot) are permitted to execute. Execution from tmpfs, procfs, sysfs, unsigned dm-verity devices,
+        and anonymous executable memory mappings is denied.</para>
+
+        <para>This setting is intended as one component of an image-based, fully verified system, where the
+        whole boot chain (firmware, kernel image, kernel command line, initramfs) is measured and attested.
+        On a general-purpose system without such guarantees it does not provide a meaningful security
+        boundary on its own: an attacker with sufficient privilege to edit
+        <filename>system.conf</filename>, modify the kernel command line, or kexec into an unsigned initrd
+        can disable or bypass the policy.</para>
+
+        <para>The enforcement hooks block <function>execve()</function> of untrusted binaries
+        (<literal>bprm_check_security</literal>), <constant>PROT_EXEC</constant> memory mappings including
+        shared libraries (<literal>mmap_file</literal>), and write-to-execute transitions such as JIT
+        compilation (<literal>file_mprotect</literal>).</para>
+
+        <para>The policy also enforces W^X system-wide: no mapping may be writable and executable at the
+        same time, and a private file mapping that has been modified through copy-on-write may not be made
+        executable afterwards.</para>
+
+        <para>Since v262, files on overlayfs mounts are resolved to the layer that hosts their data, so
+        execution from an overlay whose data resides on a signed dm-verity device is permitted, while files
+        in a writable upper layer are denied. This requires kernel v7.2 or newer; on older kernels execution from
+        overlayfs mounts is denied entirely. Note that only the file data is checked, so an untrusted upper
+        layer may still control a binary's ownership and setuid bits. Multi-device filesystems such as
+        btrfs are unsupported.</para>
+
+        <para>Note that, without further measures to secure the system, kexec can be used to circumvent
+        this.</para>
+
+        <para>This requires the kernel to be booted with <literal>dm_verity.require_signatures=1</literal>
+        and <literal>proc_mem.force_override=never</literal> on the kernel command line, and with BPF LSM
+        enabled (<literal>lsm=...,bpf</literal>).</para>
+
+        <para>The value <literal>yes</literal> is equivalent to <literal>exec</literal>. Additional
+        modes may be added in the future.</para>
+
+        <para>This option may also be set via the <varname>systemd.restrict_filesystem_access=</varname> kernel command
+        line option, see
+        <citerefentry><refentrytitle>kernel-command-line</refentrytitle><manvolnum>7</manvolnum></citerefentry>.
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v261"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><varname>SystemCallArchitectures=</varname></term>
 
         <listitem><para>Takes a space-separated list of architecture
@@ -660,6 +710,22 @@
         time window.</para>
 
         <xi:include href="version-info.xml" xpointer="v253"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>EventLoopRateLimitIntervalSec=</varname></term>
+        <term><varname>EventLoopRateLimitBurst=</varname></term>
+
+        <listitem><para>Configures the rate limiting applied to the manager's main event loop. If the event
+        loop iterates more than <varname>EventLoopRateLimitBurst=</varname> times within
+        <varname>EventLoopRateLimitIntervalSec=</varname>, event processing is briefly paused to prevent
+        excessive CPU usage. <varname>EventLoopRateLimitIntervalSec=</varname> defaults to 1s.
+        <varname>EventLoopRateLimitBurst=</varname> defaults to 50000. These settings can also be set on the
+        kernel command line via
+        <varname>systemd.event_loop_ratelimit_interval_sec=</varname> and
+        <varname>systemd.event_loop_ratelimit_burst=</varname>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v261"/></listitem>
       </varlistentry>
 
       <varlistentry>

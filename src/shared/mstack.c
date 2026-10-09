@@ -139,7 +139,7 @@ static int mstack_load_one(MStack *mstack, const char *dir, int dir_fd, const ch
                         };
 
                         _cleanup_(pick_result_done) PickResult result = PICK_RESULT_NULL;
-                        r = path_pick(dir, dir_fd, fname, &filter, /* n_filters= */ 1, PICK_ARCHITECTURE, &result);
+                        r = path_pick(dir, dir_fd, dir_fd, fname, &filter, /* n_filters= */ 1, PICK_ARCHITECTURE, &result);
                         if (r < 0)
                                 return log_debug_errno(r, "Failed to resolve '%s' directory: %m", fname);
                         if (r == 0)
@@ -456,7 +456,7 @@ static int mstack_load_now(MStack *mstack, const char *dir, int dir_fd, MStackFl
         if (dir_fd < 0) {
                 _dir_fd = openat(AT_FDCWD, isempty(dir) ? "." : dir, O_DIRECTORY|O_CLOEXEC);
                 if (_dir_fd < 0)
-                        return log_debug_errno(errno, "Failed to to open '%s': %m", dir);
+                        return log_debug_errno(errno, "Failed to open '%s': %m", dir);
 
                 dir_fd = _dir_fd;
         } else {

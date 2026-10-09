@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <sched.h>
-#include <sys/prctl.h>
 #include <unistd.h>
 
 #include "sd-event.h"
 
+#include "acl-util.h"
 #include "capability-util.h"
 #include "compress.h"
 #include "dirent-util.h"
@@ -32,9 +32,17 @@ int import_fork_tar_x(int tree_fd, int userns_fd, PidRef *ret_pid) {
         assert(tree_fd >= 0);
         assert(ret_pid);
 
-        r = dlopen_libarchive(LOG_DEBUG);
+        r = dlopen_libarchive(LOG_ERR);
         if (r < 0)
                 return r;
+
+        /* Add the #if guard here to suppress a test-dlopen-note.py failure. If libarchive support is
+         * disabled, dlopen_libarchive() above fails, so this code is never reached. However, without
+         * the #if guard, the dlopen_libacl symbol would still end up in the final executable, and the
+         * resulting missing dlopen note would trigger the test failure. */
+#if HAVE_LIBARCHIVE
+        (void) dlopen_libacl(LOG_DEBUG);
+#endif
 
         TarFlags flags =
                 (userns_fd >= 0 ? TAR_SQUASH_UIDS_ABOVE_64K : 0) |
@@ -81,8 +89,9 @@ int import_fork_tar_x(int tree_fd, int userns_fd, PidRef *ret_pid) {
                 if (r < 0)
                         log_debug_errno(r, "Failed to drop capabilities, ignoring: %m");
 
-                if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
-                        log_warning_errno(errno, "Failed to enable PR_SET_NO_NEW_PRIVS, ignoring: %m");
+                r = proc_set_nnp();
+                if (r < 0)
+                        log_warning_errno(r, "Failed to enable PR_SET_NO_NEW_PRIVS, ignoring: %m");
 
                 if (tar_x(pipefd[0], tree_fd, flags) < 0)
                         _exit(EXIT_FAILURE);
@@ -99,9 +108,15 @@ int import_fork_tar_c(int tree_fd, int userns_fd, PidRef *ret_pid) {
         assert(tree_fd >= 0);
         assert(ret_pid);
 
-        r = dlopen_libarchive(LOG_DEBUG);
+        r = dlopen_libarchive(LOG_ERR);
         if (r < 0)
                 return r;
+
+        /* Add the #if guard here to suppress a test-dlopen-note.py failure. See the comment in
+         * import_fork_tar_x() above. */
+#if HAVE_LIBARCHIVE
+        (void) dlopen_libacl(LOG_DEBUG);
+#endif
 
         TarFlags flags =
                 (userns_fd >= 0 ? TAR_SQUASH_UIDS_ABOVE_64K : 0) |
@@ -137,14 +152,24 @@ int import_fork_tar_c(int tree_fd, int userns_fd, PidRef *ret_pid) {
                 if (unshare(CLONE_NEWNET) < 0)
                         log_debug_errno(errno, "Failed to lock tar into network namespace, ignoring: %m");
 
+                /* Allocate the hardlink db before dropping privileges: it lives on a tmpfs superblock of our
+                 * own, which needs CAP_SYS_ADMIN to set up. Doing it later would leave tar_c() to fall back
+                 * to a directory in /var/tmp/, which is refused for the transient UID range we run under
+                 * here, and would leave transient owned inodes behind on a persistent file system if it
+                 * weren't. */
+                _cleanup_close_ int hardlink_db_fd = tar_hardlink_db_new();
+                if (hardlink_db_fd < 0)
+                        log_debug_errno(hardlink_db_fd, "Failed to allocate hardlink db, ignoring: %m");
+
                 r = capability_bounding_set_drop(retain, true);
                 if (r < 0)
                         log_debug_errno(r, "Failed to drop capabilities, ignoring: %m");
 
-                if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
-                        log_warning_errno(errno, "Failed to enable PR_SET_NO_NEW_PRIVS, ignoring: %m");
+                r = proc_set_nnp();
+                if (r < 0)
+                        log_warning_errno(r, "Failed to enable PR_SET_NO_NEW_PRIVS, ignoring: %m");
 
-                if (tar_c(tree_fd, pipefd[1], /* filename= */ NULL, flags) < 0)
+                if (tar_c(tree_fd, pipefd[1], /* filename= */ NULL, hardlink_db_fd, flags) < 0)
                         _exit(EXIT_FAILURE);
 
                 _exit(EXIT_SUCCESS);
@@ -392,13 +417,14 @@ int import_remove_tree(const char *path, int *userns_fd, ImportFlags flags) {
         assert(path);
         assert(userns_fd);
 
-        r = import_make_foreign_userns(userns_fd);
-        if (r < 0)
-                return r;
-
         /* Try the userns dance first, to remove foreign UID range owned trees */
-        if (FLAGS_SET(flags, IMPORT_FOREIGN_UID))
+        if (FLAGS_SET(flags, IMPORT_FOREIGN_UID)) {
+                r = import_make_foreign_userns(userns_fd);
+                if (r < 0)
+                        return r;
+
                 (void) remove_tree_foreign(path, *userns_fd);
+        }
 
         r = rm_rf(path, REMOVE_ROOT|REMOVE_PHYSICAL|REMOVE_SUBVOLUME|REMOVE_MISSING_OK|REMOVE_CHMOD);
         if (r < 0)

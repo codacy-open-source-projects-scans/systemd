@@ -49,7 +49,7 @@
 #include "logind-user.h"
 #include "logind-user-dbus.h"
 #include "logind-utmp.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "os-util.h"
 #include "parse-util.h"
 #include "path-util.h"
@@ -282,7 +282,7 @@ static int property_get_idle_hint(
         assert(bus);
         assert(reply);
 
-        return sd_bus_message_append(reply, "b", manager_get_idle_hint(m, NULL) > 0);
+        return sd_bus_message_append(reply, "b", manager_get_idle_hint(m, /* ret_timestamp= */ NULL));
 }
 
 static int property_get_idle_since_hint(
@@ -295,7 +295,7 @@ static int property_get_idle_since_hint(
                 sd_bus_error *error) {
 
         Manager *m = ASSERT_PTR(userdata);
-        dual_timestamp t = DUAL_TIMESTAMP_NULL;
+        dual_timestamp t;
 
         assert(bus);
         assert(reply);
@@ -701,10 +701,7 @@ static int method_list_sessions_ex(sd_bus_message *message, void *userdata, sd_b
                 if (!path)
                         return -ENOMEM;
 
-                r = session_get_idle_hint(s, &idle_ts);
-                if (r < 0)
-                        return r;
-                idle = r > 0;
+                idle = session_get_idle_hint(s, &idle_ts);
 
                 r = sd_bus_message_append(reply, "(sussussbto)",
                                           s->id,
@@ -1648,6 +1645,7 @@ static int method_set_user_linger(sd_bus_message *message, void *userdata, sd_bu
                         /* good_user= */ UID_INVALID,
                         interactive ? POLKIT_ALLOW_INTERACTIVE : 0,
                         &m->polkit_registry,
+                        /* ret_admin= */ NULL,
                         error);
         if (r < 0)
                 return r;
@@ -1721,7 +1719,7 @@ static int trigger_device(Manager *m, sd_device *parent) {
         }
 
         FOREACH_DEVICE(e, d) {
-                r = sd_device_trigger(d, SD_DEVICE_CHANGE);
+                r = device_trigger_with_timestamp(d, SD_DEVICE_CHANGE, m->device_trigger_args, /* ret_uuid= */ NULL);
                 if (r < 0)
                         log_device_debug_errno(d, r, "Failed to trigger device, ignoring: %m");
         }
@@ -1824,6 +1822,7 @@ static int method_attach_device(sd_bus_message *message, void *userdata, sd_bus_
                         /* good_user= */ UID_INVALID,
                         interactive ? POLKIT_ALLOW_INTERACTIVE : 0,
                         &m->polkit_registry,
+                        /* ret_admin= */ NULL,
                         error);
         if (r < 0)
                 return r;
@@ -1854,6 +1853,7 @@ static int method_flush_devices(sd_bus_message *message, void *userdata, sd_bus_
                         /* good_user= */ UID_INVALID,
                         interactive ? POLKIT_ALLOW_INTERACTIVE : 0,
                         &m->polkit_registry,
+                        /* ret_admin= */ NULL,
                         error);
         if (r < 0)
                 return r;
@@ -2327,7 +2327,11 @@ static int method_do_shutdown_or_sleep(
                                          handle_action_to_string(m->delayed_action->handle),
                                          handle_action_to_string(a->handle));
 
-        /* reset case we're shorting a scheduled shutdown */
+        r = bus_manager_shutdown_or_sleep_now_or_later(m, a, error);
+        if (r < 0)
+                return r;
+
+        /* Reset in case we're short-circuiting a scheduled shutdown. */
         m->unlink_nologin = false;
         manager_reset_scheduled_shutdown(m);
 
@@ -2335,10 +2339,6 @@ static int method_do_shutdown_or_sleep(
         m->scheduled_shutdown_action = action;
 
         (void) setup_wall_message_timer(m, message);
-
-        r = bus_manager_shutdown_or_sleep_now_or_later(m, a, error);
-        if (r < 0)
-                return r;
 
         return sd_bus_reply_method_return(message, NULL);
 }
@@ -3495,7 +3495,7 @@ static int method_set_reboot_to_boot_loader_entry(
                         if (unlink("/run/systemd/reboot-to-boot-loader-entry") < 0 && errno != ENOENT)
                                 return -errno;
                 } else {
-                        r = write_string_file("/run/systemd/reboot-boot-to-loader-entry", v, WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_ATOMIC|WRITE_STRING_FILE_LABEL);
+                        r = write_string_file("/run/systemd/reboot-to-boot-loader-entry", v, WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_ATOMIC|WRITE_STRING_FILE_LABEL);
                         if (r < 0)
                                 return r;
                 }
@@ -4321,7 +4321,7 @@ int match_job_removed(sd_bus_message *message, void *userdata, sd_bus_error *err
                 /* If the user is stopping, we're tracking stop jobs here. So don't send reply. */
                 if (!user->stopping) {
                         char **user_job;
-                        FOREACH_ARGUMENT(user_job, &user->runtime_dir_job, &user->service_manager_job)
+                        FOREACH_ARGUMENT(user_job, &user->runtime_dir_job, &user->service_manager_job, &user->measure_job)
                                 if (streq_ptr(path, *user_job)) {
                                         *user_job = mfree(*user_job);
 

@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
 #include <stdio.h>
 
 #include "alloc-util.h"
@@ -77,7 +76,7 @@ void udev_builtin_reload(UdevReloadFlags flags) {
 void udev_builtin_list(void) {
         FOREACH_ELEMENT(b, builtins)
                 if (*b)
-                        fprintf(stderr, "  %-14s  %s\n", (*b)->name, (*b)->help);
+                        printf("  %-14s  %s\n", (*b)->name, (*b)->help);
 }
 
 const char* udev_builtin_name(UdevBuiltinCommand cmd) {
@@ -106,7 +105,9 @@ UdevBuiltinCommand udev_builtin_lookup(const char *command) {
         command += strspn(command, WHITESPACE);
         n = strcspn(command, WHITESPACE);
         for (UdevBuiltinCommand i = 0; i < _UDEV_BUILTIN_MAX; i++)
-                if (builtins[i] && strneq(builtins[i]->name, command, n))
+                if (builtins[i] &&
+                    strlen(builtins[i]->name) == n &&
+                    strneq(builtins[i]->name, command, n))
                         return i;
 
         return _UDEV_BUILTIN_INVALID;
@@ -128,8 +129,6 @@ int udev_builtin_run(UdevEvent *event, UdevBuiltinCommand cmd, const char *comma
         if (r < 0)
                 return r;
 
-        /* we need '0' here to reset the internal state */
-        optind = 0;
         return builtins[cmd]->cmd(event, strv_length(argv), argv);
 }
 

@@ -26,6 +26,7 @@
 #include "dissect-image.h"
 #include "env-file.h"
 #include "env-util.h"
+#include "errno-util.h"
 #include "extension-util.h"
 #include "fd-util.h"
 #include "fs-util.h"
@@ -618,7 +619,7 @@ static int image_make(
                 (*ret)->foreign_uid_owned = uid_is_foreign(st->st_uid);
                 return 0;
 
-        } else if (S_ISREG(st->st_mode) && endswith(path, ".raw")) {
+        } else if (S_ISREG(st->st_mode) && (endswith(path, ".raw") || pretty)) {
                 usec_t crtime = 0;
 
                 /* It's a RAW disk image */
@@ -957,6 +958,7 @@ int image_find(RuntimeScope scope,
                                 _cleanup_(pick_result_done) PickResult result = PICK_RESULT_NULL;
                                 r = path_pick(root,
                                               rfd,
+                                              rfd,
                                               fname_path, /* This has to be the unresolved entry with the .v suffix */
                                               &filter,
                                               /* n_filters= */ 1,
@@ -1177,6 +1179,7 @@ int image_discover(
 
                                         _cleanup_(pick_result_done) PickResult result = PICK_RESULT_NULL;
                                         r = path_pick(root,
+                                                      rfd,
                                                       rfd,
                                                       fname_path, /* This has to be the unresolved entry with the .v suffix */
                                                       &filter,
@@ -1502,7 +1505,7 @@ int image_rename(Image *i, const char *new_name, RuntimeScope scope) {
         _cleanup_free_ char *new_path = NULL, *nn = NULL;
         _cleanup_strv_free_ char **settings = NULL;
         unsigned file_attr = 0;
-        int r;
+        int r, ret = 0;
 
         assert(i);
 
@@ -1584,27 +1587,31 @@ int image_rename(Image *i, const char *new_name, RuntimeScope scope) {
         if (file_attr & FS_IMMUTABLE_FL)
                 (void) chattr_path(new_path, FS_IMMUTABLE_FL, FS_IMMUTABLE_FL);
 
-        free_and_replace(i->path, new_path);
-        free_and_replace(i->name, nn);
-
         STRV_FOREACH(j, settings) {
                 r = rename_auxiliary_file(*j, new_name, ".nspawn");
                 if (r < 0 && r != -ENOENT)
-                        log_debug_errno(r, "Failed to rename settings file %s, ignoring: %m", *j);
+                        log_debug_errno(r, "Failed to rename settings file '%s', ignoring: %m", *j);
         }
 
         NULSTR_FOREACH(suffix, auxiliary_suffixes_nulstr) {
                 _cleanup_free_ char *aux = NULL;
+
                 r = image_auxiliary_path(i, suffix, &aux);
-                if (r < 0)
-                        return r;
+                if (r < 0) {
+                        RET_GATHER(ret, log_debug_errno(r, "Failed to generate auxiliary path for image '%s' suffix '%s': %m",
+                                                        i->name, suffix));
+                        continue;
+                }
 
                 r = rename_auxiliary_file(aux, new_name, suffix);
                 if (r < 0 && r != -ENOENT)
-                        log_debug_errno(r, "Failed to rename roothash file %s, ignoring: %m", aux);
+                        log_debug_errno(r, "Failed to rename auxiliary file '%s', ignoring: %m", aux);
         }
 
-        return 0;
+        free_and_replace(i->path, new_path);
+        free_and_replace(i->name, nn);
+
+        return ret;
 }
 
 static int clone_auxiliary_file(const char *path, const char *new_name, const char *suffix) {
@@ -1623,7 +1630,7 @@ static int clone_auxiliary_file(const char *path, const char *new_name, const ch
         if (r < 0)
                 return r;
 
-        return copy_file_atomic(path, rs, 0664, COPY_REFLINK);
+        return copy_file_atomic(path, rs, 0664, /* copy_flags= */ 0);
 }
 
 static int get_pool_directory(
@@ -1680,7 +1687,7 @@ static int get_pool_directory(
         return 0;
 }
 
-static int unprivileged_clone(Image *i, const char *new_path) {
+static int unprivileged_clone(Image *i, const char *new_path, bool read_only) {
         int r;
 
         assert(i);
@@ -1718,7 +1725,7 @@ static int unprivileged_clone(Image *i, const char *new_path) {
                         /* flags= */ 0,
                         &new_fd);
         if (r < 0)
-                return 0;
+                return r;
 
         /* Mount new image */
         _cleanup_close_ int target_fd = -EBADF;
@@ -1734,7 +1741,15 @@ static int unprivileged_clone(Image *i, const char *new_path) {
         link = sd_varlink_unref(link);
 
         /* Fork off child that moves into userns and does the copying */
-        return copy_tree_at_foreign(tree_fd, target_fd, userns_fd);
+        r = copy_tree_at_foreign(tree_fd, target_fd, userns_fd);
+        if (r < 0)
+                return r;
+
+        /* Match the best-effort immutable bit handling of ordinary directory clones. */
+        if (read_only)
+                (void) chattr_fd(new_fd, FS_IMMUTABLE_FL, FS_IMMUTABLE_FL);
+
+        return 0;
 }
 
 int image_clone(Image *i, const char *new_name, bool read_only, RuntimeScope scope) {
@@ -1777,7 +1792,7 @@ int image_clone(Image *i, const char *new_name, bool read_only, RuntimeScope sco
                         return r;
 
                 if (i->foreign_uid_owned)
-                        r = unprivileged_clone(i, new_path);
+                        r = unprivileged_clone(i, new_path, read_only);
                 else {
                         r = btrfs_subvol_snapshot_at(
                                         AT_FDCWD, i->path,
@@ -1803,7 +1818,7 @@ int image_clone(Image *i, const char *new_name, bool read_only, RuntimeScope sco
                         return r;
 
                 r = copy_file_atomic(i->path, new_path, read_only ? 0444 : 0644,
-                                     COPY_REFLINK|COPY_CRTIME|COPY_NOCOW_AFTER);
+                                     COPY_CRTIME|COPY_NOCOW_AFTER);
                 break;
         }
 
@@ -1828,7 +1843,7 @@ int image_clone(Image *i, const char *new_name, bool read_only, RuntimeScope sco
 
                 r = clone_auxiliary_file(aux, new_name, suffix);
                 if (r < 0 && r != -ENOENT)
-                        log_debug_errno(r, "Failed to clone root hash file %s, ignoring: %m", aux);
+                        log_debug_errno(r, "Failed to clone auxiliary file '%s', ignoring: %m", aux);
         }
 
         return 0;
@@ -2197,7 +2212,7 @@ int image_setup_pool(RuntimeScope scope, ImageClass class, bool use_btrfs_subvol
         if (!use_btrfs_subvol)
                 return 0;
 
-        (void) btrfs_subvol_make_label(pool);
+        (void) btrfs_subvol_make_label(pool, /* label_context= */ NULL);
 
         if (!use_btrfs_quota)
                 return 0;

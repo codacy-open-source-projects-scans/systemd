@@ -5,8 +5,8 @@
 
 #include "dns-def.h"
 #include "dns-type.h"
+#include "forward.h"
 #include "list.h"
-#include "shared-forward.h"
 
 /* DNSKEY RR flags */
 #define DNSKEY_FLAG_SEP            (UINT16_C(1) << 0)
@@ -34,6 +34,7 @@ enum {
         DNSSEC_ALGORITHM_ECDSAP384SHA384 = 14, /* RFC 6605 */
         DNSSEC_ALGORITHM_ED25519 = 15,         /* RFC 8080 */
         DNSSEC_ALGORITHM_ED448 = 16,           /* RFC 8080 */
+        DNSSEC_ALGORITHM_MLDSA44 = 18,         /* draft-westerbaan-dnssec-mldsa */
         DNSSEC_ALGORITHM_INDIRECT = 252,
         DNSSEC_ALGORITHM_PRIVATEDNS,
         DNSSEC_ALGORITHM_PRIVATEOID,
@@ -392,6 +393,7 @@ const char* dns_resource_record_to_string(DnsResourceRecord *rr);
 DnsResourceRecord *dns_resource_record_copy(DnsResourceRecord *rr);
 DEFINE_TRIVIAL_CLEANUP_FUNC(DnsResourceRecord*, dns_resource_record_unref);
 
+void dns_resource_record_clear_wire_format(DnsResourceRecord *rr);
 int dns_resource_record_to_wire_format(DnsResourceRecord *rr, bool canonical);
 
 int dns_resource_record_signer(DnsResourceRecord *rr, const char **ret);

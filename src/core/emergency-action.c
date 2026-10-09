@@ -4,6 +4,7 @@
 
 #include "ansi-color.h"
 #include "emergency-action.h"
+#include "exit-status.h"
 #include "manager.h"
 #include "reboot-util.h"
 #include "special.h"
@@ -113,7 +114,7 @@ void emergency_action(
                 log_and_status(m, action, flags, "Rebooting", reason);
 
                 (void) update_reboot_parameter_and_warn(reboot_arg, true);
-                (void) manager_add_job_by_name_and_warn(m, JOB_START, SPECIAL_REBOOT_TARGET, JOB_REPLACE_IRREVERSIBLY, NULL, NULL);
+                (void) manager_add_job_by_name_or_warn(m, JOB_START, SPECIAL_REBOOT_TARGET, JOB_REPLACE_IRREVERSIBLY, NULL, NULL);
                 break;
 
         case EMERGENCY_ACTION_REBOOT_FORCE:
@@ -141,7 +142,7 @@ void emergency_action(
         case EMERGENCY_ACTION_SOFT_REBOOT:
                 log_and_status(m, action, flags, "Soft-rebooting", reason);
 
-                (void) manager_add_job_by_name_and_warn(m, JOB_START, SPECIAL_SOFT_REBOOT_TARGET, JOB_REPLACE_IRREVERSIBLY, NULL, NULL);
+                (void) manager_add_job_by_name_or_warn(m, JOB_START, SPECIAL_SOFT_REBOOT_TARGET, JOB_REPLACE_IRREVERSIBLY, NULL, NULL);
                 break;
 
         case EMERGENCY_ACTION_SOFT_REBOOT_FORCE:
@@ -154,10 +155,14 @@ void emergency_action(
 
                 if (exit_status >= 0)
                         m->return_value = exit_status;
+                else if (FLAGS_SET(flags, EMERGENCY_ACTION_IS_FAILURE) && m->return_value == EXIT_SUCCESS)
+                        /* Nothing to propagate, but we act on a failure: don't report success. An exit
+                         * status set explicitly via SetExitCode() stays. */
+                        m->return_value = EXIT_EXCEPTION;
 
                 if (MANAGER_IS_USER(m) || detect_container() > 0) {
                         log_and_status(m, action, flags, "Exiting", reason);
-                        (void) manager_add_job_by_name_and_warn(m, JOB_START, SPECIAL_EXIT_TARGET, JOB_REPLACE_IRREVERSIBLY, NULL, NULL);
+                        (void) manager_add_job_by_name_or_warn(m, JOB_START, SPECIAL_EXIT_TARGET, JOB_REPLACE_IRREVERSIBLY, NULL, NULL);
                         break;
                 }
 
@@ -166,13 +171,17 @@ void emergency_action(
 
         case EMERGENCY_ACTION_POWEROFF:
                 log_and_status(m, action, flags, "Powering off", reason);
-                (void) manager_add_job_by_name_and_warn(m, JOB_START, SPECIAL_POWEROFF_TARGET, JOB_REPLACE_IRREVERSIBLY, NULL, NULL);
+                (void) manager_add_job_by_name_or_warn(m, JOB_START, SPECIAL_POWEROFF_TARGET, JOB_REPLACE_IRREVERSIBLY, NULL, NULL);
                 break;
 
         case EMERGENCY_ACTION_EXIT_FORCE:
 
                 if (exit_status >= 0)
                         m->return_value = exit_status;
+                else if (FLAGS_SET(flags, EMERGENCY_ACTION_IS_FAILURE) && m->return_value == EXIT_SUCCESS)
+                        /* Nothing to propagate, but we act on a failure: don't report success. An exit
+                         * status set explicitly via SetExitCode() stays. */
+                        m->return_value = EXIT_EXCEPTION;
 
                 if (MANAGER_IS_USER(m) || detect_container() > 0) {
                         log_and_status(m, action, flags, "Exiting immediately", reason);
@@ -199,7 +208,7 @@ void emergency_action(
 
         case EMERGENCY_ACTION_KEXEC:
                 log_and_status(m, action, flags, "Executing kexec", reason);
-                (void) manager_add_job_by_name_and_warn(m, JOB_START, SPECIAL_KEXEC_TARGET, JOB_REPLACE_IRREVERSIBLY, NULL, NULL);
+                (void) manager_add_job_by_name_or_warn(m, JOB_START, SPECIAL_KEXEC_TARGET, JOB_REPLACE_IRREVERSIBLY, NULL, NULL);
                 break;
 
         case EMERGENCY_ACTION_KEXEC_FORCE:
@@ -209,7 +218,7 @@ void emergency_action(
 
         case EMERGENCY_ACTION_HALT:
                 log_and_status(m, action, flags, "Halting", reason);
-                (void) manager_add_job_by_name_and_warn(m, JOB_START, SPECIAL_HALT_TARGET, JOB_REPLACE_IRREVERSIBLY, NULL, NULL);
+                (void) manager_add_job_by_name_or_warn(m, JOB_START, SPECIAL_HALT_TARGET, JOB_REPLACE_IRREVERSIBLY, NULL, NULL);
                 break;
 
         case EMERGENCY_ACTION_HALT_FORCE:

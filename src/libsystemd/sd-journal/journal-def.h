@@ -3,7 +3,7 @@
 
 #include "sd-id128.h"
 
-#include "sd-forward.h"
+#include "forward.h"
 #include "sparse-endian.h"
 
 /* Make sure not to make this smaller than the maximum coredump size.
@@ -42,6 +42,9 @@ typedef struct TagObject TagObject;
 typedef struct HashItem HashItem;
 
 typedef struct FSSHeader FSSHeader;
+
+typedef struct JournalFile JournalFile;
+typedef struct JournalAuthContext JournalAuthContext;
 
 /* Object types */
 typedef enum ObjectType {
@@ -207,7 +210,8 @@ enum {
                                                HEADER_COMPATIBLE_TAIL_ENTRY_BOOT_ID |
                                                HEADER_COMPATIBLE_SEALED_CONTINUOUS,
 
-        HEADER_COMPATIBLE_SUPPORTED          = (HAVE_GCRYPT ? HEADER_COMPATIBLE_SEALED | HEADER_COMPATIBLE_SEALED_CONTINUOUS : 0) |
+        HEADER_COMPATIBLE_SUPPORTED          = HEADER_COMPATIBLE_SEALED |
+                                               HEADER_COMPATIBLE_SEALED_CONTINUOUS |
                                                HEADER_COMPATIBLE_TAIL_ENTRY_BOOT_ID,
 };
 
@@ -261,7 +265,7 @@ assert_cc(sizeof(struct Header) == sizeof(struct Header__packed));
 assert_cc(sizeof(struct Header) == 272);
 
 #define FSS_HEADER_SIGNATURE                                            \
-        ((const char[]) { 'K', 'S', 'H', 'H', 'R', 'H', 'L', 'P' })
+        { 'K', 'S', 'H', 'H', 'R', 'H', 'L', 'P' }
 
 struct FSSHeader {
         uint8_t signature[8]; /* "KSHHRHLP" */

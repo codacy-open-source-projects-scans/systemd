@@ -9,7 +9,7 @@ set -o pipefail
 
 if ! can_do_rootless_nspawn; then
     echo "Skipping unpriv nspawn test"
-    exit 0
+    exit 77
 fi
 
 # We need FSCONFIG_SET_FD support in overlayfs for .mstack to work. Let's skip
@@ -18,7 +18,7 @@ fi
 # support for this from shell, hence let's do a version check instead.
 if systemd-analyze condition 'ConditionVersion= < 6.13' ; then
     echo "Kernel too old for FSCONFIG_SET_FD support on overlayfs, skipping pull-oci test".
-    exit 0
+    exit 77
 fi
 
 export SYSTEMD_LOG_LEVEL=debug
@@ -101,7 +101,7 @@ EOF
 cat /var/tmp/pull-oci-test/v2/ocicombo/manifests/latest
 jq < /var/tmp/pull-oci-test/v2/ocicombo/manifests/latest
 
-cat > /usr/lib/systemd/oci-registry/registry.localfile.oci-registry <<EOF
+cat >/usr/lib/systemd/oci-registry/registry.localfile.oci-registry <<EOF
 {
         "defaultProtocol" : "file",
         "overrideRegistry" : "/var/tmp/pull-oci-test"
@@ -126,13 +126,13 @@ systemd-mstack -U /tmp/ooo
 
 ls -alR /home/testuser/.local/state/machines/ocicombo.mstack
 
-run0 -u testuser importctl list-images --user | grep -q ocicombo
+run0 -u testuser importctl list-images --user | grep ocicombo >/dev/null
 
 ls -alR /home/testuser/.local/state/machines/ocicombo.mstack
 
-run0 -u testuser systemd-nspawn -q --pipe -M ocicombo /sbin/init | grep -q luftikus
+run0 -u testuser systemd-nspawn -q --pipe -M ocicombo /sbin/init | grep luftikus >/dev/null
 
-run0 -u testuser --pipe systemd-run -q --unit=fimpel --user -p PrivateUsers=managed -p RootMStack=/home/testuser/.local/state/machines/ocicombo.mstack --pipe /sbin/init | grep -q luftikus
+run0 -u testuser --pipe systemd-run -q --unit=fimpel --user -p PrivateUsers=managed -p RootMStack=/home/testuser/.local/state/machines/ocicombo.mstack --pipe /sbin/init | grep luftikus >/dev/null
 
 run0 -u testuser machinectl list-images -a --user
 

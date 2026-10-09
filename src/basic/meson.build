@@ -5,12 +5,13 @@ basic_sources = files(
         'af-list.c',
         'alloc-util.c',
         'ansi-color.c',
+        'ansi-seq.c',
         'architecture.c',
         'argv-util.c',
         'arphrd-util.c',
         'assert-util.c',
         'audit-util.c',
-        'btrfs.c',
+        'btrfs-util.c',
         'build.c',
         'build-path.c',
         'bus-label.c',
@@ -36,12 +37,12 @@ basic_sources = files(
         'ether-addr-util.c',
         'extract-word.c',
         'fd-util.c',
+        'fiber-ops.c',
         'fileio.c',
         'filesystems.c',
         'format-ifname.c',
         'format-util.c',
         'fs-util.c',
-        'gcrypt-util.c',
         'glob-util.c',
         'glyph-util.c',
         'gunicode.c',
@@ -57,13 +58,14 @@ basic_sources = files(
         'iovec-util.c',
         'iovec-wrapper.c',
         'keyring-util.c',
-        'label.c',
+        'label-util.c',
         'limits-util.c',
         'locale-util.c',
         'lock-util.c',
         'log.c',
         'log-context.c',
         'login-util.c',
+        'math-util.c',
         'memfd-util.c',
         'memory-util.c',
         'mempool.c',
@@ -160,7 +162,7 @@ foreach item : [
                 target = custom_target(
                         input : gperf_file,
                         output : '@0@-from-name.inc'.format(item[0]),
-                        command : [gperf,
+                        command : [gperf_cmdline,
                                 '-L', 'ANSI-C', '-t', '--ignore-case',
                                 '-N', 'lookup_@0@'.format(item[0]),
                                 '-H', 'hash_@0@_name'.format(item[0]),
@@ -195,15 +197,14 @@ filesystems_gperf_gperf = custom_target(
 filesystems_gperf_h = custom_target(
         input : filesystems_gperf_gperf,
         output : 'filesystems-gperf.h',
-        command : [gperf, '@INPUT@', '--output-file', '@OUTPUT@'])
+        command : [gperf_cmdline, '@INPUT@', '--output-file', '@OUTPUT@'])
 
 generated_sources += [filesystem_sets_c, filesystems_gperf_gperf, filesystems_gperf_h]
 basic_sources += [filesystem_sets_c, filesystems_gperf_h]
 
 test('kernel-filesystem-magics',
      filesystem_sets_py,
-     args : ['check'],
-     env : ['CPP=@0@'.format(cpp)])
+     args : ['check', cpp, system_include_args])
 
 libbasic_static = static_library(
         'basic',
@@ -212,15 +213,10 @@ libbasic_static = static_library(
         include_directories : basic_includes,
         implicit_include_directories : false,
         dependencies : [libbzip2_cflags,
-                        libdl,
-                        libgcrypt_cflags,
                         liblz4_cflags,
-                        libm,
-                        librt,
                         libxz_cflags,
                         libz_cflags,
                         libzstd_cflags,
-                        threads,
                         userspace],
         c_args : ['-fvisibility=default'],
         build_by_default : false)

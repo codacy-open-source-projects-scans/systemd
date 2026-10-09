@@ -102,6 +102,9 @@ static int conf_file_prefix_root(ConfFile *c, const char *root, ConfFilesFlags f
 
         assert(c);
 
+        if (FLAGS_SET(flags, CONF_FILES_DONT_PREFIX_ROOT))
+                return 0;
+
         int log_level = conf_files_log_level(flags);
 
         r = chaseat_prefix_root(c->result, root, &p);
@@ -155,7 +158,7 @@ static int conf_file_chase_and_verify(
         struct stat st = {};
         int r;
 
-        assert(rfd >= 0 || IN_SET(rfd, AT_FDCWD, XAT_FDROOT));
+        assert(wildcard_fd_is_valid(rfd));
         assert(original_path);
         assert(path);
         assert(name);
@@ -274,7 +277,7 @@ int conf_file_new_at(
         int r;
 
         assert(path);
-        assert(rfd >= 0 || IN_SET(rfd, AT_FDCWD, XAT_FDROOT));
+        assert(wildcard_fd_is_valid(rfd));
         assert(ret);
 
         int log_level = conf_files_log_level(flags);
@@ -390,7 +393,7 @@ static int files_add(
         assert(dir);
         assert(original_dirpath);
         assert(resolved_dirpath);
-        assert(rfd >= 0 || IN_SET(rfd, AT_FDCWD, XAT_FDROOT));
+        assert(wildcard_fd_is_valid(rfd));
         assert(files);
         assert(masked);
 
@@ -622,7 +625,7 @@ static int conf_files_list_impl(
         const ConfFile *inserted = NULL;
         int r;
 
-        assert(rfd >= 0 || IN_SET(rfd, AT_FDCWD, XAT_FDROOT));
+        assert(wildcard_fd_is_valid(rfd));
         assert(ret);
 
         root = empty_to_root(root);
@@ -736,7 +739,7 @@ int conf_files_list_strv_at(
         _cleanup_free_ char *root = NULL;
         int r;
 
-        assert(rfd >= 0 || IN_SET(rfd, AT_FDCWD, XAT_FDROOT));
+        assert(wildcard_fd_is_valid(rfd));
         assert(ret);
 
         if (DEBUG_LOGGING)
@@ -761,7 +764,7 @@ int conf_files_list_strv_at_full(
         _cleanup_free_ char *root = NULL;
         int r;
 
-        assert(rfd >= 0 || IN_SET(rfd, AT_FDCWD, XAT_FDROOT));
+        assert(wildcard_fd_is_valid(rfd));
         assert(ret_files);
         assert(ret_n_files);
 

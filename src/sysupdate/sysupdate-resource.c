@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
-#include <linux/magic.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -10,10 +9,10 @@
 #include "build-path.h"
 #include "chase.h"
 #include "device-util.h"
-#include "devnum-util.h"
 #include "dirent-util.h"
 #include "env-util.h"
 #include "errno-util.h"
+#include "extension-util.h"
 #include "fd-util.h"
 #include "fdisk-util.h"
 #include "fileio.h"
@@ -23,6 +22,8 @@
 #include "hexdecoct.h"
 #include "import-util.h"
 #include "iovec-util.h"
+#include "os-util.h"
+#include "path-util.h"
 #include "pidref.h"
 #include "process-util.h"
 #include "sort-util.h"
@@ -46,6 +47,18 @@ void resource_destroy(Resource *rr) {
         for (size_t i = 0; i < rr->n_instances; i++)
                 instance_free(rr->instances[i]);
         free(rr->instances);
+}
+
+bool resource_has_glob_directory_pattern(Resource *rr) {
+        assert(rr);
+
+        STRV_FOREACH(p, rr->patterns) {
+                const char *pat = *p;
+
+                if (pattern_skip_glob_directory_prefix(&pat))
+                        return true;
+        }
+        return false;
 }
 
 static int resource_add_instance(
@@ -126,7 +139,7 @@ static int resource_load_from_directory_recursive(
                         continue;
                 }
 
-                if (fstatat(dirfd(d), de->d_name, &st, AT_NO_AUTOMOUNT) < 0) {
+                if (fstatat(dirfd(d), de->d_name, &st, AT_NO_AUTOMOUNT|AT_SYMLINK_NOFOLLOW) < 0) {
                         if (errno == ENOENT) /* Gone by now? */
                                 continue;
 
@@ -139,9 +152,11 @@ static int resource_load_from_directory_recursive(
                 if ((stripped = startswith(de->d_name, ".sysupdate.partial."))) {
                         de_d_name_stripped = stripped;
                         is_partial = true;
+                        is_pending = false;
                 } else if ((stripped = startswith(de->d_name, ".sysupdate.pending."))) {
                         de_d_name_stripped = stripped;
                         is_pending = true;
+                        is_partial = false;
                 } else
                         de_d_name_stripped = de->d_name;
 
@@ -155,26 +170,45 @@ static int resource_load_from_directory_recursive(
                 if (!rel_joined_for_matching)
                         return log_oom();
 
-                r = pattern_match_many(rr->patterns, rel_joined_for_matching, &extracted_fields);
-                if (r == PATTERN_MATCH_RETRY) {
+                /* If any pattern has the glob directory prefix descend into subdirectories when looking for
+                 * regular files */
+                bool descend = S_ISDIR(st.st_mode) && S_ISREG(m) && resource_has_glob_directory_pattern(rr);
+
+                if (!descend) {
+                        r = pattern_match_many(rr->patterns, rel_joined_for_matching, &extracted_fields);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to match pattern: %m");
+                        if (r == PATTERN_MATCH_NO)
+                                continue;
+                        /* Here we descend when the match pattern itself uses subdirectories */
+                        if (r == PATTERN_MATCH_RETRY) {
+                                if (!S_ISDIR(st.st_mode)) /* The pattern continues with '/' but this is no directory */
+                                        continue;
+                                descend = true;
+                        } else if (r == PATTERN_MATCH_YES_AND_RETRY && S_ISDIR(st.st_mode) && m != S_IFDIR)
+                                /* The direct match is unusable since a directory can't be an instance here,
+                                 * but another pattern wants to descend, so do that instead */
+                                descend = true;
+                }
+
+                if (descend) {
                         _cleanup_closedir_ DIR *subdir = NULL;
 
-                        subdir = xopendirat(dirfd(d), rel_joined, 0);
-                        if (!subdir)
-                                continue;
+                        subdir = xopendirat(dirfd(d), de->d_name, O_NOFOLLOW);
+                        if (!subdir) {
+                                if (errno == ENOENT) /* Gone by now? */
+                                        continue;
+
+                                return log_error_errno(errno, "Failed to open directory %s/%s: %m", rr->path, rel_joined);
+                        }
 
                         r = resource_load_from_directory_recursive(rr, subdir, rel_joined, rel_joined_for_matching, m, is_partial, is_pending);
                         if (r < 0)
                                 return r;
-                        if (r == 0)
-                                continue;
-                }
-                else if (r < 0)
-                        return log_error_errno(r, "Failed to match pattern: %m");
-                else if (r == PATTERN_MATCH_NO)
                         continue;
+                }
 
-                if (de->d_type == DT_DIR && m != S_IFDIR)
+                if (S_ISDIR(st.st_mode) && m != S_IFDIR)
                         continue;
 
                 joined = path_join(rr->path, rel_joined);
@@ -191,6 +225,9 @@ static int resource_load_from_directory_recursive(
 
                 if (instance->metadata.mode == MODE_INVALID)
                         instance->metadata.mode = st.st_mode & 0775; /* mask out world-writability and suid and stuff, for safety */
+
+                /* Can’t be both partial and pending. */
+                assert(!(is_partial && is_pending));
 
                 instance->is_partial = is_partial;
                 instance->is_pending = is_pending;
@@ -312,6 +349,9 @@ static int resource_load_from_blockdev(Resource *rr) {
 
                 if (instance->metadata.read_only < 0)
                         instance->metadata.read_only = instance->partition_info.read_only;
+
+                /* Can’t be both partial and pending. */
+                assert(!(is_partial && is_pending));
 
                 instance->is_partial = is_partial;
                 instance->is_pending = is_pending;
@@ -524,6 +564,11 @@ static int resource_load_from_web(
                 r = unhexmem_full(p, 64, /* secure= */ false, &h.iov_base, &h.iov_len);
                 if (r < 0)
                         return log_error_errno(r, "Failed to parse digest at manifest line %zu, refusing.", line_nr);
+                if (h.iov_len != sizeof_field(InstanceMetadata, sha256sum))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Manifest hash at line %zu decoded to %zu bytes, refusing.",
+                                               line_nr,
+                                               h.iov_len);
 
                 p += 64, left -= 64;
 
@@ -545,21 +590,30 @@ static int resource_load_from_web(
                 if (!fn)
                         return log_oom();
 
-                if (!filename_is_valid(fn))
+                /* Accept either a plain filename or a relative subpath like "subdir/file" but reject
+                 * absolute paths and any paths containing "." or ".." Reject "%" too as it is added to
+                 * the URL verbatim and curl would percent-decode it, which could lead to ".." after the
+                 * normalization check. */
+                if (path_is_absolute(fn) || !path_is_normalized(fn) || strchr(fn, '%'))
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid filename specified at manifest line %zu, refusing.", line_nr);
                 if (string_has_cc(fn, NULL))
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Filename contains control characters at manifest line %zu, refusing.", line_nr);
+
+                /* Magic files can't be in subdirectories */
+                if (strchr(fn, '/') && startswith(last_path_component(fn), "BEST-BEFORE-"))
+                        log_warning("Ignoring best-before marker '%s' in subdirectory at manifest line %zu.", fn, line_nr);
 
                 r = process_magic_file(fn, &h);
                 if (r < 0)
                         return r;
                 if (r == 0) {
-                        /* If this isn't a magic file, then do the pattern matching */
-
+                        /* Pattern matching against the full manifest entry. A pattern with the glob
+                         * directory prefix matches against the basename only which pattern_match_many
+                         * handles. */
                         r = pattern_match_many(rr->patterns, fn, &extracted_fields);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to match pattern: %m");
-                        if (r == PATTERN_MATCH_YES) {
+                        if (IN_SET(r, PATTERN_MATCH_YES, PATTERN_MATCH_YES_AND_RETRY)) {
                                 _cleanup_free_ char *path = NULL;
 
                                 r = import_url_append_component(rr->path, fn, &path);
@@ -658,6 +712,32 @@ int resource_load_instances(Resource *rr, bool verify, Hashmap **web_cache) {
                 return r;
 
         typesafe_qsort(rr->instances, rr->n_instances, instance_cmp);
+
+        /* There are various cases where the same version can be provided by different files either due to
+         * multiple match patterns defined in a naming scheme transition or due to a subdirectory containing
+         * the same file again when the glob directory prefix is used, or due to a wildcard like @s or @t
+         * being used and the files offer different values there while reporting the same version. Since
+         * this could lead to unexpected behavior we report this here to the user. */
+        for (size_t i = 1; i < rr->n_instances; i++) {
+                Instance *a = rr->instances[i - 1], *b = rr->instances[i];
+
+                if (strverscmp_improved(a->metadata.version, b->metadata.version) != 0 || streq(a->path, b->path))
+                        continue;
+
+                _cleanup_free_ char *suffix = NULL;
+
+                if (!streq(a->metadata.version, b->metadata.version)) {
+                        suffix = strjoin("/'", b->metadata.version, "'");
+                        if (!suffix)
+                                return log_oom();
+                }
+
+                log_info("Multiple instances of version '%s'%s found at '%s' and '%s'.",
+                         a->metadata.version,
+                         strempty(suffix),
+                         a->path, b->path);
+        }
+
         return 0;
 }
 
@@ -684,47 +764,6 @@ Instance* resource_find_instance(Resource *rr, const char *version) {
                 return NULL;
 
         return *found;
-}
-
-static int get_sysext_overlay_block(const char *p, dev_t *ret) {
-        int r;
-
-        assert(p);
-        assert(ret);
-
-        /* Tries to read the backing device information systemd-sysext puts in the virtual file
-         * /usr/.systemd-sysext/backing */
-
-        _cleanup_free_ char *j = path_join(p, ".systemd-sysext");
-        if (!j)
-                return log_oom_debug();
-
-        _cleanup_close_ int fd = open(j, O_RDONLY|O_DIRECTORY);
-        if (fd < 0)
-                return log_debug_errno(errno, "Failed to open '%s': %m", j);
-
-        r = fd_is_fs_type(fd, OVERLAYFS_SUPER_MAGIC);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to determine backing file system of '%s': %m", j);
-        if (r == 0)
-                return log_debug_errno(SYNTHETIC_ERRNO(ENOTTY), "Backing file system of '%s' is not an overlayfs.", j);
-
-        _cleanup_free_ char *buf = NULL;
-        r = read_one_line_file_at(fd, "backing", &buf);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to read contents of '%s/backing': %m", j);
-
-        r = parse_devnum(buf, ret);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to parse contents of '%s/backing': %m", j);
-
-        if (major(*ret) == 0) { /* not a block device? */
-                *ret = 0;
-                return 0;
-        }
-
-        (void) block_get_originating(*ret, ret, /* recursive= */ false);
-        return 1;
 }
 
 int resource_resolve_path(
@@ -778,7 +817,7 @@ int resource_resolve_path(
                         /* volatile-root not found */
                         r = get_block_device_harder("/usr/", &d);
                         if (r == 0) /* Not backed by a block device? Let's see if this is a sysext overlayfs instance */
-                                r = get_sysext_overlay_block("/usr/", &d);
+                                r = extension_overlay_block("/usr/", IMAGE_SYSEXT, &d);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to determine block device of file system: %m");
                 } else if (!S_ISBLK(orig_root_stats.st_mode)) /* symlink was present but not block device */

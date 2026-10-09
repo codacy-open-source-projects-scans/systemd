@@ -47,7 +47,7 @@
 #include "json-util.h"
 #include "libmount-util.h"
 #include "loop-util.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
 #include "namespace-util.h"
@@ -320,6 +320,63 @@ not_found:
 #endif
 }
 
+int probe_partition_table(int fd, char **ret_pttype) {
+
+        /* Probes the whole device referenced by fd for a partition table and returns its blkid type (e.g.
+         * "gpt" or "dos") in *ret_pttype, or NULL if none is found. Returns a negative error on failure
+         * (including -EUCLEAN for ambiguous results). */
+
+#if HAVE_BLKID
+        _cleanup_(blkid_free_probep) blkid_probe b = NULL;
+        const char *pttype = NULL;
+        int r;
+
+        assert(fd >= 0);
+        assert(ret_pttype);
+
+        r = dlopen_libblkid(LOG_DEBUG);
+        if (r < 0)
+                return r;
+
+        b = sym_blkid_new_probe();
+        if (!b)
+                return -ENOMEM;
+
+        errno = 0;
+        r = sym_blkid_probe_set_device(b, fd, /* offset= */ 0, /* size= */ 0 /* i.e. everything */);
+        if (r != 0)
+                return errno_or_else(ENOMEM);
+
+        sym_blkid_probe_enable_partitions(b, 1);
+
+        errno = 0;
+        r = sym_blkid_do_safeprobe(b);
+        if (r == _BLKID_SAFEPROBE_NOT_FOUND) {
+                log_debug("No partition table detected.");
+                *ret_pttype = NULL;
+                return 0;
+        }
+        if (r == _BLKID_SAFEPROBE_AMBIGUOUS)
+                return log_debug_errno(SYNTHETIC_ERRNO(EUCLEAN), "Partition table results ambiguous.");
+        if (r == _BLKID_SAFEPROBE_ERROR)
+                return log_debug_errno(errno_or_else(EIO), "Failed to probe for partition table: %m");
+
+        assert(r == _BLKID_SAFEPROBE_FOUND);
+
+        (void) sym_blkid_probe_lookup_value(b, "PTTYPE", &pttype, /* len= */ NULL);
+        if (!pttype) {
+                log_debug("No partition table detected.");
+                *ret_pttype = NULL;
+                return 0;
+        }
+
+        log_debug("Probed partition table type '%s'.", pttype);
+        return strdup_to_full(ret_pttype, pttype);
+#else
+        return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Compiled without blkid support, cannot probe for partition table.");
+#endif
+}
+
 #if HAVE_BLKID
 static int image_policy_may_use(
                 const ImagePolicy *policy,
@@ -430,17 +487,24 @@ static int partition_is_luks2_integrity(int part_fd, uint64_t offset, uint64_t s
         if (sz != sizeof(header))
                 return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to read LUKS header.");
 
-        if (memcmp(header.luks_magic, LUKS2_MAGIC, sizeof(header.luks_magic)) != 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Partition's magic is not LUKS.");
+        if (memcmp(header.luks_magic, LUKS2_MAGIC, sizeof(header.luks_magic)) != 0) {
+                log_debug("Partition does not have a LUKS magic header, assuming no integrity.");
+                return 0;
+        }
 
-        if (be16toh(header.version) != 2)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Unsupported LUKS header version: %" PRIu16 ".", be16toh(header.version));
+        if (be16toh(header.version) != 2) {
+                log_debug("Partition is LUKS v%" PRIu16 ", not LUKS2, assuming no integrity.", be16toh(header.version));
+                return 0;
+        }
 
         if (be64toh(header.hdr_len) > size)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "LUKS header length exceeds partition size.");
 
         if (be64toh(header.hdr_len) <= LUKS2_FIXED_HDR_SIZE || offset > UINT64_MAX - be64toh(header.hdr_len))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid LUKS header length: %" PRIu64 ".", be64toh(header.hdr_len));
+
+        if (be64toh(header.hdr_len) - LUKS2_FIXED_HDR_SIZE > 16U * 1024U * 1024U)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "LUKS header JSON area too large: %" PRIu64 ".", be64toh(header.hdr_len));
 
         json_len = be64toh(header.hdr_len) - LUKS2_FIXED_HDR_SIZE;
         json = malloc(json_len + 1);
@@ -710,7 +774,7 @@ static int acquire_sig_for_roothash(
 
         ssize_t n = pread(fd, buf, partition_size, partition_offset);
         if (n < 0)
-                return -ENOMEM;
+                return -errno;
         if ((uint64_t) n != partition_size)
                 return -EIO;
 
@@ -902,16 +966,31 @@ static int compare_arch(Architecture a, Architecture b) {
         return 0;
 }
 
-static bool image_filter_test(const ImageFilter *filter, PartitionDesignator d, const char *label) {
+bool image_filter_test(const ImageFilter *filter, PartitionDesignator d, const char *label) {
         assert(d < _PARTITION_DESIGNATOR_MAX);
 
         if (d < 0) /* For unspecified designators we have no filter expression */
                 return true;
 
-        if (!filter || !filter->pattern[d])
+        if (!filter)
                 return true;
 
-        return fnmatch(filter->pattern[d], strempty(label),  FNM_NOESCAPE) == 0;
+        const char *pattern = filter->pattern[d];
+
+        /* If there's no filter for this specific designator but it's a verity partition, fall back to the
+         * filter for the corresponding data partition. This ensures that e.g. image_filter=usr=250 also
+         * constrains which usr verity (and verity sig) partitions are selected. This assumes verity
+         * partitions carry the same label as their corresponding data partition. */
+        if (!pattern) {
+                PartitionDesignator data = partition_verity_to_data(d);
+                if (data >= 0)
+                        pattern = filter->pattern[data];
+        }
+
+        if (!pattern)
+                return true;
+
+        return fnmatch(pattern, strempty(label), FNM_NOESCAPE) == 0;
 }
 
 static int dissect_image_from_unpartitioned(
@@ -1245,15 +1324,22 @@ static int dissect_image(
                 start = sym_blkid_partition_get_start(pp);
                 if (start < 0)
                         return errno_or_else(EIO);
-
-                assert((uint64_t) start < UINT64_MAX/512);
+                if ((uint64_t) start > INT64_MAX / 512)
+                        return log_debug_errno(SYNTHETIC_ERRNO(EOVERFLOW),
+                                               "Partition start LBA too large to convert to a byte offset, refusing.");
 
                 errno = 0;
                 size = sym_blkid_partition_get_size(pp);
                 if (size < 0)
                         return errno_or_else(EIO);
+                if ((uint64_t) size > INT64_MAX / 512)
+                        return log_debug_errno(SYNTHETIC_ERRNO(EOVERFLOW),
+                                               "Partition size in LBA too large to convert to a byte offset, refusing.");
 
-                assert((uint64_t) size < UINT64_MAX/512);
+                /* Ensure the partition's exclusive end LBA can be converted to a byte offset. */
+                if ((uint64_t) start + (uint64_t) size > INT64_MAX / 512)
+                        return log_debug_errno(SYNTHETIC_ERRNO(EOVERFLOW),
+                                               "Partition end LBA too large to convert to a byte offset, refusing.");
 
                 /* While probing we need the non-diskseq device node name to access the thing, hence mask off
                  * DISSECT_IMAGE_DISKSEQ_DEVNODE. */
@@ -1274,7 +1360,7 @@ static int dissect_image(
                  * partition already existent. */
 
                 if (FLAGS_SET(flags, DISSECT_IMAGE_ADD_PARTITION_DEVICES)) {
-                        r = block_device_add_partition(fd, node, nr, (uint64_t) start * 512, (uint64_t) size * 512);
+                        r = block_device_add_partition(fd, nr, (uint64_t) start * 512, (uint64_t) size * 512);
                         if (r < 0) {
                                 if (r != -EBUSY)
                                         return log_debug_errno(r, "BLKPG_ADD_PARTITION failed: %m");
@@ -1410,8 +1496,8 @@ static int dissect_image(
 
                                         r = acquire_sig_for_roothash(
                                                         fd,
-                                                        start * 512,
-                                                        size * 512,
+                                                        (uint64_t) start * 512,
+                                                        (uint64_t) size * 512,
                                                         &root_hash,
                                                         /* ret_root_hash_sig= */ NULL);
                                         if (r < 0)
@@ -2294,7 +2380,7 @@ int partition_pick_mount_options(
         case PARTITION_XBOOTLDR:
                 flags |= MS_NOSUID|MS_NOEXEC|MS_NOSYMFOLLOW;
 
-                /* The ESP might contain a pre-boot random seed. Let's make this unaccessible to regular
+                /* The ESP might contain a pre-boot random seed. Let's make this inaccessible to regular
                  * userspace. ESP/XBOOTLDR is almost certainly VFAT, hence if we don't know assume it is. */
                 if (!fstype || fstype_can_fmask_dmask(fstype))
                         if (!strextend_with_separator(&options, ",", "fmask=0177,dmask=0077"))
@@ -2802,8 +2888,9 @@ static DecryptedImage* decrypted_image_free(DecryptedImage *d) {
         if (!d)
                 return NULL;
 
-        for (size_t i = 0; i < d->n_decrypted; i++) {
-                DecryptedPartition *p = d->decrypted + i;
+        /* Detach in reverse order so that nested dm-verity and dm-crypt are detached in the right order. */
+        for (size_t i = d->n_decrypted; i > 0; i--) {
+                DecryptedPartition *p = d->decrypted + i - 1;
 
                 if (p->device && p->name && !p->relinquished) {
                         _cleanup_free_ char *node = NULL;
@@ -2939,6 +3026,13 @@ static int decrypt_partition(
         if (!FLAGS_SET(policy_flags, PARTITION_POLICY_ENCRYPTED))
                 return log_debug_errno(SYNTHETIC_ERRNO(ERFKILL), "Attempted to unlock partition via LUKS, but it's prohibited.");
 
+        /* If a dm-verity device was already set up on this partition, then the partition is both Verity
+         * protected and LUKS encrypted, with Verity being the outer envelope and LUKS the inner. In that
+         * case open the LUKS device on top of the verity device, so that everything we read is
+         * authenticated. Since verity devices are read-only, the LUKS layer must then be read-only, too. */
+        const char *source_node = m->decrypted_node ?: m->node;
+        bool on_verity = !!m->decrypted_node;
+
         r = dlopen_cryptsetup(LOG_DEBUG);
         if (r < 0)
                 return r;
@@ -2950,7 +3044,7 @@ static int decrypt_partition(
         if (!GREEDY_REALLOC0(d->decrypted, d->n_decrypted + 1))
                 return -ENOMEM;
 
-        r = sym_crypt_init(&cd, m->node);
+        r = sym_crypt_init(&cd, source_node);
         if (r < 0)
                 return log_debug_errno(r, "Failed to initialize dm-crypt: %m");
 
@@ -2961,8 +3055,8 @@ static int decrypt_partition(
                 return log_debug_errno(r, "Failed to load LUKS metadata: %m");
 
         r = sym_crypt_activate_by_passphrase(cd, name, CRYPT_ANY_SLOT, passphrase, strlen(passphrase),
-                                             ((flags & DISSECT_IMAGE_DEVICE_READ_ONLY) ? CRYPT_ACTIVATE_READONLY : 0) |
-                                             ((flags & DISSECT_IMAGE_DISCARD_ON_CRYPTO) ? CRYPT_ACTIVATE_ALLOW_DISCARDS : 0));
+                                             ((flags & DISSECT_IMAGE_DEVICE_READ_ONLY) || on_verity ? CRYPT_ACTIVATE_READONLY : 0) |
+                                             ((flags & DISSECT_IMAGE_DISCARD_ON_CRYPTO) && !on_verity ? CRYPT_ACTIVATE_ALLOW_DISCARDS : 0));
         if (r < 0) {
                 log_debug_errno(r, "Failed to activate LUKS device: %m");
                 return r == -EPERM ? -EKEYREJECTED : r;
@@ -2977,7 +3071,7 @@ static int decrypt_partition(
                 .device = TAKE_PTR(cd),
         };
 
-        m->decrypted_node = TAKE_PTR(node);
+        free_and_replace(m->decrypted_node, node);
         close_and_replace(m->mount_node_fd, fd);
 
         return 0;
@@ -3139,7 +3233,7 @@ static int validate_signature_userspace(const VeritySettings *verity, const char
         if (r)
                 log_debug("Userspace PKCS#7 validation succeeded.");
         else
-                log_debug("Userspace PKCS#7 validation failed: %s", sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                log_openssl_errors(LOG_DEBUG, "Userspace PKCS#7 validation failed");
 
         return r;
 #else
@@ -3476,10 +3570,23 @@ success:
                 .device = TAKE_PTR(cd),
         };
 
-        m->decrypted_node = TAKE_PTR(node);
+        free_and_replace(m->decrypted_node, node);
         close_and_replace(m->mount_node_fd, mount_node_fd);
 
         return 0;
+}
+
+static void dissected_image_undo_decrypt(DissectedImage *m) {
+        assert(m);
+
+        FOREACH_ELEMENT(p, m->partitions) {
+                if (!p->decrypted_node) /* Only look at partitions which we decrypted */
+                        continue;
+
+                p->decrypted_node = mfree(p->decrypted_node);
+                p->decrypted_fstype = mfree(p->decrypted_fstype);
+                p->mount_node_fd = safe_close(p->mount_node_fd);
+        }
 }
 #endif
 
@@ -3536,26 +3643,35 @@ int dissected_image_decrypt(
 
                 PartitionPolicyFlags fl = image_policy_get_exhaustively(policy, i);
 
-                r = decrypt_partition(m, p, passphrase, flags, fl, d);
-                if (r < 0)
-                        return r;
-
+                /* Set up Verity first, and only then LUKS: if a partition is both Verity protected and
+                 * encrypted, Verity is the outer envelope and LUKS the inner, i.e. the Verity hash data
+                 * covers the LUKS ciphertext, and decrypt_partition() then stacks the LUKS device on top of
+                 * the verity device. */
                 k = partition_verity_hash_of(i);
                 if (k >= 0) {
                         r = verity_partition(m, i, p, m->partitions + k, root, verity, flags, fl, d);
                         if (r < 0)
-                                return r;
+                                goto fail;
                 }
+
+                r = decrypt_partition(m, p, passphrase, flags, fl, d);
+                if (r < 0)
+                        goto fail;
 
                 if (!p->decrypted_fstype && p->mount_node_fd >= 0 && p->decrypted_node) {
                         r = probe_filesystem_full(p->mount_node_fd, p->decrypted_node, 0, UINT64_MAX, /* bool restrict_fstypes= */ true, &p->decrypted_fstype);
                         if (r < 0 && r != -EUCLEAN)
-                                return r;
+                                goto fail;
                 }
         }
 
         m->decrypted_image = TAKE_PTR(d);
         return 1;
+
+fail:
+        /* Undo partial activation */
+        dissected_image_undo_decrypt(m);
+        return r;
 #else
         return -EOPNOTSUPP;
 #endif
@@ -3816,7 +3932,7 @@ int verity_settings_load(
                                 if (r < 0) {
                                         _cleanup_free_ char *p = NULL;
 
-                                        if (r != -ENOENT && !ERRNO_IS_XATTR_ABSENT(r))
+                                        if (!ERRNO_IS_XATTR_ABSENT(r))
                                                 return r;
 
                                         p = build_auxiliary_path(image, ".roothash");
@@ -3845,7 +3961,7 @@ int verity_settings_load(
                                 if (r < 0) {
                                         _cleanup_free_ char *p = NULL;
 
-                                        if (r != -ENOENT && !ERRNO_IS_XATTR_ABSENT(r))
+                                        if (!ERRNO_IS_XATTR_ABSENT(r))
                                                 return r;
 
                                         p = build_auxiliary_path(image, ".usrhash");
@@ -5291,6 +5407,9 @@ int mountfsd_mount_image_fd(
                 };
         }
 
+        if (!di)
+                return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG), "Partition list is empty.");
+
         di->single_file_system = p.single_file_system;
         di->image_size = p.image_size;
         di->sector_size = p.sector_size;
@@ -5502,7 +5621,7 @@ int mountfsd_make_directory(
 
         _cleanup_close_ int fd = open(parent, O_DIRECTORY|O_CLOEXEC);
         if (fd < 0)
-                return log_debug_errno(r, "Failed to open '%s': %m", parent);
+                return log_debug_errno(errno, "Failed to open '%s': %m", parent);
 
         return mountfsd_make_directory_fd(vl, fd, dirname, mode, flags, ret_directory_fd);
 }
@@ -5542,7 +5661,7 @@ int copy_tree_at_foreign(int source_fd, int target_fd, int userns_fd) {
                                 target_fd, /* to= */ NULL,
                                 /* override_uid= */ UID_INVALID,
                                 /* override_gid= */ GID_INVALID,
-                                COPY_REFLINK|COPY_HARDLINKS|COPY_MERGE_EMPTY|COPY_MERGE_APPLY_STAT|COPY_SAME_MOUNT|COPY_ALL_XATTRS,
+                                COPY_HARDLINKS|COPY_MERGE_EMPTY|COPY_MERGE_APPLY_STAT|COPY_SAME_MOUNT|COPY_ALL_XATTRS,
                                 /* denylist= */ NULL,
                                 /* subvolumes= */ NULL);
                 if (r < 0) {

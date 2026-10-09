@@ -17,9 +17,12 @@
 #include "devnum-util.h"
 #include "dirent-util.h"
 #include "errno-util.h"
+#include "extension-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
+#include "macro.h"
+#include "os-util.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "string-util.h"
@@ -207,7 +210,7 @@ int block_device_new_from_fd(int fd, BlockDeviceLookupFlags flags, sd_device **r
 
                 r = block_device_get_originating(dev_whole_disk, &dev_origin, /* recursive= */ false);
                 if (r >= 0)
-                        device_unref_and_replace(dev, dev_origin);
+                        device_unref_and_replace_new_ref(dev, dev_origin);
                 else if (r != -ENOENT)
                         return r;
         }
@@ -642,15 +645,9 @@ int path_get_whole_disk(const char *path, bool backing, dev_t *ret) {
         return fd_get_whole_disk(fd, backing, ret);
 }
 
-int block_device_add_partition(
-                int fd,
-                const char *name,
-                int nr,
-                uint64_t start,
-                uint64_t size) {
+int block_device_add_partition(int fd, int nr, uint64_t start, uint64_t size) {
 
         assert(fd >= 0);
-        assert(name);
         assert(nr > 0);
 
         struct blkpg_partition bp = {
@@ -665,21 +662,12 @@ int block_device_add_partition(
                 .datalen = sizeof(bp),
         };
 
-        if (strlen(name) >= sizeof(bp.devname))
-                return -EINVAL;
-
-        strcpy(bp.devname, name);
-
         return RET_NERRNO(ioctl(fd, BLKPG, &ba));
 }
 
-int block_device_remove_partition(
-                int fd,
-                const char *name,
-                int nr) {
+int block_device_remove_partition(int fd, int nr) {
 
         assert(fd >= 0);
-        assert(name);
         assert(nr > 0);
 
         struct blkpg_partition bp = {
@@ -691,11 +679,6 @@ int block_device_remove_partition(
                 .data = &bp,
                 .datalen = sizeof(bp),
         };
-
-        if (strlen(name) >= sizeof(bp.devname))
-                return -EINVAL;
-
-        strcpy(bp.devname, name);
 
         return RET_NERRNO(ioctl(fd, BLKPG, &ba));
 }
@@ -824,7 +807,7 @@ int block_device_remove_all_partitions(sd_device *dev, int fd) {
                 if (r < 0 && r != -ENOENT)
                         log_debug_errno(r, "Failed to forget btrfs device %s, ignoring: %m", devname);
 
-                r = block_device_remove_partition(fd, devname, nr);
+                r = block_device_remove_partition(fd, nr);
                 if (r == -ENODEV) {
                         log_debug("Kernel removed partition %s before us, ignoring", devname);
                         continue;
@@ -895,6 +878,13 @@ int blockdev_get_root(int level, dev_t *ret) {
                                 return btrfs_log_dev_root(level, r, "/usr");
                         if (r < 0)
                                 return log_full_errno(level, r, "Failed to determine block device of /usr/ file system: %m");
+                        if (r == 0) { /* Not backed by a single block device, we might be looking at a sysext overlay */
+                                r = extension_overlay_block("/usr", IMAGE_SYSEXT, &devno);
+                                if (IN_SET(r, -ENOENT, -ENOTTY))
+                                        r = 0; /* no sysext overlay metadata */
+                                else if (r < 0)
+                                        return log_full_errno(level, r, "Failed to determine backing device of /usr/ extension overlay: %m");
+                        }
                         if (r == 0) { /* /usr/ not backed by single block device, either. */
                                 log_debug("Neither root nor /usr/ file system are on a (single) block device.");
 

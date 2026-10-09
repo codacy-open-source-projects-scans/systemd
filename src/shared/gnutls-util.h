@@ -1,11 +1,16 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "shared-forward.h"
+#include "dlopen-note.h"
+#include "forward.h"
 
-int dlopen_gnutls(int log_level);
+int dlopen_gnutls(int log_level) _dlopen_loader_;
 
 #if HAVE_GNUTLS
+#  ifndef SYSTEMD_CFLAGS_MARKER_LIBGNUTLS
+#    error "missing libgnutls_cflags in meson dependency."
+#  endif
+
 #  include <gnutls/gnutls.h>    /* IWYU pragma: export */
 #  include <gnutls/x509.h>      /* IWYU pragma: export */
 

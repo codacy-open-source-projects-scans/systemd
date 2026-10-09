@@ -7,6 +7,7 @@
 #include "sd-bus.h"
 #include "sd-id128.h"
 #include "sd-messages.h"
+#include "sd-varlink.h"
 
 #include "all-units.h"
 #include "alloc-util.h"
@@ -28,6 +29,7 @@
 #include "escape.h"
 #include "exec-credential.h"
 #include "execute.h"
+#include "exit-status.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "format-util.h"
@@ -39,7 +41,7 @@
 #include "load-fragment.h"
 #include "log.h"
 #include "logarithm.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "manager.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
@@ -791,6 +793,7 @@ Unit* unit_free(Unit *u) {
 
         u->match_bus_slot = sd_bus_slot_unref(u->match_bus_slot);
         u->bus_track = sd_bus_track_unref(u->bus_track);
+        u->varlink_unit_change = sd_varlink_unref(u->varlink_unit_change);
         u->deserialized_refs = strv_free(u->deserialized_refs);
         u->pending_freezer_invocation = sd_bus_message_unref(u->pending_freezer_invocation);
 
@@ -801,7 +804,7 @@ Unit* unit_free(Unit *u) {
         if (u->id)
                 hashmap_remove_value(u->manager->units, u->id, u);
 
-        if (!sd_id128_is_null(u->invocation_id))
+        if (unit_has_invocation_id(u))
                 hashmap_remove_value(u->manager->units_by_invocation_id, &u->invocation_id, u);
 
         if (u->job) {
@@ -1193,6 +1196,8 @@ int unit_merge(Unit *u, Unit *other) {
         if (r < 0)
                 return r;
 
+        UnitLoadState saved_load_state = other->load_state;
+
         other->load_state = UNIT_MERGED;
         other->merged_into = u;
 
@@ -1201,7 +1206,7 @@ int unit_merge(Unit *u, Unit *other) {
 
         /* If there is still some data attached to the other node, we
          * don't need it anymore, and can free it. */
-        if (other->load_state != UNIT_STUB)
+        if (saved_load_state != UNIT_STUB)
                 if (UNIT_VTABLE(other)->done)
                         UNIT_VTABLE(other)->done(other);
 
@@ -1624,7 +1629,7 @@ static int unit_add_oomd_dependencies(Unit *u) {
         if (!c)
                 return 0;
 
-        bool wants_oomd = c->moom_swap == MANAGED_OOM_KILL || c->moom_mem_pressure == MANAGED_OOM_KILL;
+        bool wants_oomd = c->moom_swap == MANAGED_OOM_KILL || c->moom_mem_pressure == MANAGED_OOM_KILL || !strv_isempty(c->moom_rules);
         if (!wants_oomd)
                 return 0;
 
@@ -1814,7 +1819,7 @@ static bool unit_test_condition(Unit *u) {
                                 env,
                                 condition_type_to_string,
                                 log_unit_internal,
-                                u);
+                                u) > 0;
 
         unit_add_to_dbus_queue(u);
         return u->condition_result;
@@ -1838,7 +1843,7 @@ static bool unit_test_assert(Unit *u) {
                                 env,
                                 assert_type_to_string,
                                 log_unit_internal,
-                                u);
+                                u) > 0;
 
         unit_add_to_dbus_queue(u);
         return u->assert_result;
@@ -1883,7 +1888,7 @@ int unit_test_start_limit(Unit *u) {
         emergency_action(
                         u->manager,
                         u->start_limit_action,
-                        EMERGENCY_ACTION_IS_WATCHDOG|EMERGENCY_ACTION_WARN|EMERGENCY_ACTION_SLEEP_5S,
+                        EMERGENCY_ACTION_IS_WATCHDOG|EMERGENCY_ACTION_WARN|EMERGENCY_ACTION_SLEEP_5S|EMERGENCY_ACTION_IS_FAILURE,
                         u->reboot_arg,
                         /* exit_status= */ -1,
                         reason);
@@ -2028,6 +2033,10 @@ int unit_start(Unit *u, ActivationDetails *details) {
                         /* Also check soft concurrenty limit, and return EAGAIN so that the job is kept in
                          * the queue */
                         if (slice_concurrency_soft_max_reached(slice, u))
+                                return -EAGAIN; /* Try again, keep in queue */
+
+                        /* Check activating concurrency limit to pace concurrent startups */
+                        if (slice_activating_concurrency_max_reached(slice, u))
                                 return -EAGAIN; /* Try again, keep in queue */
                 }
         }
@@ -2336,7 +2345,7 @@ static void retroactively_stop_dependencies(Unit *u) {
 
 void unit_start_on_termination_deps(Unit *u, UnitDependencyAtom atom) {
         const char *dependency_name = NULL;
-        JobMode job_mode;
+        JobMode job_mode = _JOB_MODE_INVALID;
         unsigned n_jobs = 0;
         int r;
 
@@ -2709,20 +2718,21 @@ static void unit_check_concurrency_limit(Unit *u) {
         if (!slice)
                 return;
 
-        /* If a unit was stopped, maybe it has pending siblings (or children thereof) that can be started now */
+        /* If a unit was stopped, maybe it has pending siblings (or children thereof) that can be started now.
+         * Walk up the slice hierarchy and re-dispatch for each ancestor that has a limit configured. */
 
-        if (SLICE(slice)->concurrency_soft_max != UINT_MAX) {
-                Unit *sibling;
-                UNIT_FOREACH_DEPENDENCY(sibling, slice, UNIT_ATOM_SLICE_OF) {
-                        if (sibling == u)
-                                continue;
+        for (Unit *s = slice; s; s = UNIT_GET_SLICE(s)) {
+                if (SLICE(s)->concurrency_soft_max != UINT_MAX ||
+                    SLICE(s)->activating_concurrency_max != UINT_MAX) {
+                        Unit *member;
+                        UNIT_FOREACH_DEPENDENCY(member, s, UNIT_ATOM_SLICE_OF) {
+                                if (member == u)
+                                        continue;
 
-                        unit_recursive_add_to_run_queue(sibling);
+                                unit_recursive_add_to_run_queue(member);
+                        }
                 }
         }
-
-        /* Also go up the tree. */
-        unit_check_concurrency_limit(slice);
 }
 
 void unit_notify(Unit *u, UnitActiveState os, UnitActiveState ns, bool reload_success) {
@@ -2834,7 +2844,7 @@ void unit_notify(Unit *u, UnitActiveState os, UnitActiveState ns, bool reload_su
 
                 if (os != UNIT_FAILED && ns == UNIT_FAILED) {
                         reason = strjoina("unit ", u->id, " failed");
-                        emergency_action(m, u->failure_action, EMERGENCY_ACTION_WARN|EMERGENCY_ACTION_SLEEP_5S, u->reboot_arg, unit_failure_action_exit_status(u), reason);
+                        emergency_action(m, u->failure_action, EMERGENCY_ACTION_WARN|EMERGENCY_ACTION_SLEEP_5S|EMERGENCY_ACTION_IS_FAILURE, u->reboot_arg, unit_failure_action_exit_status(u), reason);
                 } else if (!UNIT_IS_INACTIVE_OR_FAILED(os) && ns == UNIT_INACTIVE) {
                         reason = strjoina("unit ", u->id, " succeeded");
                         emergency_action(m, u->success_action, /* flags= */ 0, u->reboot_arg, unit_success_action_exit_status(u), reason);
@@ -2878,7 +2888,15 @@ void unit_notify(Unit *u, UnitActiveState os, UnitActiveState ns, bool reload_su
                  * when something BindsTo= to a Type=oneshot unit, as these units go directly from starting to
                  * inactive, without ever entering started.) */
                 unit_submit_to_stop_when_bound_queue(u);
+
+                /* Maybe the activating concurrency limits now allow dispatching of another start job in this slice? */
+                unit_check_concurrency_limit(u);
         }
+
+        /* When a unit leaves the activating state (to deactivating, inactive, or active), it frees up a slot for
+         * ActivatingConcurrencyMax. Re-dispatch queued starts. */
+        if (os == UNIT_ACTIVATING && ns != UNIT_ACTIVATING)
+                unit_check_concurrency_limit(u);
 }
 
 int unit_watch_pidref(Unit *u, const PidRef *pid, bool exclusive) {
@@ -3383,10 +3401,16 @@ char* unit_dbus_path(Unit *u) {
 char* unit_dbus_path_invocation_id(Unit *u) {
         assert(u);
 
-        if (sd_id128_is_null(u->invocation_id))
+        if (!unit_has_invocation_id(u))
                 return NULL;
 
         return unit_dbus_path_from_name(u->invocation_id_string);
+}
+
+bool unit_has_invocation_id(const Unit *u) {
+        assert(u);
+
+        return !sd_id128_is_null(u->invocation_id);
 }
 
 int unit_set_invocation_id(Unit *u, sd_id128_t id) {
@@ -3399,7 +3423,7 @@ int unit_set_invocation_id(Unit *u, sd_id128_t id) {
         if (sd_id128_equal(u->invocation_id, id))
                 return 0;
 
-        if (!sd_id128_is_null(u->invocation_id))
+        if (unit_has_invocation_id(u))
                 (void) hashmap_remove_value(u->manager->units_by_invocation_id, &u->invocation_id, u);
 
         if (sd_id128_is_null(id)) {
@@ -3576,7 +3600,7 @@ static int signal_name_owner_changed_install_handler(sd_bus_message *message, vo
         u->get_name_owner_slot = sd_bus_slot_unref(u->get_name_owner_slot);
 
         if (UNIT_VTABLE(u)->bus_name_owner_change)
-                UNIT_VTABLE(u)->bus_name_owner_change(u, NULL);
+                UNIT_VTABLE(u)->bus_name_owner_change(u, NULL, /* from_signal= */ true);
 
         return 0;
 }
@@ -3595,7 +3619,7 @@ static int signal_name_owner_changed(sd_bus_message *message, void *userdata, sd
         }
 
         if (UNIT_VTABLE(u)->bus_name_owner_change)
-                UNIT_VTABLE(u)->bus_name_owner_change(u, empty_to_null(new_owner));
+                UNIT_VTABLE(u)->bus_name_owner_change(u, empty_to_null(new_owner), /* from_signal= */ true);
 
         return 0;
 }
@@ -3628,8 +3652,11 @@ static int get_name_owner_handler(sd_bus_message *message, void *userdata, sd_bu
                 assert(!isempty(new_owner));
         }
 
+        /* Given we're in a GetNameOwner() refresh, which we issue right after (re)connecting to the broker,
+         * a NULL owner here may simply mean the owning client is still getting its bearings, so treat it as
+         * non-definitive and worth waiting a bit for. */
         if (UNIT_VTABLE(u)->bus_name_owner_change)
-                UNIT_VTABLE(u)->bus_name_owner_change(u, new_owner);
+                UNIT_VTABLE(u)->bus_name_owner_change(u, new_owner, /* from_signal= */ false);
 
         return 0;
 }
@@ -4156,7 +4183,7 @@ int unit_kill(
                         }
 
                         if (signo == SIGKILL) {
-                                r = cg_kill_kernel_sigkill(p);
+                                r = cg_kill_kernel_sigkill(p, /* ret_n_pids_killed= */ NULL);
                                 if (r >= 0) {
                                         killed = true;
                                         log_unit_info(u, "Killed unit cgroup '%s' with SIGKILL on client request.", p);
@@ -4343,10 +4370,13 @@ static int unit_verify_contexts(const Unit *u) {
                 return log_unit_error_errno(u, SYNTHETIC_ERRNO(ENOEXEC), "PrivatePIDs= setting is only supported for service units. Refusing.");
 
         if ((ec->user || ec->dynamic_user || ec->group || ec->pam_name) && ec->private_users == PRIVATE_USERS_MANAGED)
-                return log_unit_error_errno(u, SYNTHETIC_ERRNO(ENOEXEC), "PrivateUsers=managed may not be used in combination with User=/DynamicUser=/Group=/PAMName=, refusing.");
+                return log_unit_error_errno(u, SYNTHETIC_ERRNO(ENOEXEC), "PrivateUsers=managed may not be used in combination with User=/DynamicUser=/Group=/PAMName=. Refusing.");
 
         if (ec->user_namespace_path && ec->private_users != PRIVATE_USERS_NO)
-                return log_unit_error_errno(u, SYNTHETIC_ERRNO(ENOEXEC), "PrivateUsers= may not be used with custom UserNamespacePath=, refusing.");
+                return log_unit_error_errno(u, SYNTHETIC_ERRNO(ENOEXEC), "PrivateUsers= may not be used with custom UserNamespacePath=. Refusing.");
+
+        if (ec->private_pids != PRIVATE_PIDS_NO && ec->pam_name)
+                return log_unit_error_errno(u, SYNTHETIC_ERRNO(ENOEXEC), "PAM is not supported under PrivatePIDs=. Refusing.");
 
         const KillContext *kc = unit_get_kill_context(u);
 
@@ -4893,6 +4923,42 @@ int unit_make_transient(Unit *u) {
         return 0;
 }
 
+int manager_setup_transient_unit(Manager *m, const char *name, Unit **ret, sd_bus_error *reterr_error) {
+        Unit *u;
+        int r;
+
+        assert(m);
+        assert(name);
+        assert(ret);
+
+        UnitType t = unit_name_to_type(name);
+        if (t < 0)
+                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
+                                         "Invalid unit name or type: %s", name);
+
+        if (!unit_vtable[t]->can_transient)
+                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
+                                         "Unit type %s does not support transient units.",
+                                         unit_type_to_string(t));
+
+        r = manager_load_unit(m, name, /* path= */ NULL, reterr_error, &u);
+        if (r < 0)
+                return r;
+
+        if (!unit_is_pristine(u))
+                return sd_bus_error_setf(reterr_error, BUS_ERROR_UNIT_EXISTS,
+                                         "Unit %s was already loaded or has a fragment file.", name);
+
+        /* OK, the unit failed to load and is unreferenced, now let's
+         * fill in the transient data instead */
+        r = unit_make_transient(u);
+        if (r < 0)
+                return r;
+
+        *ret = u;
+        return 0;
+}
+
 static bool ignore_leftover_process(const char *comm) {
         return comm && comm[0] == '('; /* Most likely our own helper process (PAM?), ignore */
 }
@@ -4989,6 +5055,35 @@ static int unit_kill_context_one(
         return !is_alien;
 }
 
+typedef struct PidsMaxRestore {
+        const char *cgroup_path;
+        uint64_t max;
+        Unit *unit;
+} PidsMaxRestore;
+
+static void pids_max_restore(PidsMaxRestore *p) {
+        int r;
+
+        assert(p);
+        assert(p->unit);
+
+        if (!p->cgroup_path)
+                return;
+
+        char value[DECIMAL_STR_MAX(uint64_t) + 1] = "max";
+        if (p->max != CGROUP_LIMIT_MAX)
+                xsprintf(value, "%" PRIu64, p->max);
+
+        r = cg_set_attribute(p->cgroup_path, "pids.max", value);
+        if (r < 0)
+                log_unit_warning_errno(p->unit,
+                                       r,
+                                       "Failed to restore pids.max to %s for control group %s, ignoring: %m",
+                                       value, empty_to_root(p->cgroup_path));
+
+        p->cgroup_path = NULL;
+}
+
 int unit_kill_context(Unit *u, KillOperation k) {
         bool wait_for_exit = false, send_sighup;
         cg_kill_log_func_t log_func = NULL;
@@ -5025,7 +5120,31 @@ int unit_kill_context(Unit *u, KillOperation k) {
         CGroupRuntime *crt = unit_get_cgroup_runtime(u);
         if (crt && crt->cgroup_path &&
             (c->kill_mode == KILL_CONTROL_GROUP || (c->kill_mode == KILL_MIXED && k == KILL_KILL))) {
+                _cleanup_(pids_max_restore) PidsMaxRestore state = {
+                        .unit = u,
+                };
                 _cleanup_set_free_ Set *pid_set = NULL;
+
+                /* Stop more processes from being spawned when zapping the cgroup. Restore previous state
+                 * before returning. */
+                if (sig == SIGKILL) {
+                        r = cg_get_attribute_as_uint64(crt->cgroup_path, "pids.max", &state.max);
+                        if (r < 0)
+                                log_unit_warning_errno(u,
+                                                       r,
+                                                       "Failed to read pids.max for control group %s, ignoring: %m",
+                                                       empty_to_root(crt->cgroup_path));
+                        else {
+                                r = cg_set_attribute(crt->cgroup_path, "pids.max", "0");
+                                if (r < 0)
+                                        log_unit_warning_errno(u,
+                                                               r,
+                                                               "Failed to set pids.max to 0 for control group %s, ignoring: %m",
+                                                               empty_to_root(crt->cgroup_path));
+                                else
+                                        state.cgroup_path = crt->cgroup_path;
+                        }
+                }
 
                 /* Exclude the main/control pids from being killed via the cgroup */
                 r = unit_pid_set(u, &pid_set);
@@ -5355,15 +5474,15 @@ static void unit_modify_user_nft_set(Unit *u, bool add, NFTSetSource source, uin
         if (!c)
                 return;
 
-        if (!u->manager->nfnl) {
-                r = sd_nfnl_socket_open(&u->manager->nfnl);
-                if (r < 0)
-                        return;
-        }
-
         FOREACH_ARRAY(nft_set, c->nft_set_context.sets, c->nft_set_context.n_sets) {
                 if (nft_set->source != source)
                         continue;
+
+                if (!u->manager->nfnl) {
+                        r = sd_nfnl_socket_open(&u->manager->nfnl);
+                        if (r < 0)
+                                return (void) log_once_errno(LOG_WARNING, r, "Failed to open NETLINK_NETFILTER socket, ignoring: %m");
+                }
 
                 r = nft_set_element_modify_any(u->manager->nfnl, add, nft_set->nfproto, nft_set->table, nft_set->set, &element, sizeof(element));
                 if (r < 0)
@@ -5789,7 +5908,7 @@ static int unit_export_invocation_id(Unit *u) {
         if (u->exported_invocation_id)
                 return 0;
 
-        if (sd_id128_is_null(u->invocation_id))
+        if (!unit_has_invocation_id(u))
                 return 0;
 
         r = unit_get_invocation_path(u, &p);
@@ -6298,7 +6417,7 @@ int unit_failure_action_exit_status(Unit *u) {
 
         r = unit_exit_status(u);
         if (r == -EBADE) /* Exited, but not cleanly (i.e. by signal or such) */
-                return 255;
+                return EXIT_EXCEPTION;
 
         return r;
 }
@@ -6315,7 +6434,7 @@ int unit_success_action_exit_status(Unit *u) {
 
         r = unit_exit_status(u);
         if (r == -EBADE) /* Exited, but not cleanly (i.e. by signal or such) */
-                return 255;
+                return EXIT_EXCEPTION;
 
         return r;
 }
@@ -6814,6 +6933,8 @@ int unit_get_exec_quota_stats(Unit *u, ExecContext *c, ExecDirectoryType dt, uin
 
         assert(u);
         assert(c);
+        assert(ret_usage);
+        assert(ret_limit);
 
         if (c->directories[dt].n_items == 0) {
                 *ret_usage = UINT64_MAX;

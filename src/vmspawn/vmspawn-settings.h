@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+#include "forward.h"
 #include "machine-util.h"
-#include "shared-forward.h"
 
 typedef struct ExtraDrive {
         char *path;
@@ -42,6 +42,14 @@ typedef enum Firmware {
         _FIRMWARE_INVALID = -EINVAL,
 } Firmware;
 
+typedef enum ConfidentialComputing {
+        COCO_NO,
+        COCO_SEV_SNP,
+        COCO_TDX,
+        _COCO_MAX,
+        _COCO_INVALID = -EINVAL,
+} ConfidentialComputing;
+
 typedef enum SettingsMask {
         SETTING_START_MODE        = UINT64_C(1) << 0,
         SETTING_MACHINE_ID        = UINT64_C(1) << 6,
@@ -55,3 +63,4 @@ typedef enum SettingsMask {
 DECLARE_STRING_TABLE_LOOKUP(console_mode, ConsoleMode);
 DECLARE_STRING_TABLE_LOOKUP(console_transport, ConsoleTransport);
 DECLARE_STRING_TABLE_LOOKUP(firmware, Firmware);
+DECLARE_STRING_TABLE_LOOKUP(confidential_computing, ConfidentialComputing);

@@ -21,17 +21,22 @@
 
 #include <stdio.h>
 
+#include "iovec-util.h"
 #include "siphash24.h"
 #include "string-util.h"
 #include "unaligned.h"
 
-static uint64_t rotate_left(uint64_t x, uint8_t b) {
+/* The round is small enough that it is worth inlining at every call site, but large enough that gcc's
+ * -O2 inlining budget declines to do so on its own, leaving a call/ret and a reload of the state around
+ * six rounds of ~14 ALU ops. clang inlines it either way, and the SipHash reference implementation this
+ * file is derived from inlines the round manually, by writing it as a macro. */
+static inline _always_inline_ uint64_t rotate_left(uint64_t x, uint8_t b) {
         assert(b < 64);
 
         return (x << b) | (x >> (64 - b));
 }
 
-static void sipround(struct siphash *state) {
+static inline _always_inline_ void sipround(struct siphash *state) {
         assert(state);
 
         state->v0 += state->v1;
@@ -154,6 +159,16 @@ void siphash24_compress(const void *_in, size_t inlen, struct siphash *state) {
 
 void siphash24_compress_string(const char *in, struct siphash *state) {
         siphash24_compress_safe(in, strlen_ptr(in), state);
+}
+
+void siphash24_compress_iovec(const struct iovec *iov, struct siphash *state) {
+        assert(iovec_is_valid(iov));
+        assert(state);
+
+        if (!iovec_is_set(iov))
+                return;
+
+        siphash24_compress(iov->iov_base, iov->iov_len, state);
 }
 
 uint64_t siphash24_finalize(struct siphash *state) {

@@ -713,7 +713,37 @@ test ! -h "$root/etc/systemd/system/another-target@.target.wants/some-some-link7
 test ! -h "$root/etc/systemd/system/target2@some-some-link7.target.requires/some-some-link7.socket"
 test ! -h "$root/etc/systemd/system/another-target2@.target.requires/some-some-link7.socket"
 
-# TODO: repeat the tests above for presets
+: '-------specifiers in presets------------------------------------'
+# Repeat the check above, but via 'systemctl preset' instead
+# of calling enable/disable directly. We reuse the same unit file, which is
+# currently disabled (no symlinks) from the block above.
+
+mkdir -p "$root/etc/systemd/system-preset"
+cat >"$root/etc/systemd/system-preset/99-test.preset" <<EOF
+enable some-some-link7.socket
+EOF
+
+"$systemctl" --root="$root" preset 'some-some-link7.socket'
+islink "$root/etc/systemd/system/target@some-some-link7.target.wants/some-some-link7.socket" "/etc/systemd/system/some-some-link7.socket"
+islink "$root/etc/systemd/system/another-target@.target.wants/some-some-link7.socket" "/etc/systemd/system/some-some-link7.socket"
+islink "$root/etc/systemd/system/target2@some-some-link7.target.requires/some-some-link7.socket" "/etc/systemd/system/some-some-link7.socket"
+islink "$root/etc/systemd/system/another-target2@.target.requires/some-some-link7.socket" "/etc/systemd/system/some-some-link7.socket"
+
+cat >"$root/etc/systemd/system-preset/99-test.preset" <<EOF
+disable some-some-link7.socket
+EOF
+
+"$systemctl" --root="$root" preset 'some-some-link7.socket'
+test ! -h "$root/etc/systemd/system/target@some-some-link7.target.wants/some-some-link7.socket"
+test ! -h "$root/etc/systemd/system/another-target@.target.wants/some-some-link7.socket"
+test ! -h "$root/etc/systemd/system/target2@some-some-link7.target.requires/some-some-link7.socket"
+test ! -h "$root/etc/systemd/system/another-target2@.target.requires/some-some-link7.socket"
+
+# Not testing preset-all here: $root has leftover units from earlier
+# sections that are deliberately invalid, and preset-all trips on those.
+
+# Clean up so later tests aren't affected by this preset file.
+rm -f "$root/etc/systemd/system-preset/99-test.preset"
 
 : '-------SYSTEMD_OS_RELEASE relative to root---------------------'
 # check that os-release overwriting works as expected with root
@@ -724,3 +754,15 @@ ID='the-id2'
 EOF
 
 SYSTEMD_OS_RELEASE="/etc/os-release2" check_alias o 'the-id2'
+
+: '-------is-enabled --full is relative to --root=-----------------'
+mkdir -p "$root/usr/lib/systemd/system"
+cat >"$root/usr/lib/systemd/system/rooted.service" <<EOF
+[Install]
+WantedBy=multi-user.target
+EOF
+"$systemctl" --root="$root" enable rooted.service
+
+# Without --root= being passed on this inspects the host, which knows nothing about this unit.
+"$systemctl" --root="$root" is-enabled --full rooted.service |
+    grep "^  $root/etc/systemd/system/multi-user.target.wants/rooted.service\$" >/dev/null

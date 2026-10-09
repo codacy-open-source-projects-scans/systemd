@@ -8,7 +8,7 @@ timesyncd_sources = files(
         'timesyncd.c',
         'timesyncd-bus.c',
 )
-timesyncd_extract_sources = files(
+timesyncd_export_sources = files(
         'timesyncd-conf.c',
         'timesyncd-manager.c',
         'timesyncd-server.c',
@@ -17,38 +17,28 @@ timesyncd_extract_sources = files(
 timesyncd_gperf_c = custom_target(
         input : 'timesyncd-gperf.gperf',
         output : 'timesyncd-gperf.c',
-        command : [gperf, '@INPUT@', '--output-file', '@OUTPUT@'])
+        command : [gperf_cmdline, '@INPUT@', '--output-file', '@OUTPUT@'])
 
 generated_sources += timesyncd_gperf_c
-timesyncd_extract_sources += timesyncd_gperf_c
-
-if get_option('link-timesyncd-shared')
-        timesyncd_link_with = [libshared]
-else
-        timesyncd_link_with = [libsystemd_static,
-                               libshared_static]
-endif
+timesyncd_export_sources += timesyncd_gperf_c
 
 executables += [
         libexec_template + {
                 'name' : 'systemd-timesyncd',
                 'sources' : timesyncd_sources,
-                'extract' : timesyncd_extract_sources,
-                'link_with' : timesyncd_link_with,
-                'dependencies' : [
-                        libm,
-                        threads,
-                ],
+                'export' : timesyncd_export_sources,
+                'dependencies' : libm,
+                'install' : get_option('link-timesyncd-shared') ? 'yes' : 'static',
         },
         libexec_template + {
                 'name' : 'systemd-time-wait-sync',
                 'sources' : files('wait-sync.c'),
-                'objects' : ['systemd-timesyncd'],
+                'import' : ['systemd-timesyncd'],
                 'dependencies' : libm,
         },
         test_template + {
                 'sources' : files('test-timesync.c'),
-                'objects' : ['systemd-timesyncd'],
+                'import' : ['systemd-timesyncd'],
                 'dependencies' : libm,
         },
 ]

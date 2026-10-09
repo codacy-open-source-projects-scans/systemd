@@ -1,7 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <math.h>
-
 #include "alloc-util.h"
 #include "bitmap.h"
 #include "dns-answer.h"                 /* IWYU pragma: keep */
@@ -13,6 +11,7 @@
 #include "hash-funcs.h"
 #include "hexdecoct.h"
 #include "json-util.h"
+#include "math-util.h"
 #include "memory-util.h"
 #include "siphash24.h"
 #include "string-table.h"
@@ -773,9 +772,9 @@ static char* format_location(uint32_t latitude, uint32_t longitude, uint32_t alt
         int lat = latitude >= 1U<<31 ? (int) (latitude - (1U<<31)) : (int) ((1U<<31) - latitude);
         int lon = longitude >= 1U<<31 ? (int) (longitude - (1U<<31)) : (int) ((1U<<31) - longitude);
         double alt = altitude >= 10000000u ? altitude - 10000000u : -(double)(10000000u - altitude);
-        double siz = (size >> 4) * exp10((double) (size & 0xF));
-        double hor = (horiz_pre >> 4) * exp10((double) (horiz_pre & 0xF));
-        double ver = (vert_pre >> 4) * exp10((double) (vert_pre & 0xF));
+        double siz = (size >> 4) * xexp10i(size & 0xF);
+        double hor = (horiz_pre >> 4) * xexp10i(horiz_pre & 0xF);
+        double ver = (vert_pre >> 4) * xexp10i(vert_pre & 0xF);
 
         if (asprintf(&s, "%d %d %.3f %c %d %d %.3f %c %.2fm %.2fm %.2fm %.2fm",
                      (lat / 60000 / 60),
@@ -1467,6 +1466,15 @@ int dns_resource_record_to_wire_format(DnsResourceRecord *rr, bool canonical) {
         return 0;
 }
 
+void dns_resource_record_clear_wire_format(DnsResourceRecord *rr) {
+        assert(rr);
+
+        rr->wire_format = mfree(rr->wire_format);
+        rr->wire_format_size = 0;
+        rr->wire_format_rdata_offset = 0;
+        rr->wire_format_canonical = false;
+}
+
 int dns_resource_record_signer(DnsResourceRecord *rr, const char **ret) {
         const char *n;
         int r;
@@ -1978,6 +1986,7 @@ int dns_resource_record_clamp_ttl(DnsResourceRecord **rr, uint32_t max_ttl) {
         if (old_rr->n_ref == 1) {
                 /* Patch in place */
                 old_rr->ttl = new_ttl;
+                dns_resource_record_clear_wire_format(old_rr);
                 return 1;
         }
 
@@ -2375,7 +2384,8 @@ int dns_resource_record_to_json(DnsResourceRecord *rr, sd_json_variant **ret) {
                                 SD_JSON_BUILD_PAIR_STRING("rname", rr->soa.rname),
                                 SD_JSON_BUILD_PAIR_UNSIGNED("serial", rr->soa.serial),
                                 SD_JSON_BUILD_PAIR_UNSIGNED("refresh", rr->soa.refresh),
-                                SD_JSON_BUILD_PAIR_UNSIGNED("expire", rr->soa.retry),
+                                SD_JSON_BUILD_PAIR_UNSIGNED("retry", rr->soa.retry),
+                                SD_JSON_BUILD_PAIR_UNSIGNED("expire", rr->soa.expire),
                                 SD_JSON_BUILD_PAIR_UNSIGNED("minimum", rr->soa.minimum));
 
         case DNS_TYPE_MX:
@@ -2476,6 +2486,12 @@ int dns_resource_record_to_json(DnsResourceRecord *rr, sd_json_variant **ret) {
                                 SD_JSON_BUILD_PAIR_UNSIGNED("selector", rr->tlsa.selector),
                                 SD_JSON_BUILD_PAIR_UNSIGNED("matchingType", rr->tlsa.matching_type),
                                 SD_JSON_BUILD_PAIR_HEX("data", rr->tlsa.data, rr->tlsa.data_size));
+
+        case DNS_TYPE_OPENPGPKEY:
+                return sd_json_buildo(
+                                ret,
+                                SD_JSON_BUILD_PAIR_VARIANT("key", k),
+                                SD_JSON_BUILD_PAIR_BASE64("data", rr->generic.data, rr->generic.data_size));
 
         case DNS_TYPE_SVCB:
         case DNS_TYPE_HTTPS: {
@@ -2627,6 +2643,7 @@ static const char* const dnssec_algorithm_table[_DNSSEC_ALGORITHM_MAX_DEFINED] =
         [DNSSEC_ALGORITHM_ECDSAP384SHA384]    = "ECDSAP384SHA384",
         [DNSSEC_ALGORITHM_ED25519]            = "ED25519",
         [DNSSEC_ALGORITHM_ED448]              = "ED448",
+        [DNSSEC_ALGORITHM_MLDSA44]            = "MLDSA44",
         [DNSSEC_ALGORITHM_INDIRECT]           = "INDIRECT",
         [DNSSEC_ALGORITHM_PRIVATEDNS]         = "PRIVATEDNS",
         [DNSSEC_ALGORITHM_PRIVATEOID]         = "PRIVATEOID",

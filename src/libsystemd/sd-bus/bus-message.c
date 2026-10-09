@@ -142,7 +142,7 @@ static sd_bus_message* message_free(sd_bus_message *m) {
         return mfree(m);
 }
 
-static void* message_extend_fields(sd_bus_message *m, size_t sz, bool add_offset) {
+static void* message_extend_fields(sd_bus_message *m, size_t sz) {
         void *op, *np;
         size_t old_size, new_size, start;
 
@@ -195,13 +195,6 @@ static void* message_extend_fields(sd_bus_message *m, size_t sz, bool add_offset
 
         m->free_header = true;
 
-        if (add_offset) {
-                if (m->n_header_offsets >= ELEMENTSOF(m->header_offsets))
-                        goto poison;
-
-                m->header_offsets[m->n_header_offsets++] = new_size - sizeof(BusMessageHeader);
-        }
-
         return (uint8_t*) np + start;
 
 poison:
@@ -233,7 +226,7 @@ static int message_append_field_string(
         /* Signature "(yv)" where the variant contains "s" */
 
         /* (field id byte + (signature length + signature 's' + NUL) + (string length + string + NUL)) */
-        p = message_extend_fields(m, 4 + 4 + l + 1, false);
+        p = message_extend_fields(m, 4 + 4 + l + 1);
         if (!p)
                 return -ENOMEM;
 
@@ -274,7 +267,7 @@ static int message_append_field_signature(
         /* Signature "(yv)" where the variant contains "g" */
 
         /* (field id byte + (signature length + signature 'g' + NUL) + (string length + string + NUL)) */
-        p = message_extend_fields(m, 4 + 1 + l + 1, false);
+        p = message_extend_fields(m, 4 + 1 + l + 1);
         if (!p)
                 return -ENOMEM;
 
@@ -301,7 +294,7 @@ static int message_append_field_uint32(sd_bus_message *m, uint64_t h, uint32_t x
                 return -EINVAL;
 
         /* (field id byte + (signature length + signature 'u' + NUL) + value) */
-        p = message_extend_fields(m, 4 + 4, false);
+        p = message_extend_fields(m, 4 + 4);
         if (!p)
                 return -ENOMEM;
 
@@ -3904,7 +3897,8 @@ static int message_skip_fields(
                 sd_bus_message *m,
                 size_t *ri,
                 uint32_t array_size,
-                const char **signature) {
+                const char **signature,
+                unsigned depth) {
 
         size_t original_index;
         int r;
@@ -3912,6 +3906,9 @@ static int message_skip_fields(
         assert(m);
         assert(ri);
         assert(signature);
+
+        if (depth >= BUS_CONTAINER_DEPTH)
+                return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG), "Maximum container nesting depth reached, refusing.");
 
         original_index = *ri;
 
@@ -3993,7 +3990,7 @@ static int message_skip_fields(
                                 if (r < 0)
                                         return r;
 
-                                r = message_skip_fields(m, ri, nas, (const char**) &s);
+                                r = message_skip_fields(m, ri, nas, (const char**) &s, depth + 1);
                                 if (r < 0)
                                         return r;
                         }
@@ -4007,7 +4004,7 @@ static int message_skip_fields(
                         if (r < 0)
                                 return r;
 
-                        r = message_skip_fields(m, ri, UINT32_MAX, &s);
+                        r = message_skip_fields(m, ri, UINT32_MAX, &s, depth + 1);
                         if (r < 0)
                                 return r;
 
@@ -4025,7 +4022,7 @@ static int message_skip_fields(
                                 strncpy(sig, *signature + 1, l);
                                 sig[l] = '\0';
 
-                                r = message_skip_fields(m, ri, UINT32_MAX, (const char**) &s);
+                                r = message_skip_fields(m, ri, UINT32_MAX, (const char**) &s, depth + 1);
                                 if (r < 0)
                                         return r;
                         }
@@ -4198,7 +4195,7 @@ static int message_parse_fields(sd_bus_message *m, bool got_ctrunc) {
                         break;
 
                 default:
-                        r = message_skip_fields(m, &ri, UINT32_MAX, &signature);
+                        r = message_skip_fields(m, &ri, UINT32_MAX, &signature, 0);
                 }
                 if (r < 0)
                         return r;
@@ -4331,6 +4328,7 @@ int bus_message_get_blob(sd_bus_message *m, void **buffer, size_t *sz) {
 _public_ int sd_bus_message_read_strv_extend(sd_bus_message *m, char ***l) {
         char type;
         const char *contents, *s;
+        size_t n;
         int r;
 
         assert(m);
@@ -4347,9 +4345,10 @@ _public_ int sd_bus_message_read_strv_extend(sd_bus_message *m, char ***l) {
         if (r <= 0)
                 return r;
 
+        n = strv_length(*l);
         /* sd_bus_message_read_basic() does content validation for us. */
         while ((r = sd_bus_message_read_basic(m, *contents, &s)) > 0) {
-                r = strv_extend(l, s);
+                r = strv_extend_with_size(l, &n, s);
                 if (r < 0)
                         return r;
         }

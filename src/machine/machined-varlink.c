@@ -31,6 +31,7 @@
 #include "varlink-io.systemd.Resolve.Hook.h"
 #include "varlink-io.systemd.service.h"
 #include "varlink-util.h"
+#include "xattr-util.h"
 
 typedef struct LookupParameters {
         const char *user_name;
@@ -774,6 +775,14 @@ static int manager_varlink_init_userdb(Manager *m) {
         if (r < 0)
                 return log_error_errno(r, "Failed to bind to varlink socket %s: %m", VARLINK_PATH_MACHINED_USERDB);
 
+        /* Reduce the noise routed to us: advertise that only look-ups for the higher UID range */
+        char text[DECIMAL_STR_MAX(uid_t) + 1 + DECIMAL_STR_MAX(gid_t) + 1];
+        xsprintf(text, UID_FMT "-" UID_FMT, (uid_t) 0x10000U, (uid_t) UINT32_C(0xfffffffe));
+        FOREACH_STRING(xattr, "user.userdb.uid", "user.userdb.gid")
+                (void) xsetxattr(AT_FDCWD, VARLINK_PATH_MACHINED_USERDB, /* at_flags= */ 0, xattr, text);
+        (void) xsetxattr(AT_FDCWD, VARLINK_PATH_MACHINED_USERDB, /* at_flags= */ 0, "user.userdb.username", "vu-*");
+        (void) xsetxattr(AT_FDCWD, VARLINK_PATH_MACHINED_USERDB, /* at_flags= */ 0, "user.userdb.groupname", "vg-*");
+
         r = sd_varlink_server_attach_event(s, m->event, SD_EVENT_PRIORITY_NORMAL);
         if (r < 0)
                 return log_error_errno(r, "Failed to attach varlink connection to event loop: %m");
@@ -829,6 +838,7 @@ static int manager_varlink_init_machine(Manager *m) {
                         "io.systemd.MachineImage.CleanPool",    vl_method_clean_pool,
                         "io.systemd.service.Ping",              varlink_method_ping,
                         "io.systemd.service.SetLogLevel",       varlink_method_set_log_level,
+                        "io.systemd.service.GetLogLevel",       varlink_method_get_log_level,
                         "io.systemd.service.GetEnvironment",    varlink_method_get_environment);
         if (r < 0)
                 return log_error_errno(r, "Failed to register varlink methods: %m");

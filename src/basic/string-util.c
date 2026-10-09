@@ -3,6 +3,7 @@
 #include <stdio.h>
 
 #include "alloc-util.h"
+#include "ansi-seq.h"
 #include "escape.h"
 #include "extract-word.h"
 #include "glyph-util.h"
@@ -14,7 +15,6 @@
 #include "path-util.h"
 #include "string-util.h"
 #include "strv.h"
-#include "terminal-util.h"
 #include "utf8.h"
 
 char* first_word(const char *s, const char *word) {
@@ -163,6 +163,8 @@ char* ascii_strupper(char *s) {
 }
 
 char* ascii_strlower_n(char *s, size_t n) {
+        assert(n <= 0 || s);
+
         if (n <= 0)
                 return s;
 
@@ -285,13 +287,21 @@ static size_t previous_ansi_sequence(const char *s, size_t length, const char **
 
         /* Locate the previous ANSI sequence and save its start in *ret_where and return length. */
 
-        for (size_t i = length - 2; i > 0; i--) {  /* -2 because at least two bytes are needed */
-                size_t slen = ansi_sequence_length(s + (i - 1), length - (i - 1));
-                if (slen == 0)
-                        continue;
+        if (length < 2) {
+                /* Need at least two bytes for an ANSI sequence */
+                *ret_where = NULL;
+                return 0;
+        }
 
-                *ret_where = s + (i - 1);
-                return slen;
+        for (size_t i = length - 2;; i--) {  /* -2 because at least two bytes are needed */
+                size_t slen = ansi_sequence_length(s + i, length - i);
+                if (slen > 0) {
+                        *ret_where = s + i;
+                        return slen;
+                }
+
+                if (i == 0)
+                        break;
         }
 
         *ret_where = NULL;
@@ -349,6 +359,33 @@ static char *ascii_ellipsize_mem(const char *s, size_t old_length, size_t new_le
         return t;
 }
 
+/* Walk backwards from 'end' (exclusive) to the start of the last complete UTF-8 character, without
+ * descending below 'start', validate it and return a pointer to its first byte, optionally decoding it
+ * into *ret_c. Returns NULL on a truncated or otherwise malformed sequence. */
+static const char* find_previous_unichar(const char *start, const char *end, char32_t *ret_c) {
+        const char *p;
+        int r;
+
+        assert(start);
+        assert(end);
+        assert(end > start);
+
+        for (p = end; p > start; ) {
+                p--;
+                if (((uint8_t) *p & 0xc0) != 0x80) /* Found a non-continuation byte, i.e. a character start. */
+                        break;
+        }
+
+        r = utf8_encoded_valid_unichar(p, end - p);
+        if (r < 0 || p + r != end)
+                return NULL;
+
+        if (ret_c)
+                assert_se(utf8_encoded_to_unichar(p, ret_c) == r);
+
+        return p;
+}
+
 char* ellipsize_mem(const char *s, size_t old_length, size_t new_length, unsigned percent) {
         size_t x, k, len, len2;
         const char *i, *j;
@@ -377,8 +414,10 @@ char* ellipsize_mem(const char *s, size_t old_length, size_t new_length, unsigne
 
         bool has_ansi_seq = string_has_ansi_sequence(s, old_length);
 
-        /* If no multibyte characters or ANSI sequences, use ascii_ellipsize_mem for speed */
-        if (!has_ansi_seq && ascii_is_valid_n(s, old_length))
+        /* If no multibyte characters or ANSI sequences, use ascii_ellipsize_mem for speed. It equates
+         * bytes with character cells, which holds for ASCII except for the tab, which
+         * unichar_console_width() counts as 8 cells. */
+        if (!has_ansi_seq && ascii_is_valid_n(s, old_length) && !memchr(s, '\t', old_length))
                 return ascii_ellipsize_mem(s, old_length, new_length, percent);
 
         x = (new_length - 1) * percent / 100;
@@ -392,12 +431,14 @@ char* ellipsize_mem(const char *s, size_t old_length, size_t new_length, unsigne
                         continue;  /* ANSI sequences don't take up any space in output */
                 }
 
-                char32_t c;
-                r = utf8_encoded_to_unichar(i, &c);
+                r = utf8_encoded_valid_unichar(i, s + old_length - i);
                 if (r < 0)
                         return NULL;
 
-                int w = unichar_iswide(c) ? 2 : 1;
+                char32_t c;
+                assert_se(utf8_encoded_to_unichar(i, &c) == r);
+
+                int w = unichar_console_width(c);
                 if (k + w > x)
                         break;
 
@@ -423,12 +464,12 @@ char* ellipsize_mem(const char *s, size_t old_length, size_t new_length, unsigne
                         continue;
                 }
 
-                tt = utf8_prev_char(t);
-                r = utf8_encoded_to_unichar(tt, &c);
-                if (r < 0)
+                /* Find the previous complete UTF-8 character inside the retained suffix. */
+                tt = find_previous_unichar(i, t, &c);
+                if (!tt)
                         return NULL;
 
-                w = unichar_iswide(c) ? 2 : 1;
+                w = unichar_console_width(c);
                 if (k + w > new_length)
                         break;
 
@@ -443,11 +484,21 @@ char* ellipsize_mem(const char *s, size_t old_length, size_t new_length, unsigne
         if (k >= new_length) {
                 /* Make space for ellipsis, if required and possible. We know that the edge character is not
                  * part of an ANSI sequence (because then we'd skip it). If the last character we looked at
-                 * was wide, we don't need to make space. */
-                if (j < s + old_length)
-                        j = utf8_next_char(j);
-                else if (i > s)
-                        i = utf8_prev_char(i);
+                 * was wide, we don't need to make space.
+                 * Move the edge by one complete UTF-8 character within the input slice. */
+                if (j < s + old_length) {
+                        r = utf8_encoded_valid_unichar(j, s + old_length - j);
+                        if (r < 0)
+                                return NULL;
+
+                        j += r;
+                } else if (i > s) {
+                        const char *tt = find_previous_unichar(s, i, NULL);
+                        if (!tt)
+                                return NULL;
+
+                        i = tt;
+                }
         }
 
         len = i - s;
@@ -652,16 +703,32 @@ static void advance_offsets(
                 shift[1] += size;
 }
 
+static void retract_offsets(
+                size_t begin,
+                size_t end,
+                size_t offsets[2], /* note: we can't use [static 2] here, since this may be NULL */
+                size_t shift[static 2]) {
+
+        /* The input range [begin, end) was dropped from the output: offsets past it move back by its
+         * length, offsets inside it collapse onto its beginning. The shift is tracked in unsigned modular
+         * arithmetic, which is fine as the sum of all shifts applied to an offset is never negative: at most
+         * as many bytes can be dropped before an offset as there are bytes before it. */
+
+        if (!offsets)
+                return;
+
+        assert(shift);
+        assert(begin <= end);
+
+        for (size_t k = 0; k < 2; k++)
+                if (offsets[k] > begin)
+                        shift[k] -= MIN(offsets[k], end) - begin;
+}
+
 char* strip_tab_ansi(char **ibuf, size_t *_isz, size_t highlight[2]) {
-        const char *begin = NULL;
-        enum {
-                STATE_OTHER,
-                STATE_ESCAPE,
-                STATE_CSI,
-                STATE_OSC,
-                STATE_OSC_CLOSING,
-        } state = STATE_OTHER;
+        _cleanup_(ansi_seq_parser_done) AnsiSeqParser parser = {};
         _cleanup_(memstream_done) MemStream m = {};
+        const char *begin = NULL;
         size_t isz, shift[2] = {}, n_carriage_returns = 0;
         FILE *f;
 
@@ -672,16 +739,14 @@ char* strip_tab_ansi(char **ibuf, size_t *_isz, size_t highlight[2]) {
         /* This does three things:
          *
          * 1. Replaces TABs by 8 spaces
-         * 2. Strips ANSI color sequences (a subset of CSI), i.e. ESC '[' … 'm' sequences
-         * 3. Strips ANSI operating system sequences (OSC), i.e. ESC ']' … ST sequences
-         * 4. Strip trailing \r characters (since they would "move the cursor", but have no
+         * 2. Strips ANSI sequences (CSI, OSC and all other escape sequences)
+         * 3. Strips trailing \r characters (since they would "move the cursor", but have no
          *    other effect).
          *
-         * Everything else will be left as it is. In particular other ANSI sequences are left as they are, as
-         * are any other special characters. Truncated ANSI sequences are left-as is too. This call is
-         * supposed to suppress the most basic formatting noise, but nothing else.
-         *
-         * Why care for OSC sequences? Well, to undo what terminal_urlify() and friends generate. */
+         * Any other special characters are left as they are. Invalid or truncated ANSI sequences are
+         * dropped, too: when stripping ANSI sequences it's better to strip too much than too little. This
+         * call is supposed to suppress formatting noise (including what terminal_urlify() and friends
+         * generate), but nothing else. */
 
         isz = _isz ? *_isz : strlen(*ibuf);
 
@@ -691,28 +756,48 @@ char* strip_tab_ansi(char **ibuf, size_t *_isz, size_t highlight[2]) {
         if (!f)
                 return NULL;
 
-        for (const char *i = *ibuf; i < *ibuf + isz + 1; i++) {
+        for (const char *i = *ibuf; i < *ibuf + isz; i++) {
+                int e;
 
-                bool eot = i >= *ibuf + isz;
-
-                switch (state) {
-
-                case STATE_OTHER:
-                        if (eot)
+                for (;;) {
+                        e = ansi_seq_parser_feed(&parser, *i);
+                        if (e < 0)
+                                return NULL;
+                        if (e != ANSI_SEQ_EVENT_ABORT)
                                 break;
 
+                        /* Eat up bogus sequences. The aborted sequence is over (and dropped, up to but
+                         * excluding the current character, which is fed again), hence forget about it, so
+                         * that the next sequence flushes pending carriage returns again. */
+                        if (begin) {
+                                retract_offsets(begin - *ibuf, i - *ibuf, highlight, shift);
+                                begin = NULL;
+                        }
+                }
+
+                switch (e) {
+
+                case ANSI_SEQ_EVENT_TEXT:
                         if (*i == '\r') {
                                 n_carriage_returns++;
-                                break;
-                        } else if (*i == '\n')
-                                /* Ignore carriage returns before new line */
+                                continue;
+                        }
+                        if (*i == '\n') {
+                                /* Ignore carriage returns before new line. They are dropped from the output,
+                                 * hence the offsets need to account for them. (Note that pending carriage
+                                 * returns always immediately precede the current character, since anything
+                                 * else flushes them.) */
+                                retract_offsets(
+                                                (size_t) (i - *ibuf) - n_carriage_returns,
+                                                i - *ibuf,
+                                                highlight,
+                                                shift);
                                 n_carriage_returns = 0;
+                        }
                         for (; n_carriage_returns > 0; n_carriage_returns--)
                                 fputc('\r', f);
 
-                        if (*i == '\x1B')
-                                state = STATE_ESCAPE;
-                        else if (*i == '\t') {
+                        if (*i == '\t') {
                                 fputs("        ", f);
                                 advance_offsets(i - *ibuf, highlight, shift, 7);
                         } else
@@ -720,74 +805,35 @@ char* strip_tab_ansi(char **ibuf, size_t *_isz, size_t highlight[2]) {
 
                         break;
 
-                case STATE_ESCAPE:
-                        assert(n_carriage_returns == 0);
+                case ANSI_SEQ_EVENT_SEQUENCE:
+                        if (!begin) {
+                                /* This starts a new sequence, flush any pending carriage returns first */
+                                for (; n_carriage_returns > 0; n_carriage_returns--)
+                                        fputc('\r', f);
 
-                        if (eot) {
-                                fputc('\x1B', f);
-                                advance_offsets(i - *ibuf, highlight, shift, 1);
-                                break;
-                        } else if (*i == '[') { /* ANSI CSI */
-                                state = STATE_CSI;
-                                begin = i + 1;
-                        } else if (*i == ']') { /* ANSI OSC */
-                                state = STATE_OSC;
-                                begin = i + 1;
-                        } else {
-                                fputc('\x1B', f);
-                                fputc(*i, f);
-                                advance_offsets(i - *ibuf, highlight, shift, 1);
-                                state = STATE_OTHER;
+                                begin = i;
                         }
-
                         break;
 
-                case STATE_CSI:
-                        assert(n_carriage_returns == 0);
-
-                        if (eot || !strchr(DIGITS ";:m", *i)) { /* EOT or invalid chars in sequence */
-                                fputc('\x1B', f);
-                                fputc('[', f);
-                                advance_offsets(i - *ibuf, highlight, shift, 2);
-                                state = STATE_OTHER;
-                                i = begin-1;
-                        } else if (*i == 'm')
-                                state = STATE_OTHER;
-
+                case ANSI_SEQ_EVENT_END:
+                        /* A complete sequence, drop it (the current character is its last one) */
+                        assert(begin);
+                        retract_offsets(begin - *ibuf, i + 1 - *ibuf, highlight, shift);
+                        begin = NULL;
                         break;
 
-                case STATE_OSC:
-                        assert(n_carriage_returns == 0);
-
-                        /* There are three kinds of OSC terminators: \x07, \x1b\x5c or \x9c. We only support
-                         * the first two, because the last one is a valid UTF-8 codepoint and hence creates
-                         * an ambiguity (many Terminal emulators refuse to support it as well). */
-                        if (eot || (!IN_SET(*i, '\x07', '\x1b') && !osc_char_is_valid(*i))) { /* EOT or invalid chars in sequence */
-                                fputc('\x1B', f);
-                                fputc(']', f);
-                                advance_offsets(i - *ibuf, highlight, shift, 2);
-                                state = STATE_OTHER;
-                                i = begin-1;
-                        } else if (*i == '\x07') /* Single character ST */
-                                state = STATE_OTHER;
-                        else if (*i == '\x1B')
-                                state = STATE_OSC_CLOSING;
-
-                        break;
-
-                case STATE_OSC_CLOSING:
-                        if (eot || *i != '\x5c') { /* EOT or incomplete two-byte ST in sequence */
-                                fputc('\x1B', f);
-                                fputc(']', f);
-                                advance_offsets(i - *ibuf, highlight, shift, 2);
-                                state = STATE_OTHER;
-                                i = begin-1;
-                        } else if (*i == '\x5c')
-                                state = STATE_OTHER;
-
-                        break;
+                default:
+                        assert_not_reached();
                 }
         }
+
+        /* If the input ends in the middle of a sequence the truncated sequence is dropped as well, hence
+         * the offsets need to account for it, too. */
+        if (begin)
+                retract_offsets(begin - *ibuf, isz, highlight, shift);
+
+        /* Trailing carriage returns are dropped, too */
+        retract_offsets(isz - n_carriage_returns, isz, highlight, shift);
 
         char *obuf;
         if (memstream_finalize(&m, &obuf, _isz) < 0)
@@ -1003,23 +1049,29 @@ char* strrep(const char *s, size_t n) {
 int split_pair(const char *s, const char *sep, char **ret_first, char **ret_second) {
         assert(s);
         assert(!isempty(sep));
-        assert(ret_first);
-        assert(ret_second);
 
         const char *x = strstr(s, sep);
         if (!x)
                 return -EINVAL;
 
-        _cleanup_free_ char *a = strndup(s, x - s);
-        if (!a)
-                return -ENOMEM;
+        _cleanup_free_ char *a = NULL;
+        if (ret_first) {
+                a = strndup(s, x - s);
+                if (!a)
+                        return -ENOMEM;
+        }
 
-        _cleanup_free_ char *b = strdup(x + strlen(sep));
-        if (!b)
-                return -ENOMEM;
+        _cleanup_free_ char *b = NULL;
+        if (ret_second) {
+                b = strdup(x + strlen(sep));
+                if (!b)
+                        return -ENOMEM;
+        }
 
-        *ret_first = TAKE_PTR(a);
-        *ret_second = TAKE_PTR(b);
+        if (ret_first)
+                *ret_first = TAKE_PTR(a);
+        if (ret_second)
+                *ret_second = TAKE_PTR(b);
         return 0;
 }
 
@@ -1113,7 +1165,11 @@ bool string_is_safe(const char *p, StringSafeFlags flags) {
                 return false;
 
         for (const char *t = p; *t; t++) {
-                if ((*t > 0 && *t < ' ') || *t == 0x7f) /* never allow control characters */
+                /* never allow control characters, except for new line */
+                if ((*t > 0 && *t < ' ' && *t != '\n') || *t == 0x7f)
+                        return false;
+
+                if (!FLAGS_SET(flags, STRING_ALLOW_NEWLINES) && *t == '\n')
                         return false;
 
                 if (!FLAGS_SET(flags, STRING_ALLOW_BACKSLASHES) && *t == '\\')
@@ -1125,11 +1181,17 @@ bool string_is_safe(const char *p, StringSafeFlags flags) {
                 if (!FLAGS_SET(flags, STRING_ALLOW_GLOBS) && strchr(GLOB_CHARS, *t))
                         return false;
 
+                if (FLAGS_SET(flags, STRING_DISALLOW_WHITESPACE) && strchr(WHITESPACE, *t))
+                        return false;
+
                 if (FLAGS_SET(flags, STRING_ASCII) && (uint8_t) *t >= 0x80)
                         return false;
         }
 
         if (FLAGS_SET(flags, STRING_FILENAME) && !filename_is_valid(p))
+                return false;
+
+        if (FLAGS_SET(flags, STRING_FILENAME_PART) && !filename_part_is_valid(p))
                 return false;
 
         return true;
@@ -1365,6 +1427,23 @@ size_t strspn_from_end(const char *str, const char *accept) {
         return n;
 }
 
+size_t strnspn(const char *str, const char *accept, size_t n) {
+        size_t i;
+
+        /* Like strspn(), but reads at most 'n' bytes from 'str'. Returns the length of the initial
+         * run of 'str' (capped at 'n') that consists solely of bytes found in 'accept'. Stops at a
+         * NUL byte too. Unlike strspn() this is safe on a buffer that is not NUL terminated within
+         * 'n' bytes. */
+
+        assert(str || n == 0);
+        assert(accept);
+
+        for (i = 0; i < n && str[i] != '\0' && strchr(accept, str[i]); i++)
+                ;
+
+        return i;
+}
+
 char* strdupspn(const char *a, const char *accept) {
         if (isempty(a) || isempty(accept))
                 return strdup("");
@@ -1438,28 +1517,47 @@ char* find_line_after_internal(const char *haystack, const char *needle) {
         return NULL;
 }
 
-bool version_is_valid(const char *s) {
-        if (isempty(s))
+bool version_is_valid(const char *s, VersionFlags flags) {
+
+        /* Validates a version string superficially. This does not process the version string in any
+         * semantical way, it mostly just validates that its charset is reasonable. */
+
+        if (FLAGS_SET(flags, VERSION_ALLOW_EMPTY) ? !s : isempty(s))
                 return false;
 
         if (!filename_part_is_valid(s))
                 return false;
 
-        /* This is a superset of the characters used by semver. We additionally allow "," and "_". */
-        if (!in_charset(s, ALPHANUMERICAL ".,_-+"))
-                return false;
+        /* We always allow all characters specified by the UAPI.10 Version Specification, i.e. 0-9, a-z, A-Z,
+         * ".", "-", "~", "^".
+         *
+         * If the relevant flags are set we'll also allow "+" and "_" separators.
+         *
+         * Note that with SemVer allows 0-9, a-z, A-Z, "+", "-", ".", hence with VERSION_ALLOW_PLUS we
+         * implement a superset of it.
+         *
+         * If you wonder when to use which flags: when validating foreign versions (e.g. distribution
+         * versions in /etc/os-release or so) validate liberally, i.e. add
+         * VERSION_ALLOW_UNDERSCORE|VERSION_ALLOW_PLUS. When validating our own versioned objects (e.g. vpick
+         * or so) validate more strictly, and in particular refuse characters such as "_" and "+" that may be
+         * used for separating component names or boot attempt counters. Also: first – if appropriate – split
+         * the string into individual components. For example, if the string consists of a name and a
+         * version, separated by some character, only pass the version part to this function. The name part
+         * may pass verification, but it's cleaner to not rely on that.
+         *
+         * For details about UAPI.10 see:
+         *
+         * → https://uapi-group.org/specifications/specs/version_format_specification/ */
 
-        return true;
-}
+        char charset[] = ALPHANUMERICAL ".-~^" /* plus room for the two chars below: */ "\0\0";
+        size_t l = strlen(charset);
 
-bool version_is_valid_versionspec(const char *s) {
-        if (!filename_part_is_valid(s))
-                return false;
+        if (FLAGS_SET(flags, VERSION_ALLOW_UNDERSCORE))
+                charset[l++] = '_';
+        if (FLAGS_SET(flags, VERSION_ALLOW_PLUS))
+                charset[l++] = '+';
 
-        if (!in_charset(s, ALPHANUMERICAL "-.~^"))
-                return false;
-
-        return true;
+        return in_charset(s, charset);
 }
 
 ssize_t strlevenshtein(const char *x, const char *y) {

@@ -20,13 +20,15 @@
 #include "creds-util.h"
 #include "curl-util.h"
 #include "device-private.h"
+#include "dlopen-note.h"
 #include "dns-rr.h"
 #include "errno-util.h"
 #include "escape.h"
 #include "event-util.h"
+#include "exit-status.h"
 #include "fd-util.h"
+#include "fileio.h"
 #include "format-ifname.h"
-#include "format-table.h"
 #include "hash-funcs.h"
 #include "hashmap.h"
 #include "imds-util.h"
@@ -37,11 +39,9 @@
 #include "log.h"
 #include "main-func.h"
 #include "netlink-util.h"
-#include "options.h"
 #include "parse-argument.h"
 #include "parse-util.h"
 #include "path-util.h"
-#include "pretty-print.h"
 #include "proc-cmdline.h"
 #include "socket-util.h"
 #include "string-util.h"
@@ -51,6 +51,7 @@
 #include "utf8.h"
 #include "varlink-io.systemd.InstanceMetadata.h"
 #include "varlink-util.h"
+#include "verbs.h"
 #include "web-util.h"
 #include "xattr-util.h"
 
@@ -63,7 +64,7 @@
  * https://docs.hetzner.cloud/reference/cloud#description/server-metadata
  *
  * Some notes:
- *   - IMDS service are heavily rate limited, and hence we want to centralize requests in one place and cache
+ *   - IMDS service are heavily rate-limited, and hence we want to centralize requests in one place and cache
  *   - In order to isolate IMDS access this expects that traffic to the IMDS address 169.254.169.254 is
  *     generally prohibited (via a prohibit route), but our service uses fwmark 0x7FFF0815, which (via source
  *     routing) can bypass this route.
@@ -107,7 +108,7 @@ static char* arg_key = NULL;
 static bool arg_cache = true;
 static bool arg_wait = false;
 static bool arg_varlink = false;
-static ImdsNetworkMode arg_network_mode = _IMDS_NETWORK_MODE_INVALID;
+static ImdsNetworkMode arg_network_mode = IMDS_NETWORK_DEFAULT;
 static bool arg_setup_network = false;
 
 /* The follow configure the IMDS service endpoint details */
@@ -124,8 +125,7 @@ static struct in6_addr arg_address_ipv6 = {};
 static char *arg_well_known_key[_IMDS_WELL_KNOWN_MAX] = {};
 
 static void imds_well_known_key_free(typeof(arg_well_known_key) *array) {
-        FOREACH_ARRAY(i, *array, _IMDS_WELL_KNOWN_MAX)
-                free(*i);
+        free_many_charp(*array, _IMDS_WELL_KNOWN_MAX);
 }
 
 STATIC_DESTRUCTOR_REGISTER(arg_ifname, freep);
@@ -138,6 +138,13 @@ STATIC_DESTRUCTOR_REGISTER(arg_data_url_suffix, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_token_header_name, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_extra_header, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_well_known_key, imds_well_known_key_free);
+
+COMMAND(
+        "systemd-imdsd\0",
+        "Low-level IMDS data acquisition.",
+        .argspec = "KEY\0",
+        .man_pages = "systemd-imdsd@.service(8)\0",
+);
 
 typedef struct Context Context;
 
@@ -182,8 +189,8 @@ struct Context {
 
         /* Mode 1 "direct": we go directly to the network (this is done if we know the interface index to
          * use) */
-        CURL *curl_token;
-        CURL *curl_data;
+        CurlSlot *slot_token;
+        CurlSlot *slot_data;
         struct curl_slist *request_header_token, *request_header_data;
         sd_event_source *retry_source;
         unsigned n_retry;
@@ -247,15 +254,8 @@ static void context_reset_for_refresh(Context *c) {
 
         /* Flush out all fields, up to the point we can restart the current request */
 
-        if (c->curl_token) {
-                curl_glue_remove_and_free(c->glue, c->curl_token);
-                c->curl_token = NULL;
-        }
-
-        if (c->curl_data) {
-                curl_glue_remove_and_free(c->glue, c->curl_data);
-                c->curl_data = NULL;
-        }
+        c->slot_token = curl_slot_unref(c->slot_token);
+        c->slot_data = curl_slot_unref(c->slot_data);
 
         sym_curl_slist_free_all(c->request_header_token);
         c->request_header_token = NULL;
@@ -325,11 +325,12 @@ static void context_done(Context *c) {
         c->system_bus = sd_bus_flush_close_unref(c->system_bus);
 }
 
-static void context_fail_full(Context *c, int r, const char *varlink_error) {
+static int context_fail_full(Context *c, int r, const char *varlink_error) {
         assert(c);
         assert(r != 0);
 
-        /* Called whenever the current retrieval fails asynchronously */
+        /* Called whenever the current retrieval fails asynchronously. Returns 0 so callers in
+         * int-returning paths can `return context_fail_full(...)` directly. */
 
         r = -abs(r);
 
@@ -349,10 +350,11 @@ static void context_fail_full(Context *c, int r, const char *varlink_error) {
                 sd_event_exit(c->event, r);
 
         context_reset_full(c);
+        return 0;
 }
 
-static void context_fail(Context *c, int r) {
-        context_fail_full(c, r, /* varlink_error= */ NULL);
+static int context_fail(Context *c, int r) {
+        return context_fail_full(c, r, /* varlink_error= */ NULL);
 }
 
 static void context_success(Context *c) {
@@ -898,16 +900,11 @@ static int context_save_data(Context *c) {
         return 0;
 }
 
-static void curl_glue_on_finished(CurlGlue *g, CURL *curl, CURLcode result) {
+static int curl_on_finished(CurlSlot *slot, CURL *curl, CURLcode result, void *userdata) {
+        Context *c = ASSERT_PTR(userdata);
         int r;
 
-        assert(g);
-
         /* Called whenever libcurl did its thing and reports a download being complete or having failed */
-
-        Context *c = NULL;
-        if (sym_curl_easy_getinfo(curl, CURLINFO_PRIVATE, (char**) &c) != CURLE_OK)
-                return;
 
         switch (result) {
 
@@ -934,7 +931,7 @@ static void curl_glue_on_finished(CurlGlue *g, CURL *curl, CURLcode result) {
                 if (r < 0)
                         return context_fail(c, r);
 
-                return;
+                return 0;
 
         default:
                 return context_fail_full(
@@ -951,12 +948,12 @@ static void curl_glue_on_finished(CurlGlue *g, CURL *curl, CURLcode result) {
                 return context_fail(c, r);
         if (r == 0) { /* We shall retry */
                 (void) context_schedule_retry(c);
-                return;
+                return 0;
         }
         if (result != CURLE_OK) /* if getting the HTTP status didn't work, propagate a generic error */
                 return context_fail(c, SYNTHETIC_ERRNO(ENOTRECOVERABLE));
 
-        if (curl == c->curl_token) {
+        if (slot == c->slot_token) {
                 r = context_validate_token_http_status(c, status);
                 if (r < 0)
                         return context_fail(c, r);
@@ -975,7 +972,7 @@ static void curl_glue_on_finished(CurlGlue *g, CURL *curl, CURLcode result) {
                 if (r < 0)
                         return context_fail(c, r);
 
-        } else if (curl == c->curl_data) {
+        } else if (slot == c->slot_data) {
 
                 r = context_validate_data_http_status(c, status);
                 if (r == -ENOENT)
@@ -983,7 +980,7 @@ static void curl_glue_on_finished(CurlGlue *g, CURL *curl, CURLcode result) {
                 if (r < 0)
                         return context_fail(c, r);
                 if (r == 0) /* Immediately restarted */
-                        return;
+                        return 0;
 
                 context_log(c, LOG_DEBUG, "Data download successful.");
 
@@ -994,6 +991,8 @@ static void curl_glue_on_finished(CurlGlue *g, CURL *curl, CURLcode result) {
                 context_success(c);
         } else
                 assert_not_reached();
+
+        return 0;
 }
 
 static int context_acquire_glue(Context *c) {
@@ -1010,9 +1009,6 @@ static int context_acquire_glue(Context *c) {
         if (r < 0)
                 return context_log_errno(c, LOG_ERR, r, "Failed to allocate curl glue: %m");
 
-        c->glue->on_finished = curl_glue_on_finished;
-        c->glue->userdata = c;
-
         return 0;
 }
 
@@ -1028,13 +1024,13 @@ static size_t data_write_callback(void *contents, size_t size, size_t nmemb, voi
         (void) context_save_ifname(c);
 
         /* Before we use the acquired data, let's verify the HTTP status, if there's a failure or we need to
-         * restart, abort the write here. Note that the curl_glue_on_finished() call will then check the HTTP
+         * restart, abort the write here. Note that the curl_on_finished() call will then check the HTTP
          * status again and act on it. */
         long status;
-        r = context_acquire_http_status(c, c->curl_data, &status);
+        r = context_acquire_http_status(c, curl_slot_get_easy(c->slot_data), &status);
         if (r <= 0)
-                return 0; /* fail the thing, so that curl_glue_on_finished() can handle this failure or retry request */
-        if (status >= 300) /* any status equal or above 300 needs to be handled by curl_glue_on_finished() too */
+                return 0; /* fail the thing, so that curl_on_finished() can handle this failure or retry request */
+        if (status >= 300) /* any status equal or above 300 needs to be handled by curl_on_finished() too */
                 return 0;
 
         if (sz > UINT64_MAX - c->data_size ||
@@ -1103,7 +1099,8 @@ static int context_acquire_data(Context *c) {
         if (!url)
                 return context_log_oom(c);
 
-        r = curl_glue_make(&c->curl_data, url, c);
+        _cleanup_(curl_easy_cleanupp) CURL *easy = NULL;
+        r = curl_glue_make(&easy, url);
         if (r < 0)
                 return context_log_errno(c, LOG_ERR, r, "Failed to create CURL request for data: %m");
 
@@ -1122,30 +1119,31 @@ static int context_acquire_data(Context *c) {
                 return context_log_errno(c, LOG_ERR, r, "Failed to create curl header: %m");
 
         if (c->request_header_data)
-                if (sym_curl_easy_setopt(c->curl_data, CURLOPT_HTTPHEADER, c->request_header_data) != CURLE_OK)
+                if (sym_curl_easy_setopt(easy, CURLOPT_HTTPHEADER, c->request_header_data) != CURLE_OK)
                         return context_log_errno(c, LOG_ERR, SYNTHETIC_ERRNO(EIO), "Failed to set HTTP request header.");
 
-        if (sym_curl_easy_setopt(c->curl_data, CURLOPT_WRITEFUNCTION, data_write_callback) != CURLE_OK)
+        if (sym_curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, data_write_callback) != CURLE_OK)
                 return context_log_errno(c, LOG_ERR, SYNTHETIC_ERRNO(EIO), "Failed to set CURL write function.");
 
-        if (sym_curl_easy_setopt(c->curl_data, CURLOPT_WRITEDATA, c) != CURLE_OK)
+        if (sym_curl_easy_setopt(easy, CURLOPT_WRITEDATA, c) != CURLE_OK)
                 return context_log_errno(c, LOG_ERR, SYNTHETIC_ERRNO(EIO), "Failed to set CURL write function userdata.");
 
-        if (sym_curl_easy_setopt(c->curl_data, CURLOPT_SOCKOPTFUNCTION, setsockopt_callback) != CURLE_OK)
+        if (sym_curl_easy_setopt(easy, CURLOPT_SOCKOPTFUNCTION, setsockopt_callback) != CURLE_OK)
                 return context_log_errno(c, LOG_ERR, SYNTHETIC_ERRNO(EIO), "Failed to set CURL setsockopt function.");
 
-        if (sym_curl_easy_setopt(c->curl_data, CURLOPT_SOCKOPTDATA, c) != CURLE_OK)
+        if (sym_curl_easy_setopt(easy, CURLOPT_SOCKOPTDATA, c) != CURLE_OK)
                 return context_log_errno(c, LOG_ERR, SYNTHETIC_ERRNO(EIO), "Failed to set CURL setsockopt function userdata.");
 
-        if (sym_curl_easy_setopt(c->curl_data, CURLOPT_LOCALPORT, 1L) != CURLE_OK)
+        if (sym_curl_easy_setopt(easy, CURLOPT_LOCALPORT, 1L) != CURLE_OK)
                 return context_log_errno(c, LOG_ERR, SYNTHETIC_ERRNO(EIO), "Failed to set CURL setsockopt local port");
 
-        if (sym_curl_easy_setopt(c->curl_data, CURLOPT_LOCALPORTRANGE, 1023L) != CURLE_OK)
+        if (sym_curl_easy_setopt(easy, CURLOPT_LOCALPORTRANGE, 1023L) != CURLE_OK)
                 return context_log_errno(c, LOG_ERR, SYNTHETIC_ERRNO(EIO), "Failed to set CURL setsockopt local port range");
 
-        r = curl_glue_add(c->glue, c->curl_data);
+        r = curl_glue_perform_async(c->glue, easy, curl_on_finished, c, &c->slot_data);
         if (r < 0)
                 return context_log_errno(c, LOG_ERR, r, "Failed to add CURL request to glue: %m");
+        TAKE_PTR(easy);
 
         return 0;
 }
@@ -1163,10 +1161,10 @@ static size_t token_write_callback(void *contents, size_t size, size_t nmemb, vo
 
         /* Before we use acquired data, let's verify the HTTP status */
         long status;
-        r = context_acquire_http_status(c, c->curl_token, &status);
+        r = context_acquire_http_status(c, curl_slot_get_easy(c->slot_token), &status);
         if (r <= 0)
-                return 0; /* fail the thing, so that curl_glue_on_finished() can handle this failure or retry request */
-        if (status >= 300) /* any status equal or above 300 needs to be handled by curl_glue_on_finished() */
+                return 0; /* fail the thing, so that curl_on_finished() can handle this failure or retry request */
+        if (status >= 300) /* any status equal or above 300 needs to be handled by curl_on_finished() */
                 return 0;
 
         if (sz > SIZE_MAX - c->token.iov_len ||
@@ -1199,7 +1197,8 @@ static int context_acquire_token(Context *c) {
         if (r < 0)
                 return r;
 
-        r = curl_glue_make(&c->curl_token, arg_token_url, c);
+        _cleanup_(curl_easy_cleanupp) CURL *easy = NULL;
+        r = curl_glue_make(&easy, arg_token_url);
         if (r < 0)
                 return context_log_errno(c, LOG_ERR, r, "Failed to create CURL request for API token: %m");
 
@@ -1216,27 +1215,28 @@ static int context_acquire_token(Context *c) {
                         return context_log_oom(c);
         }
 
-        if (sym_curl_easy_setopt(c->curl_token, CURLOPT_HTTPHEADER, c->request_header_token) != CURLE_OK)
+        if (sym_curl_easy_setopt(easy, CURLOPT_HTTPHEADER, c->request_header_token) != CURLE_OK)
                 return context_log_errno(c, LOG_ERR, SYNTHETIC_ERRNO(EIO), "Failed to set HTTP request header.");
 
-        if (sym_curl_easy_setopt(c->curl_token, CURLOPT_CUSTOMREQUEST, "PUT") != CURLE_OK)
+        if (sym_curl_easy_setopt(easy, CURLOPT_CUSTOMREQUEST, "PUT") != CURLE_OK)
                 return context_log_errno(c, LOG_ERR, SYNTHETIC_ERRNO(EIO), "Failed to set HTTP request method.");
 
-        if (sym_curl_easy_setopt(c->curl_token, CURLOPT_WRITEFUNCTION, token_write_callback) != CURLE_OK)
+        if (sym_curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, token_write_callback) != CURLE_OK)
                 return context_log_errno(c, LOG_ERR, SYNTHETIC_ERRNO(EIO), "Failed to set CURL write function.");
 
-        if (sym_curl_easy_setopt(c->curl_token, CURLOPT_WRITEDATA, c) != CURLE_OK)
+        if (sym_curl_easy_setopt(easy, CURLOPT_WRITEDATA, c) != CURLE_OK)
                 return context_log_errno(c, LOG_ERR, SYNTHETIC_ERRNO(EIO), "Failed to set CURL write function userdata.");
 
-        if (sym_curl_easy_setopt(c->curl_token, CURLOPT_SOCKOPTFUNCTION, setsockopt_callback) != CURLE_OK)
+        if (sym_curl_easy_setopt(easy, CURLOPT_SOCKOPTFUNCTION, setsockopt_callback) != CURLE_OK)
                 return context_log_errno(c, LOG_ERR, SYNTHETIC_ERRNO(EIO), "Failed to set CURL setsockopt function.");
 
-        if (sym_curl_easy_setopt(c->curl_token, CURLOPT_SOCKOPTDATA, c) != CURLE_OK)
+        if (sym_curl_easy_setopt(easy, CURLOPT_SOCKOPTDATA, c) != CURLE_OK)
                 return context_log_errno(c, LOG_ERR, SYNTHETIC_ERRNO(EIO), "Failed to set CURL setsockopt function userdata.");
 
-        r = curl_glue_add(c->glue, c->curl_token);
+        r = curl_glue_perform_async(c->glue, easy, curl_on_finished, c, &c->slot_token);
         if (r < 0)
                 return context_log_errno(c, LOG_ERR, r, "Failed to add CURL request to glue: %m");
+        TAKE_PTR(easy);
 
         return 0;
 }
@@ -1858,7 +1858,9 @@ static int cmdline_run(void) {
 
         /* Process the request when invoked via the command line (i.e. not via Varlink) */
 
-        r = imds_configured(LOG_ERR);
+        r = imds_configured(LOG_INFO);
+        if (r == -EOPNOTSUPP)
+                return EXIT_NOTCONFIGURED;
         if (r < 0)
                 return r;
 
@@ -2195,50 +2197,6 @@ static int vl_server(void) {
         return 0;
 }
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        _cleanup_(table_unrefp) Table *options = NULL, *endpoint_options = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-imdsd@.service", "8", &link);
-        if (r < 0)
-                return log_oom();
-
-        r = option_parser_get_help_table(&options);
-        if (r < 0)
-                return r;
-
-        r = option_parser_get_help_table_group("Manual Endpoint Configuration", &endpoint_options);
-        if (r < 0)
-                return r;
-
-        (void) table_sync_column_widths(0, options, endpoint_options);
-
-        printf("%1$s [OPTIONS...] KEY\n"
-               "\n%2$sLow-level IMDS data acquisition.%3$s\n"
-               "\n%4$sOptions:%5$s\n",
-               program_invocation_short_name,
-               ansi_highlight(),
-               ansi_normal(),
-               ansi_underline(),
-               ansi_normal());
-
-        r = table_print_or_warn(options);
-        if (r < 0)
-                return r;
-
-        printf("\n%sManual Endpoint Configuration:%s\n",
-               ansi_underline(),
-               ansi_normal());
-
-        r = table_print_or_warn(endpoint_options);
-        if (r < 0)
-                return r;
-
-        printf("\nSee the %s for details.\n", link);
-        return 0;
-}
-
 static bool http_header_name_valid(const char *a) {
         return a && ascii_is_valid(a) && !string_has_cc(a, /* ok= */ NULL) && !strchr(a, ':');
 }
@@ -2251,11 +2209,11 @@ static int parse_argv(int argc, char *argv[]) {
 
         OptionParser opts = { argc, argv };
 
-        FOREACH_OPTION(c, &opts, /* on_error= */ return c)
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return help();
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();
@@ -2286,7 +2244,8 @@ static int parse_argv(int argc, char *argv[]) {
                         if (r < 0)
                                 return log_error_errno(r, "Failed to parse refresh timeout: %s", opts.arg);
                         if (t < REFRESH_USEC_MIN) {
-                                log_warning("Increasing specified refresh time to %s, lower values are not supported.", FORMAT_TIMESPAN(REFRESH_USEC_MIN, 0));
+                                log_info("Increasing specified refresh time to %s, lower values are not supported.",
+                                         FORMAT_TIMESPAN(REFRESH_USEC_MIN, 0));
                                 arg_refresh_usec = REFRESH_USEC_MIN;
                         } else
                                 arg_refresh_usec = t;
@@ -2499,6 +2458,9 @@ static int parse_argv(int argc, char *argv[]) {
                                 return r;
                         break;
                 }
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
         if (arg_vendor || arg_token_url || arg_refresh_header_name || arg_data_url || arg_data_url_suffix || arg_token_header_name || arg_extra_header)
@@ -2859,7 +2821,7 @@ static int credential_server_info(void) {
                 _cleanup_free_ char *s = NULL;
 
                 r = read_credential(i->name, (void**) &s, /* ret_size= */ NULL);
-                if (r == -ENOENT)
+                if (IN_SET(r, -ENOENT, -ENXIO))
                         continue;
                 if (r < 0) {
                         log_warning_errno(r, "Failed to read credential '%s', ignoring: %m", i->name);
@@ -2882,7 +2844,7 @@ static int credential_server_info(void) {
 
                 _cleanup_free_ char *s = NULL;
                 r = read_credential(n, (void**) &s, /* ret_size= */ NULL);
-                if (r == -ENOENT)
+                if (IN_SET(r, -ENOENT, -ENXIO))
                         continue;
                 if (r < 0) {
                         log_warning_errno(r, "Failed to read credential '%s', ignoring: %m", n);
@@ -2897,7 +2859,7 @@ static int credential_server_info(void) {
 
         union in_addr_union u;
         r = read_credential_ip_address("imds.address_ipv4", AF_INET, &u);
-        if (r < 0 && r != -ENOENT)
+        if (r < 0 && !IN_SET(r, -ENOENT, -ENXIO))
                 log_warning_errno(r, "Failed read IPv4 address from credential 'imds.address_ipv4', ignoring: %m");
         if (r >= 0) {
                 arg_address_ipv4 = u.in;
@@ -2905,7 +2867,7 @@ static int credential_server_info(void) {
         }
 
         r = read_credential_ip_address("imds.address_ipv6", AF_INET6, &u);
-        if (r < 0 && r != -ENOENT)
+        if (r < 0 && !IN_SET(r, -ENOENT, -ENXIO))
                 log_warning_errno(r, "Failed read IPv6 address from credential 'imds.address_ipv6', ignoring: %m");
         if (r >= 0) {
                 arg_address_ipv6 = u.in6;
@@ -2919,7 +2881,7 @@ static int credential_server_info(void) {
 
                 _cleanup_free_ char *s = NULL;
                 r = read_credential(n, (void**) &s, /* ret_size= */ NULL);
-                if (r == -ENOENT)
+                if (IN_SET(r, -ENOENT, -ENXIO))
                         continue;
                 if (r < 0) {
                         log_warning_errno(r, "Failed to read credential '%s', ignoring: %m", n);
@@ -3061,6 +3023,8 @@ static int parse_proc_cmdline_item(const char *key, const char *value, void *dat
 
 static int run(int argc, char* argv[]) {
         int r;
+
+        LIBCURL_NOTE(required);
 
         log_setup();
 

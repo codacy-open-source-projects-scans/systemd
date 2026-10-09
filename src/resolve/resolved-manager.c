@@ -369,7 +369,7 @@ static int manager_network_monitor_listen(Manager *m) {
         if (r < 0)
                 return r;
 
-        r = sd_event_source_set_priority(m->network_event_source, SD_EVENT_PRIORITY_IMPORTANT+5);
+        r = sd_event_source_set_priority(m->network_event_source, SD_EVENT_PRIORITY_IMPORTANT-5);
         if (r < 0)
                 return r;
 
@@ -641,6 +641,8 @@ static void manager_set_defaults(Manager *m) {
         m->read_static_records = true;
         m->resolve_unicast_single_label = false;
         m->cache_from_localhost = false;
+        for (DnsProtocol p = 0; p < _DNS_PROTOCOL_MAX; p++)
+                m->cache_max[p] = DEFAULT_CACHE_MAX;
         m->stale_retention_usec = 0;
         m->refuse_record_types = set_free(m->refuse_record_types);
         m->resolv_conf_stat = (struct stat) {};
@@ -752,12 +754,6 @@ int manager_new(Manager **ret) {
         if (r < 0)
                 log_warning_errno(r, "Failed to parse configuration file, ignoring: %m");
 
-#if ENABLE_DNS_OVER_TLS
-        r = dnstls_manager_init(m);
-        if (r < 0)
-                return r;
-#endif
-
         r = sd_event_default(&m->event);
         if (r < 0)
                 return r;
@@ -843,10 +839,6 @@ int manager_start(Manager *m) {
 }
 
 Manager* manager_free(Manager *m) {
-        Link *l;
-        DnssdRegisteredService *s;
-        DnsServiceBrowser *sb;
-
         if (!m)
                 return NULL;
 
@@ -854,9 +846,7 @@ Manager* manager_free(Manager *m) {
         dns_server_unlink_all(m->fallback_dns_servers);
         dns_search_domain_unlink_all(m->search_domains);
 
-        while ((l = hashmap_first(m->links)))
-               link_free(l);
-
+        m->links = hashmap_free(m->links);
         m->delegates = hashmap_free(m->delegates);
 
         while (m->dns_queries)
@@ -875,7 +865,6 @@ Manager* manager_free(Manager *m) {
 #endif
 
         set_free(m->refuse_record_types);
-        hashmap_free(m->links);
         hashmap_free(m->dns_transactions);
 
         sd_event_source_unref(m->network_event_source);
@@ -919,16 +908,12 @@ Manager* manager_free(Manager *m) {
         free(m->llmnr_hostname);
         free(m->mdns_hostname);
 
-        while ((s = hashmap_first(m->dnssd_registered_services)))
-               dnssd_registered_service_free(s);
         hashmap_free(m->dnssd_registered_services);
 
         dns_trust_anchor_flush(&m->trust_anchor);
         manager_etc_hosts_flush(m);
         manager_static_records_flush(m);
 
-        while ((sb = hashmap_first(m->dns_service_browsers)))
-                dns_service_browser_free(sb);
         hashmap_free(m->dns_service_browsers);
 
         hashmap_free(m->hooks);
@@ -960,6 +945,13 @@ int manager_recv(Manager *m, int fd, DnsProtocol protocol, DnsPacket **ret) {
         assert(ret);
 
         ms = next_datagram_size_fd(fd);
+        /* The MSG_PEEK recv() in next_datagram_size_fd() validates the datagram's checksum, and drops it if
+         * it is bad. Hence we can end up here with nothing left to read even though the event source said
+         * otherwise, and must treat that like the recvmsg_safe() below does: as "no packet", not as a
+         * failure. Our callers propagate a failure to the event loop, which would then turn the listening
+         * socket's event source off for good. */
+        if (ERRNO_IS_NEG_TRANSIENT(ms))
+                return 0;
         if (ms < 0)
                 return ms;
 
@@ -2335,7 +2327,7 @@ int manager_send_dns_configuration_changed(Manager *m, Link *l, bool reset) {
         if (sd_json_variant_equal(configuration, m->dns_configuration_json))
                 return 0;
 
-        JSON_VARIANT_REPLACE(m->dns_configuration_json, TAKE_PTR(configuration));
+        json_variant_unref_and_replace(m->dns_configuration_json, configuration);
 
         r = varlink_many_notify(m->varlink_dns_configuration_subscription, m->dns_configuration_json);
         if (r < 0)

@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <linux/magic.h>
 #include <linux/nsfs.h>
+#include <linux/sockios.h>
 #include <sched.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
@@ -23,6 +24,7 @@
 #include "stat-util.h"
 #include "stdio-util.h"
 #include "uid-range.h"
+#include "unaligned.h"
 #include "user-util.h"
 
 const struct namespace_info namespace_info[_NAMESPACE_TYPE_MAX + 1] = {
@@ -228,7 +230,14 @@ int namespace_open(
         return pidref_namespace_open(&pidref, ret_pidns_fd, ret_mntns_fd, ret_netns_fd, ret_userns_fd, ret_root_fd);
 }
 
-int namespace_enter(int pidns_fd, int mntns_fd, int netns_fd, int userns_fd, int root_fd) {
+int namespace_enter_full(
+                int pidns_fd,
+                int mntns_fd,
+                int netns_fd,
+                int userns_fd,
+                int root_fd,
+                NamespaceEnterFlags flags) {
+
         int r;
 
         /* Block dlopen() now, to avoid us inadvertently loading shared library from another namespace */
@@ -270,6 +279,15 @@ int namespace_enter(int pidns_fd, int mntns_fd, int netns_fd, int userns_fd, int
                         return r;
                 if (r > 0)
                         userns_fd = -EBADF;
+        }
+
+        /* Determine this before joining anything, as /proc might not be available afterwards. */
+        bool keep_uid_gid = false;
+        if (userns_fd >= 0 && FLAGS_SET(flags, NAMESPACE_ENTER_KEEP_UID_GID_IF_ROOT_UNMAPPED)) {
+                r = userns_has_root_mapping(userns_fd);
+                if (r < 0)
+                        return r;
+                keep_uid_gid = r == 0;
         }
 
         r = have_effective_cap(CAP_SYS_ADMIN);
@@ -317,13 +335,26 @@ int namespace_enter(int pidns_fd, int mntns_fd, int netns_fd, int userns_fd, int
                         return -errno;
         }
 
-        if (userns_fd >= 0) {
-                /* Try to become root in the user namespace but don't error out if we can't, since it's not
-                 * uncommon to have user namespaces without a root user in them. */
-                r = reset_uid_gid();
-                if (r < 0)
-                        log_debug_errno(r, "Unable to drop auxiliary groups or reset UID/GID, ignoring: %m");
-        }
+        if (userns_fd < 0)
+                return 0;
+
+        /* Drop supplementary groups where possible. setgroups() may be denied, either via
+         * /proc/self/setgroups or by policy (e.g. a BPF LSM), in which case there's nothing we can do
+         * about them. */
+        r = maybe_setgroups(/* size= */ 0, /* list= */ NULL);
+        if (r < 0)
+                log_debug_errno(r, "Unable to drop supplementary groups, ignoring: %m");
+
+        if (keep_uid_gid)
+                return 0;
+
+        /* Joining a user namespace preserves the underlying UID/GID. Require becoming root to succeed, as
+         * otherwise we'd continue running with our original identity inside the namespace. */
+        if (setresgid(0, 0, 0) < 0)
+                return log_debug_errno(errno, "Failed to become root group in user namespace: %m");
+
+        if (setresuid(0, 0, 0) < 0)
+                return log_debug_errno(errno, "Failed to become root in user namespace: %m");
 
         return 0;
 }
@@ -358,7 +389,7 @@ int is_our_namespace(int fd, NamespaceType type) {
         int r;
 
         assert(fd >= 0);
-        assert(type < _NAMESPACE_TYPE_MAX);
+        assert(type >= 0 && type < _NAMESPACE_TYPE_MAX);
 
         r = fd_is_namespace(fd, type);
         if (r < 0)
@@ -409,11 +440,47 @@ int are_our_namespaces(int pidns_fd, int mntns_fd, int netns_fd, int userns_fd, 
         return true;
 }
 
+int network_namespace_is_init(int socket_fd) {
+        struct stat a, b;
+        int r;
+
+        /* This works only when privileged. */
+
+        r = RET_NERRNO(stat(pid_namespace_path(1, NAMESPACE_NET), &a));
+        if (r == -ENOENT) {
+                /* If the /proc/ns/<type> API is not around in /proc/ then ns is off in the kernel and we are in the init ns */
+                r = proc_mounted();
+                if (r < 0)
+                        return -ENOENT; /* If we can't determine if /proc/ is mounted propagate original error */
+
+                return r ? true : -ENOSYS;
+        }
+        if (r < 0)
+                return r;
+
+        if (socket_fd >= 0) {
+                _cleanup_close_ int netns = ioctl(socket_fd, SIOCGSKNS);
+                if (netns < 0)
+                        return -errno;
+
+                if (fstat(netns, &b) < 0)
+                        return -errno;
+        } else {
+                if (stat(pid_namespace_path(0, NAMESPACE_NET), &b) < 0)
+                        return -errno;
+        }
+
+        return stat_inode_same(&a, &b);
+}
+
 int namespace_is_init(NamespaceType type) {
         int r;
 
         assert(type >= 0);
         assert(type < _NAMESPACE_TYPE_MAX);
+
+        if (type == NAMESPACE_NET)
+                return network_namespace_is_init(/* socket_fd= */ -EBADF);
 
         if (namespace_info[type].root_inode == 0)
                 return -EBADR; /* Cannot answer this question */
@@ -793,6 +860,36 @@ int userns_get_base_uid(int userns_fd, uid_t *ret_uid, gid_t *ret_gid) {
         return 0;
 }
 
+int userns_has_root_mapping(int userns_fd) {
+        _cleanup_(uid_range_freep) UIDRange *uid_range = NULL, *gid_range = NULL;
+        _cleanup_(pidref_done_sigkill_wait) PidRef pidref = PIDREF_NULL;
+        int r;
+
+        assert(userns_fd >= 0);
+
+        r = userns_enter_and_pin(userns_fd, &pidref);
+        if (r < 0)
+                return r;
+
+        const char *p = procfs_file_alloca(pidref.pid, "uid_map");
+        r = uid_range_load_userns(p, UID_RANGE_USERNS_INSIDE, &uid_range);
+        if (r < 0)
+                return r;
+
+        p = procfs_file_alloca(pidref.pid, "gid_map");
+        r = uid_range_load_userns(p, GID_RANGE_USERNS_INSIDE, &gid_range);
+        if (r < 0)
+                return r;
+
+        /* The maps can be written only once. While they are empty the namespace is still being set up and
+         * root might yet get mapped, so refuse to answer rather than guess. */
+        if (uid_range_is_empty(uid_range) || uid_range_is_empty(gid_range))
+                return log_debug_errno(SYNTHETIC_ERRNO(ENODATA),
+                                       "User namespace has no UID/GID mapping yet.");
+
+        return uid_range_contains(uid_range, 0) && uid_range_contains(gid_range, 0);
+}
+
 int process_is_owned_by_uid(const PidRef *pidref, uid_t uid) {
         int r;
 
@@ -804,7 +901,7 @@ int process_is_owned_by_uid(const PidRef *pidref, uid_t uid) {
         uid_t process_uid;
         r = pidref_get_uid(pidref, &process_uid);
         if (r < 0)
-                return log_debug_errno(r, "Failed to get UID of process " PID_FMT ": %m", pidref->pid);
+                return log_debug_errno(r, "Failed to get UID of process " PID_FMT ": %m", pidref ? pidref->pid : 0);
         if (process_uid == uid)
                 return true;
 
@@ -858,6 +955,70 @@ int process_is_owned_by_uid(const PidRef *pidref, uid_t uid) {
 
                 close_and_replace(userns_fd, parent_fd);
         }
+}
+
+int namespace_open_by_id(uint64_t ns_id) {
+        int r;
+
+        /* Looks up a namespace by its unique boot-stable identifier and returns an O_PATH fd to it.
+         * Requires kernel ≥ 6.13.
+         *
+         * Returns -ESTALE if the namespace no longer exists, or if the kernel refuses the lookup
+         * for permission reasons. The latter happens outside the initial user namespace: the
+         * kernel only permits open_by_handle_at() on nsfs when the caller is in the initial user
+         * and pid namespaces with CAP_SYS_ADMIN, with a narrow exception for lookups of the
+         * caller's own user namespace and its ancestors. To avoid conflating "namespace is dead"
+         * with "kernel refused us", we refuse early with -EPERM when we aren't in the initial
+         * user/pid namespace or missing CAP_SYS_ADMIN and let the caller skip the check. */
+
+        if (ns_id == 0)
+                return -EINVAL;
+
+        r = namespace_is_init(NAMESPACE_USER);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return -EPERM;
+
+        r = namespace_is_init(NAMESPACE_PID);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return -EPERM;
+
+        r = have_effective_cap(CAP_SYS_ADMIN);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return -EPERM;
+
+        /* The natural way to write this would be a compound designated initializer:
+         *
+         *         union { ... } fh = {
+         *                 .file_handle.handle_bytes = sizeof(struct nsfs_file_handle),
+         *                 .file_handle.handle_type = FILEID_NSFS,
+         *         };
+         *
+         * but that only zero-initializes the named struct members of struct file_handle.
+         * struct file_handle ends with a flexible array (`unsigned char f_handle[]`), whose
+         * storage comes from the overlapping `space[]` member of the union. Bytes in that storage
+         * are not covered by the partial struct initializer and end up as stack garbage. Zero the
+         * entire union first, then fill in the fields explicitly. */
+
+        union {
+                struct file_handle file_handle;
+                uint8_t space[offsetof(struct file_handle, f_handle) + sizeof(struct nsfs_file_handle)];
+        } fh = {};
+        fh.file_handle.handle_bytes = sizeof(struct nsfs_file_handle);
+        fh.file_handle.handle_type = FILEID_NSFS;
+
+        /* The first 8 bytes of struct nsfs_file_handle (see <linux/nsfs.h>, uapi since kernel v6.18)
+         * are __u64 ns_id; the remaining ns_type/ns_inum fields stay zero so the kernel looks up by
+         * id alone. The kernel made lookup-by-id-only an explicit ABI guarantee in v6.19 via commit
+         * 04173501a69e ("nstree: allow lookup solely based on inode"). */
+        unaligned_write_ne64(fh.file_handle.f_handle, ns_id);
+
+        return RET_NERRNO(open_by_handle_at(FD_NSFS_ROOT, &fh.file_handle, O_PATH|O_CLOEXEC));
 }
 
 int is_idmapping_supported(const char *path) {

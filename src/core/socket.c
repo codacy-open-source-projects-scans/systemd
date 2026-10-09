@@ -30,7 +30,7 @@
 #include "ip-protocol-list.h"
 #include "log.h"
 #include "manager.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "namespace-util.h"
 #include "parse-util.h"
 #include "path-util.h"
@@ -209,6 +209,10 @@ static void socket_done(Unit *u) {
         s->smack_ip_out = mfree(s->smack_ip_out);
 
         strv_free(s->symlinks);
+
+        strv_free(s->xattr_entrypoint);
+        strv_free(s->xattr_listen);
+        strv_free(s->xattr_accept);
 
         s->user = mfree(s->user);
         s->group = mfree(s->group);
@@ -1205,7 +1209,7 @@ static int fifo_address_create(
 
         (void) mkdir_parents_label(path, directory_mode);
 
-        r = mac_selinux_create_file_prepare(path, S_IFIFO);
+        r = mac_selinux_create_file_prepare(path, S_IFIFO, /* label_context= */ NULL);
         if (r < 0)
                 return r;
 
@@ -1510,7 +1514,9 @@ static int socket_address_listen_do(
                         s->directory_mode,
                         s->socket_mode,
                         selinux_label,
-                        s->smack);
+                        s->smack,
+                        s->xattr_entrypoint,
+                        s->xattr_listen);
 }
 
 #define log_address_error_errno(u, address, error, fmt)          \
@@ -2045,25 +2051,21 @@ static int socket_chown(Socket *s, PidRef *ret_pid) {
                 /* Child */
 
                 if (!isempty(s->user)) {
-                        const char *user = s->user;
-
-                        r = get_user_creds(&user, &uid, &gid, NULL, NULL, 0);
+                        r = get_user_creds(s->user, /* flags= */ 0, NULL, &uid, &gid, NULL, NULL);
                         if (r < 0) {
                                 log_unit_error_errno(UNIT(s), r,
                                                      "Failed to resolve user '%s': %s",
-                                                     user, STRERROR_USER(r));
+                                                     s->user, STRERROR_USER(r));
                                 _exit(EXIT_USER);
                         }
                 }
 
                 if (!isempty(s->group)) {
-                        const char *group = s->group;
-
-                        r = get_group_creds(&group, &gid, 0);
+                        r = get_group_creds(s->group, /* flags= */ 0, /* ret_name= */ NULL, &gid);
                         if (r < 0) {
                                 log_unit_error_errno(UNIT(s), r,
                                                      "Failed to resolve group '%s': %s",
-                                                     group, STRERROR_GROUP(r));
+                                                     s->group, STRERROR_GROUP(r));
                                 _exit(EXIT_GROUP);
                         }
                 }
@@ -3212,6 +3214,7 @@ static int socket_dispatch_io(sd_event_source *source, int fd, uint32_t revents,
                 if (cfd < 0)
                         goto fail;
 
+                (void) socket_set_xattrs(cfd, /* path= */ NULL, p->socket->xattr_accept);
                 socket_apply_socket_options(p->socket, p, cfd);
         }
 
@@ -3726,6 +3729,7 @@ const UnitVTable socket_vtable = {
         .can_transient = true,
         .can_trigger = true,
         .can_fail = true,
+        .track_orphaned = true,
 
         .init = socket_init,
         .done = socket_done,

@@ -1,14 +1,15 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+#include "forward.h"
 #include "list.h"
-#include "shared-forward.h"
 
 typedef enum ConditionType {
         CONDITION_ARCHITECTURE,
         CONDITION_FIRMWARE,
         CONDITION_VIRTUALIZATION,
         CONDITION_HOST,
+        CONDITION_FRACTION,
         CONDITION_KERNEL_COMMAND_LINE,
         CONDITION_VERSION,
         CONDITION_CREDENTIAL,
@@ -20,6 +21,7 @@ typedef enum ConditionType {
         CONDITION_ENVIRONMENT,
         CONDITION_CPU_FEATURE,
         CONDITION_OS_RELEASE,
+        CONDITION_MACHINE_TAG,
         CONDITION_MEMORY_PRESSURE,
         CONDITION_CPU_PRESSURE,
         CONDITION_IO_PRESSURE,
@@ -82,8 +84,9 @@ static inline Condition* condition_free_list(Condition *first) {
 int condition_test(Condition *c, char **env);
 
 typedef int (*condition_test_logger_t)(void *userdata, int level, int error, const char *file, int line, const char *func, const char *format, ...) _printf_(7, 8);
-typedef const char* (*condition_to_string_t)(ConditionType t) _const_;
-bool condition_test_list(Condition *first, char **env, condition_to_string_t to_string, condition_test_logger_t logger, void *userdata);
+typedef const char* (*condition_to_string_t)(ConditionType t);
+bool condition_test_list_net(Condition *first, char **env, condition_to_string_t to_string, condition_test_logger_t logger, void *userdata);
+int condition_test_list(Condition *first, char **env, condition_to_string_t to_string, condition_test_logger_t logger, void *userdata);
 
 void condition_dump(Condition *c, FILE *f, const char *prefix, condition_to_string_t to_string);
 void condition_dump_list(Condition *first, FILE *f, const char *prefix, condition_to_string_t to_string);

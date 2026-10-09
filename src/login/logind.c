@@ -17,6 +17,7 @@
 #include "device-util.h"
 #include "devnum-util.h"
 #include "dirent-util.h"
+#include "dlopen-note.h"
 #include "errno-util.h"
 #include "escape.h"
 #include "fd-util.h"
@@ -35,7 +36,7 @@
 #include "logind-utmp.h"
 #include "logind-varlink.h"
 #include "main-func.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "parse-util.h"
 #include "process-util.h"
 #include "service-util.h"
@@ -45,6 +46,7 @@
 #include "terminal-util.h"
 #include "udev-util.h"
 #include "user-util.h"
+#include "verbs.h"
 
 static Manager* manager_free(Manager *m);
 DEFINE_TRIVIAL_CLEANUP_FUNC(Manager*, manager_free);
@@ -85,6 +87,10 @@ static int manager_new(Manager **ret) {
 
         if (!m->devices || !m->seats || !m->sessions || !m->users || !m->inhibitors || !m->buttons || !m->user_units || !m->session_units)
                 return -ENOMEM;
+
+        r = device_build_default_trigger_args(/* with_timestamp= */ false, &m->device_trigger_args);
+        if (r < 0)
+                return r;
 
         r = sd_event_default(&m->event);
         if (r < 0)
@@ -141,7 +147,10 @@ static Manager* manager_free(Manager *m) {
         sd_event_source_unref(m->console_active_event_source);
         sd_event_source_unref(m->lid_switch_ignore_event_source);
 
+        sd_event_source_unref(m->power_key_long_press_event_source);
         sd_event_source_unref(m->reboot_key_long_press_event_source);
+        sd_event_source_unref(m->suspend_key_long_press_event_source);
+        sd_event_source_unref(m->hibernate_key_long_press_event_source);
 
 #if ENABLE_UTMP
         sd_event_source_unref(m->utmp_event_source);
@@ -154,6 +163,8 @@ static Manager* manager_free(Manager *m) {
         sd_device_monitor_unref(m->device_vcsa_monitor);
         sd_device_monitor_unref(m->device_button_monitor);
         sd_device_monitor_unref(m->device_uaccess_monitor);
+
+        strv_free(m->device_trigger_args);
 
         if (m->unlink_nologin)
                 (void) unlink_or_warn("/run/nologin");
@@ -1116,6 +1127,7 @@ static int manager_dispatch_idle_action(sd_event_source *s, uint64_t t, void *us
         Manager *m = ASSERT_PTR(userdata);
         struct dual_timestamp since;
         usec_t n, elapse;
+        bool idle;
         int r;
 
         if (m->idle_action == HANDLE_IGNORE ||
@@ -1124,8 +1136,8 @@ static int manager_dispatch_idle_action(sd_event_source *s, uint64_t t, void *us
 
         n = now(CLOCK_MONOTONIC);
 
-        r = manager_get_idle_hint(m, &since);
-        if (r <= 0) {
+        idle = manager_get_idle_hint(m, &since);
+        if (!idle) {
                 /* Not idle. Let's check if after a timeout it might be idle then. */
                 elapse = n + m->idle_action_usec;
                 m->was_idle = false;
@@ -1342,17 +1354,29 @@ static int manager_run(Manager *m) {
         }
 }
 
+COMMAND(
+        "systemd-logind\0",
+        "Manage user logins and devices and privileged operations.",
+        .man_pages = "systemd-logind.service(8)\0",
+        .option_namespace = "service",
+        .option_groups =
+                "Options\0"
+                "Bus introspection\0",
+);
+
 static int run(int argc, char *argv[]) {
         _cleanup_(manager_freep) Manager *m = NULL;
         _unused_ _cleanup_(notify_on_cleanup) const char *notify_message = NULL;
         int r;
 
+        LIBACL_NOTE(recommended);
+        LIBBLKID_NOTE(recommended);
+        LIBSELINUX_NOTE(recommended);
+
         log_set_facility(LOG_AUTH);
         log_setup();
 
-        r = service_parse_argv("systemd-logind.service",
-                               "Manager for user logins and devices and privileged operations.",
-                               BUS_IMPLEMENTATIONS(&manager_object,
+        r = service_parse_argv(BUS_IMPLEMENTATIONS(&manager_object,
                                                    &log_control_object),
                                /* runtime_scope= */ NULL,
                                argc, argv);

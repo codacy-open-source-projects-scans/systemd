@@ -16,6 +16,7 @@
 #include "constants.h"
 #include "daemon-util.h"
 #include "dirent-util.h"
+#include "dlopen-note.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "hash-funcs.h"
@@ -26,15 +27,16 @@
 #include "machined-dbus.h"
 #include "machined-varlink.h"
 #include "main-func.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "operation.h"
 #include "path-lookup.h"
 #include "service-util.h"
 #include "set.h"
 #include "signal-util.h"
-#include "socket-util.h"
 #include "special.h"
 #include "string-util.h"
+#include "verbs.h"
+#include "vsock-util.h"
 
 static Manager* manager_unref(Manager *m);
 DEFINE_TRIVIAL_CLEANUP_FUNC(Manager*, manager_unref);
@@ -342,17 +344,32 @@ static bool check_idle(void *userdata) {
         return hashmap_isempty(m->machines);
 }
 
+COMMAND(
+        "systemd-machined\0",
+        "Manage registrations of local VMs and containers.",
+        .man_pages = "systemd-machined.service(8)\0",
+        .option_namespace = "service",
+        .option_groups =
+                "Options\0"
+                "Bus introspection\0"
+                "Runtime scope\0",
+);
+
 static int run(int argc, char *argv[]) {
         _cleanup_(manager_unrefp) Manager *m = NULL;
         RuntimeScope scope = RUNTIME_SCOPE_SYSTEM;
         int r;
 
+        LIBBLKID_NOTE(recommended);
+        LIBCRYPTO_NOTE(suggested);
+        LIBCRYPTSETUP_NOTE(suggested);
+        LIBMOUNT_NOTE(recommended);
+        LIBSELINUX_NOTE(recommended);
+
         log_set_facility(LOG_AUTH);
         log_setup();
 
-        r = service_parse_argv("systemd-machined.service",
-                               "Manage registrations of local VMs and containers.",
-                               BUS_IMPLEMENTATIONS(&manager_object,
+        r = service_parse_argv(BUS_IMPLEMENTATIONS(&manager_object,
                                                    &log_control_object),
                                &scope,
                                argc, argv);

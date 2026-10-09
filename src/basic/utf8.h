@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "basic-forward.h"
+#include "forward.h"
 
 #define UTF8_REPLACEMENT_CHARACTER "\xef\xbf\xbd"
 #define UTF8_BYTE_ORDER_MARK "\xef\xbb\xbf"
@@ -38,7 +38,10 @@ char16_t *utf8_to_utf16(const char *s, size_t length);
 size_t char16_strlen(const char16_t *s) _pure_; /* returns the number of 16-bit words in the string (not bytes!) */
 size_t char16_strsize(const char16_t *s) _pure_;
 
-int utf8_encoded_valid_unichar(const char *str, size_t length) _pure_;
+int utf8_encoded_valid_unichar_full(const char *str, size_t length, char32_t *ret_unichar);
+static inline int _pure_ utf8_encoded_valid_unichar(const char *str, size_t length) {
+        return utf8_encoded_valid_unichar_full(str, length, NULL);
+}
 int utf8_encoded_to_unichar(const char *str, char32_t *ret_unichar);
 
 static inline bool utf16_is_surrogate(char16_t c) {
@@ -55,6 +58,7 @@ static inline char32_t utf16_surrogate_pair_to_unichar(char16_t lead, char16_t t
 
 size_t utf8_n_codepoints(const char *str) _pure_;
 int utf8_char_console_width(const char *str) _pure_;
+int unichar_console_width(char32_t c) _pure_;
 size_t utf8_console_width(const char *str) _pure_;
 
 size_t utf8_last_length(const char *s, size_t n) _pure_;

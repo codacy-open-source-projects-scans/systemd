@@ -98,7 +98,7 @@ static int verify_conditions(char **lines, RuntimeScope scope, const char *unit,
                 return log_error_errno(r, "Failed to initialize manager: %m");
 
         log_debug("Starting manager...");
-        r = manager_startup(m, /* serialization= */ NULL, /* fds= */ NULL, root);
+        r = manager_startup(m, /* serialization= */ NULL, /* fds= */ NULL, /* named_listen_fds= */ NULL, root);
         if (r < 0)
                 return r;
 
@@ -109,7 +109,7 @@ static int verify_conditions(char **lines, RuntimeScope scope, const char *unit,
                 if (r < 0)
                         return log_error_errno(r, "Failed to prepare filename %s: %m", unit);
 
-                r = manager_load_startable_unit_or_warn(m, NULL, prepared, &u);
+                r = manager_load_startable_unit_or_warn(m, /* name= */ NULL, prepared, LOG_ERR, &u);
                 if (r < 0)
                         return r;
         } else {
@@ -125,11 +125,11 @@ static int verify_conditions(char **lines, RuntimeScope scope, const char *unit,
         }
 
         condition_test_logger_t logger = arg_quiet ? NULL : log_helper;
-        r = condition_test_list(u->asserts, environ, assert_type_to_string, logger, u);
+        r = condition_test_list(u->asserts, environ, assert_type_to_string, logger, u) > 0;
         if (u->asserts)
                 log_full(arg_quiet ? LOG_DEBUG : LOG_NOTICE, "Asserts %s.", r > 0 ? "succeeded" : "failed");
 
-        q = condition_test_list(u->conditions, environ, condition_type_to_string, logger, u);
+        q = condition_test_list(u->conditions, environ, condition_type_to_string, logger, u) > 0;
         if (u->conditions)
                 log_full(arg_quiet ? LOG_DEBUG : LOG_NOTICE, "Conditions %s.", q > 0 ? "succeeded" : "failed");
 

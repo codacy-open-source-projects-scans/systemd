@@ -15,6 +15,7 @@
 #include "chase.h"
 #include "discover-image.h"
 #include "dissect-image.h"
+#include "dlopen-note.h"
 #include "env-util.h"
 #include "errno-util.h"
 #include "escape.h"
@@ -502,7 +503,8 @@ static int vl_method_mount_image(
                         polkit_details,
                         /* good_user= */ UID_INVALID,
                         polkit_flags,
-                        polkit_registry);
+                        polkit_registry,
+                        /* ret_admin= */ NULL);
         if (r <= 0)
                 return r;
 
@@ -541,7 +543,7 @@ static int vl_method_mount_image(
 
         /* Let's see if we have acquired the privilege to mount untrusted images already */
         bool polkit_have_untrusted_action =
-                varlink_has_polkit_action(link, polkit_untrusted_action, polkit_details, polkit_registry);
+                varlink_has_polkit_action(link, polkit_untrusted_action, polkit_details, polkit_registry, /* ret_admin= */ NULL);
 
         for (;;) {
                 use_policy = image_policy_free(use_policy);
@@ -594,7 +596,8 @@ static int vl_method_mount_image(
                                                 polkit_details,
                                                 /* good_user= */ UID_INVALID,
                                                 /* flags= */ 0,                   /* NB: the image cannot be authenticated, hence unless PK is around to allow this anyway, fail! */
-                                                polkit_registry);
+                                                polkit_registry,
+                                                /* ret_admin= */ NULL);
                                 if (r <= 0 && !ERRNO_IS_NEG_PRIVILEGE(r))
                                         return r;
                                 if (r > 0) {
@@ -672,7 +675,8 @@ static int vl_method_mount_image(
                                                  polkit_details,
                                                  /* good_user= */ UID_INVALID,
                                                  /* flags= */ 0,                   /* NB: the image cannot be authenticated, hence unless PK is around to allow this anyway, fail! */
-                                                 polkit_registry);
+                                                 polkit_registry,
+                                                 /* ret_admin= */ NULL);
                                  if (r <= 0 && !ERRNO_IS_NEG_PRIVILEGE(r))
                                          return r;
                                  if (r > 0) {
@@ -1167,7 +1171,8 @@ static int vl_method_mount_directory(
                         polkit_details,
                         /* good_user= */ UID_INVALID,
                         trusted_directory ? polkit_flags : 0,
-                        polkit_registry);
+                        polkit_registry,
+                        /* ret_admin= */ NULL);
         if (r <= 0)
                 return r;
 
@@ -1362,7 +1367,7 @@ static int vl_method_make_directory(
 
         struct stat parent_stat;
         if (fstat(parent_fd, &parent_stat) < 0)
-                return r;
+                return log_debug_errno(errno, "Failed to fstat parent directory fd: %m");
 
         r = stat_verify_directory(&parent_stat);
         if (r < 0)
@@ -1400,7 +1405,8 @@ static int vl_method_make_directory(
                         polkit_details,
                         /* good_user= */ UID_INVALID,
                         polkit_flags,
-                        polkit_registry);
+                        polkit_registry,
+                        /* ret_admin= */ NULL);
         if (r <= 0)
                 return r;
 
@@ -1483,6 +1489,11 @@ static int run(int argc, char *argv[]) {
         _cleanup_(pidref_done) PidRef parent = PIDREF_NULL;
         unsigned n_iterations = 0;
         int m, listen_fd, r;
+
+        LIBBLKID_NOTE(recommended);
+        LIBCRYPTO_NOTE(suggested);
+        LIBCRYPTSETUP_NOTE(suggested);
+        LIBMOUNT_NOTE(recommended);
 
         log_setup();
 

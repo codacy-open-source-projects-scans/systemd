@@ -3,8 +3,9 @@
 
 #include <string.h>
 
-#include "basic-forward.h"
-#include "memory-util-fundamental.h" /* IWYU pragma: export */
+#include "forward.h"
+
+#include "../fundamental/memory-util.h" /* IWYU pragma: export */
 
 size_t page_size(void) _pure_;
 #define PAGE_ALIGN(l)          ALIGN_TO(l, page_size())
@@ -97,6 +98,3 @@ static inline void erase_and_freep(void *p) {
 static inline void erase_char(char *p) {
         explicit_bzero_safe(p, sizeof(char));
 }
-
-/* Makes a copy of the buffer with reversed order of bytes */
-void* memdup_reverse(const void *mem, size_t size);

@@ -2,16 +2,12 @@
 
 #include <syslog.h>
 
-#include "sd-dlopen.h"
-
 #include "log.h"
 #include "module-util.h"
 #include "proc-cmdline.h"
 #include "strv.h"
 
 #if HAVE_KMOD
-
-static void *libkmod_dl = NULL;
 
 DLSYM_PROTOTYPE(kmod_list_next) = NULL;
 DLSYM_PROTOTYPE(kmod_load_resources) = NULL;
@@ -173,11 +169,9 @@ int module_setup_context(struct kmod_ctx **ret) {
 
 int dlopen_libkmod(int log_level) {
 #if HAVE_KMOD
-        SD_ELF_NOTE_DLOPEN(
-                        "kmod",
-                        "Support for loading kernel modules",
-                        SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED,
-                        "libkmod.so.2");
+        static void *libkmod_dl = NULL;
+
+        LIBKMOD_NOTE(suggested);
 
         return dlopen_many_sym_or_warn(
                         &libkmod_dl,

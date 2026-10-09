@@ -126,6 +126,8 @@ static int machine_cid(const char *name, sd_json_variant *variant, sd_json_dispa
 int vl_method_register(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
         Manager *manager = ASSERT_PTR(userdata);
         _cleanup_(machine_freep) Machine *machine = NULL;
+        const char *bad_field = NULL;
+        bool sender_is_admin = false;
         int r;
 
         static const sd_json_dispatch_field dispatch_table[] = {
@@ -135,8 +137,6 @@ int vl_method_register(sd_varlink *link, sd_json_variant *parameters, sd_varlink
                 { "class",               SD_JSON_VARIANT_STRING,        dispatch_machine_class,   offsetof(Machine, class),                SD_JSON_MANDATORY },
                 { "leader",              _SD_JSON_VARIANT_TYPE_INVALID, machine_pidref,           offsetof(Machine, leader),               SD_JSON_STRICT    },
                 { "leaderProcessId",     SD_JSON_VARIANT_OBJECT,        machine_pidref,           offsetof(Machine, leader),               SD_JSON_STRICT    },
-                { "supervisor",          _SD_JSON_VARIANT_TYPE_INVALID, machine_pidref,           offsetof(Machine, supervisor),           SD_JSON_STRICT    },
-                { "supervisorProcessId", SD_JSON_VARIANT_OBJECT,        machine_pidref,           offsetof(Machine, supervisor),           SD_JSON_STRICT    },
                 { "rootDirectory",       SD_JSON_VARIANT_STRING,        json_dispatch_path,       offsetof(Machine, root_directory),       SD_JSON_STRICT    },
                 { "ifIndices",           SD_JSON_VARIANT_ARRAY,         machine_ifindices,        0,                                       0                 },
                 { "vSockCid",            _SD_JSON_VARIANT_TYPE_INVALID, machine_cid,              offsetof(Machine, vsock_cid),            0                 },
@@ -152,21 +152,27 @@ int vl_method_register(sd_varlink *link, sd_json_variant *parameters, sd_varlink
         if (r < 0)
                 return r;
 
-        r = sd_varlink_dispatch(link, parameters, dispatch_table, machine);
-        if (r != 0)
+        r = sd_json_dispatch_full(parameters, dispatch_table, /* bad= */ NULL, SD_JSON_ALLOW_EXTENSIONS, machine, &bad_field);
+        if (r < 0) {
+                if (bad_field)
+                        return sd_varlink_error_invalid_parameter_name(link, bad_field);
                 return r;
+        }
 
         if (!MACHINE_CLASS_CAN_REGISTER(machine->class))
                 return sd_varlink_error_invalid_parameter_name(link, "class");
 
         if (manager->runtime_scope != RUNTIME_SCOPE_USER) {
-                r = varlink_verify_polkit_async(
+                r = varlink_verify_polkit_async_full(
                                 link,
                                 manager->system_bus,
                                 machine->allocate_unit ? "org.freedesktop.machine1.create-machine" : "org.freedesktop.machine1.register-machine",
                                 (const char**) STRV_MAKE("name", machine->name,
                                                          "class", machine_class_to_string(machine->class)),
-                                &manager->polkit_registry);
+                                /* good_user= */ UID_INVALID,
+                                /* flags= */ 0,
+                                &manager->polkit_registry,
+                                &sender_is_admin);
                 if (r <= 0)
                         return r;
         }
@@ -175,9 +181,7 @@ int vl_method_register(sd_varlink *link, sd_json_variant *parameters, sd_varlink
                 r = varlink_get_peer_pidref(link, &machine->leader);
                 if (r < 0)
                         return r;
-        }
-
-        if (!pidref_is_set(&machine->supervisor)) {
+        } else {
                 _cleanup_(pidref_done) PidRef client_pidref = PIDREF_NULL;
 
                 r = varlink_get_peer_pidref(link, &client_pidref);
@@ -196,7 +200,7 @@ int vl_method_register(sd_varlink *link, sd_json_variant *parameters, sd_varlink
         /* In system scope, ensure an unprivileged user cannot claim any process they don't
          * control as their own machine. In user scope the varlink socket is already
          * protected by $XDG_RUNTIME_DIR permissions. */
-        if (manager->runtime_scope != RUNTIME_SCOPE_USER && machine->uid != 0) {
+        if (manager->runtime_scope != RUNTIME_SCOPE_USER && machine->uid != 0 && !sender_is_admin) {
                 r = process_is_owned_by_uid(&machine->leader, machine->uid);
                 if (r < 0)
                         return r;
@@ -323,7 +327,8 @@ int vl_method_unregister_internal(sd_varlink *link, sd_json_variant *parameters,
                                                          "verb", "unregister"),
                                 machine->uid,
                                 /* flags= */ 0,
-                                &manager->polkit_registry);
+                                &manager->polkit_registry,
+                                /* ret_admin= */ NULL);
                 if (r <= 0)
                         return r;
         }
@@ -349,7 +354,8 @@ int vl_method_terminate_internal(sd_varlink *link, sd_json_variant *parameters, 
                                                          "verb", "terminate"),
                                 machine->uid,
                                 /* flags= */ 0,
-                                &manager->polkit_registry);
+                                &manager->polkit_registry,
+                                /* ret_admin= */ NULL);
                 if (r <= 0)
                         return r;
         }
@@ -417,7 +423,8 @@ int vl_method_kill(sd_varlink *link, sd_json_variant *parameters, sd_varlink_met
                                                          "verb", "kill"),
                                 machine->uid,
                                 /* flags= */ 0,
-                                &manager->polkit_registry);
+                                &manager->polkit_registry,
+                                /* ret_admin= */ NULL);
                 if (r <= 0)
                         return r;
         }
@@ -583,7 +590,8 @@ int vl_method_open(sd_varlink *link, sd_json_variant *parameters, sd_varlink_met
                                 (const char**) polkit_details,
                                 machine->uid,
                                 /* flags= */ 0,
-                                &manager->polkit_registry);
+                                &manager->polkit_registry,
+                                /* ret_admin= */ NULL);
                 if (r <= 0)
                         return r;
         }
@@ -821,10 +829,10 @@ static void machine_mount_paramaters_done(MachineMountParameters *p) {
 int vl_method_bind_mount(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
         static const sd_json_dispatch_field dispatch_table[] = {
                 VARLINK_DISPATCH_MACHINE_LOOKUP_FIELDS(MachineMountParameters),
-                { "source",      SD_JSON_VARIANT_STRING,  json_dispatch_const_path, offsetof(MachineMountParameters, src),       SD_JSON_MANDATORY },
-                { "destination", SD_JSON_VARIANT_STRING,  json_dispatch_const_path, offsetof(MachineMountParameters, dest),      0                 },
-                { "readOnly",    SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(MachineMountParameters, read_only), 0                 },
-                { "mkdir",       SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(MachineMountParameters, mkdir),     0                 },
+                { "source",      SD_JSON_VARIANT_STRING,  json_dispatch_const_path, offsetof(MachineMountParameters, src),       SD_JSON_MANDATORY|SD_JSON_STRICT },
+                { "destination", SD_JSON_VARIANT_STRING,  json_dispatch_const_path, offsetof(MachineMountParameters, dest),      SD_JSON_STRICT                   },
+                { "readOnly",    SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(MachineMountParameters, read_only), 0                                },
+                { "mkdir",       SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(MachineMountParameters, mkdir),     0                                },
                 VARLINK_DISPATCH_POLKIT_FIELD,
                 {}
         };
@@ -844,7 +852,7 @@ int vl_method_bind_mount(sd_varlink *link, sd_json_variant *parameters, sd_varli
         if (r != 0)
                 return r;
 
-        /* There is no need for extra validation since json_dispatch_const_path() does path_is_valid() and path_is_absolute(). */
+        /* There is no need for extra validation since json_dispatch_const_path() with SD_JSON_STRICT does path_is_normalized() and path_is_absolute(). */
         const char *dest = p.dest ?: p.src;
 
         Machine *machine;
@@ -931,9 +939,9 @@ static int copy_done(Operation *operation, int ret, sd_bus_error *error) {
 int vl_method_copy_internal(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata, bool copy_from) {
         static const sd_json_dispatch_field dispatch_table[] = {
                 VARLINK_DISPATCH_MACHINE_LOOKUP_FIELDS(MachineCopyParameters),
-                { "source",      SD_JSON_VARIANT_STRING,  json_dispatch_const_path, offsetof(MachineCopyParameters, src),     SD_JSON_MANDATORY },
-                { "destination", SD_JSON_VARIANT_STRING,  json_dispatch_const_path, offsetof(MachineCopyParameters, dest),    0                 },
-                { "replace",     SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(MachineCopyParameters, replace), 0                 },
+                { "source",      SD_JSON_VARIANT_STRING,  json_dispatch_const_path, offsetof(MachineCopyParameters, src),     SD_JSON_MANDATORY|SD_JSON_STRICT },
+                { "destination", SD_JSON_VARIANT_STRING,  json_dispatch_const_path, offsetof(MachineCopyParameters, dest),    SD_JSON_STRICT                   },
+                { "replace",     SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(MachineCopyParameters, replace), 0                                },
                 VARLINK_DISPATCH_POLKIT_FIELD,
                 {}
         };
@@ -954,11 +962,11 @@ int vl_method_copy_internal(sd_varlink *link, sd_json_variant *parameters, sd_va
         if (r != 0)
                 return r;
 
-        /* There is no need for extra validation since json_dispatch_const_path() does path_is_valid() and path_is_absolute(). */
+        /* There is no need for extra validation since json_dispatch_const_path() with SD_JSON_STRICT does path_is_normalized() and path_is_absolute(). */
         const char *dest = p.dest ?: p.src;
         const char *container_path = copy_from ? p.src : dest;
         const char *host_path = copy_from ? dest : p.src;
-        CopyFlags copy_flags = COPY_REFLINK|COPY_MERGE|COPY_HARDLINKS;
+        CopyFlags copy_flags = COPY_MERGE|COPY_HARDLINKS;
         copy_flags |= p.replace ? COPY_REPLACE : 0;
 
         Machine *machine;

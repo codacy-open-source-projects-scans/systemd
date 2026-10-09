@@ -4,9 +4,9 @@
 #include "sd-id128.h"
 
 #include "architecture.h"
+#include "forward.h"
 #include "gpt.h"
 #include "iovec-util.h"
-#include "shared-forward.h"
 
 typedef struct DecryptedImage DecryptedImage;
 
@@ -160,6 +160,8 @@ static inline int probe_filesystem(const char *path, char **ret_fstype) {
         return probe_filesystem_full(-1, path, 0, UINT64_MAX, /* bool restrict_fstypes= */ false, ret_fstype);
 }
 
+int probe_partition_table(int fd, char **ret_pttype);
+
 int dissect_log_error(int log_level, int r, const char *name, const VeritySettings *verity);
 int dissect_image_file(const char *path, const VeritySettings *verity, const MountOptions *mount_options, const ImagePolicy *image_policy, const ImageFilter *filter, DissectImageFlags flags, DissectedImage **ret);
 int dissect_image_file_and_warn(const char *path, const VeritySettings *verity, const MountOptions *mount_options, const ImagePolicy *image_policy, const ImageFilter *filter, DissectImageFlags flags, DissectedImage **ret);
@@ -201,6 +203,7 @@ int dissected_image_relinquish(DissectedImage *m);
 void image_filter_done(ImageFilter *f);
 ImageFilter *image_filter_free(ImageFilter *f);
 DEFINE_TRIVIAL_CLEANUP_FUNC(ImageFilter*, image_filter_free);
+bool image_filter_test(const ImageFilter *filter, PartitionDesignator d, const char *label);
 int image_filter_parse(const char *s, ImageFilter **ret);
 
 int verity_settings_load(VeritySettings *verity, const char *image, const char *root_hash_path, const char *root_hash_sig_path);

@@ -36,8 +36,7 @@ static int normalize_and_maybe_pin_inode(
         assert(ret_tfd);
         assert(ret_opath);
 
-        if (isempty(*path))
-                *path = NULL; /* Normalize "" to NULL */
+        *path = empty_to_null(*path); /* Normalize "" to NULL */
 
         if (*fd == AT_FDCWD) {
                 if (!*path) /* Both unspecified? Then operate on current working directory */
@@ -296,7 +295,7 @@ int xsetxattr_full(
         assert(fd >= 0 || fd == AT_FDCWD);
         assert((at_flags & ~(AT_SYMLINK_FOLLOW|AT_EMPTY_PATH)) == 0);
         assert(name);
-        assert(value);
+        assert(value || size == 0);
 
         if (size == SIZE_MAX)
                 size = strlen(value);

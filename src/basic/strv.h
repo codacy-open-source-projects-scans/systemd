@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "basic-forward.h"
-#include "strv-fundamental.h"   /* IWYU pragma: export */
+#include "forward.h"
+
+#include "../fundamental/strv.h"   /* IWYU pragma: export */
 
 char* strv_find(char * const *l, const char *name) _pure_;
 char* strv_find_case(char * const *l, const char *name) _pure_;
@@ -84,6 +85,7 @@ int strv_consume_pair(char ***l, char *a, char *b);
 int strv_consume_prepend(char ***l, char *value);
 
 char** strv_remove(char **l, const char *s);
+char** strv_remove_strv(char **l, char *const*ll);
 char** strv_uniq(char **l);
 bool strv_is_uniq(char * const *l) _pure_;
 
@@ -118,9 +120,9 @@ char** strv_split_newlines(const char *s);
  * string in the vector is an empty string. */
 int strv_split_colon_pairs(char ***t, const char *s);
 
-char* strv_join_full(char * const *l, const char *separator, const char *prefix, bool escape_separator);
+char* strv_join_full(char * const *l, const char *separator, const char *prefix);
 static inline char *strv_join(char * const *l, const char *separator) {
-        return strv_join_full(l, separator, NULL, false);
+        return strv_join_full(l, separator, NULL);
 }
 
 bool strv_overlap(char * const *a, char * const *b) _pure_;
@@ -145,6 +147,7 @@ bool strv_overlap(char * const *a, char * const *b) _pure_;
         _STRV_FOREACH_PAIR(x, y, l, UNIQ_T(i, UNIQ))
 
 char** strv_sort(char **l);
+char** strv_sort_uniq_full(char **l, int (*compare)(char * const *a, char * const *b));
 char** strv_sort_uniq(char **l);
 void strv_print_full(char * const *l, const char *prefix);
 static inline void strv_print(char * const *l) {

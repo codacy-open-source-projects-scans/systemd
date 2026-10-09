@@ -11,10 +11,16 @@ cryptenroll_wipe_and_check() {(
     grep -qE "Wiped slot [[:digit:]]+" /tmp/cryptenroll.out
 )}
 
+at_exit() {
+    rm -f "${IMAGE:-}" "${VL_IMAGE:-}" /tmp/cryptenroll.out /tmp/password
+}
+
+trap at_exit EXIT
+
 # There is an external issue with libcryptsetup on ppc64 that hits 95% of Ubuntu ppc64 test runs, so skip it
 if [[ "$(uname -m)" == "ppc64le" ]]; then
     echo "Skipping systemd-cryptenroll tests on ppc64le, see https://github.com/systemd/systemd/issues/27716"
-    exit 0
+    exit 77
 fi
 
 export SYSTEMD_LOG_LEVEL=debug
@@ -95,3 +101,58 @@ PIN=4321 systemd-cryptenroll --unlock-tpm2-device=auto --recovery-key "$IMAGE"
 (! systemd-cryptenroll --fido2-device=auto --unlock-fido2-device=auto "$IMAGE")
 
 rm -f "$IMAGE"
+
+# Exercise the io.systemd.CryptEnroll Varlink interface with calls equivalent to the command line ones above.
+CRYPTENROLL="$(command -v systemd-cryptenroll)"
+VL_ADDRESS="exec:$CRYPTENROLL"
+VL_IMAGE="$(mktemp /tmp/systemd-cryptenroll-varlink-XXX.image)"
+truncate -s 20M "$VL_IMAGE"
+cryptsetup luksFormat -q --pbkdf pbkdf2 --pbkdf-force-iterations 1000 --use-urandom "$VL_IMAGE" /tmp/password
+
+# Enroll a recovery key, unlocking via key file (cf. systemd-cryptenroll --unlock-key-file= --recovery-key)
+varlinkctl call "$VL_ADDRESS" io.systemd.CryptEnroll.Enroll \
+    "{\"node\":\"$VL_IMAGE\",\"mechanism\":\"recovery\",\"unlockKeyFile\":\"/tmp/password\"}" | grep recoveryKey >/dev/null
+
+# Enroll a recovery key generated via MakeRecoveryKey(), unlocking via key file (cf. systemd-cryptenroll --unlock-key-file= --recovery-key)
+RECOVERY_KEY=$(varlinkctl call "$VL_ADDRESS" io.systemd.CryptEnroll.MakeRecoveryKey "{}" | jq -e -r '.recoveryKey')
+
+RESULT_RECOVERY_KEY=$(varlinkctl call "$VL_ADDRESS" io.systemd.CryptEnroll.Enroll \
+    "{\"node\":\"$VL_IMAGE\",\"mechanism\":\"recovery\",\"recoveryKey\":\"$RECOVERY_KEY\",\"unlockKeyFile\":\"/tmp/password\"}" | jq -e -r '.recoveryKey')
+test "$RECOVERY_KEY" = "$RESULT_RECOVERY_KEY"
+
+# Ensure that the enrolled recovery key works
+echo -n "$RECOVERY_KEY" | cryptsetup open --type=luks2 --test-passphrase --key-file=- "$VL_IMAGE"
+
+# Fail to enroll a malformed recovery key, unlocking via key file (cf. systemd-cryptenroll --unlock-key-file= --recovery-key)
+(! varlinkctl call "$VL_ADDRESS" io.systemd.CryptEnroll.Enroll \
+    "{\"node\":\"$VL_IMAGE\",\"mechanism\":\"recovery\",\"recoveryKey\":\"SOME_RANDOM_KEY\",\"unlockKeyFile\":\"/tmp/password\"}" | grep recoveryKey >/dev/null)
+
+# Enroll a password, unlocking via key file (cf. NEWPASSWORD=… systemd-cryptenroll --unlock-key-file= --password)
+varlinkctl call "$VL_ADDRESS" io.systemd.CryptEnroll.Enroll \
+    "{\"node\":\"$VL_IMAGE\",\"mechanism\":\"password\",\"unlockKeyFile\":\"/tmp/password\",\"password\":\"varlinkpassword\"}"
+
+# Enroll a password, unlocking via the key file passed as a file descriptor instead of a path
+varlinkctl --push-fd=3 call "$VL_ADDRESS" io.systemd.CryptEnroll.Enroll \
+    "{\"node\":\"$VL_IMAGE\",\"mechanism\":\"password\",\"unlockKeyFileDescriptor\":0,\"password\":\"fdpassword\"}" 3</tmp/password
+
+# List enrolled slots (must be called with 'more'); we should see the password and the two recovery slots we enrolled
+SLOTS=$(varlinkctl call --more "$VL_ADDRESS" io.systemd.CryptEnroll.ListSlots "{\"node\":\"$VL_IMAGE\"}")
+test "$(grep -c '"type":"recovery"' <<<"$SLOTS")" -eq 2
+grep '"type":"password"' <<<"$SLOTS" >/dev/null
+
+# Enroll combined with a wipe of the recovery key slot (cf. systemd-cryptenroll --wipe-slot=recovery --password).
+# The recovery key slot just got wiped, so it should be reported back in the (non-empty) wipedSlots output.
+varlinkctl call "$VL_ADDRESS" io.systemd.CryptEnroll.Enroll \
+    "{\"node\":\"$VL_IMAGE\",\"mechanism\":\"password\",\"unlockKeyFile\":\"/tmp/password\",\"password\":\"wipepassword\",\"wipeTypes\":[\"recovery\"]}" | grep -E '"wipedSlots":\[[0-9]+(,[0-9]+)*\]' >/dev/null
+(! varlinkctl call --more "$VL_ADDRESS" io.systemd.CryptEnroll.ListSlots "{\"node\":\"$VL_IMAGE\"}" | grep '"type":"recovery"' >/dev/null)
+
+# ListSlots without 'more' is refused
+(! varlinkctl call "$VL_ADDRESS" io.systemd.CryptEnroll.ListSlots "{\"node\":\"$VL_IMAGE\"}")
+
+# PKCS#11 and TPM2 cannot be enrolled via this interface, so the Enroll() handler rejects them as invalid parameters
+(! varlinkctl call "$VL_ADDRESS" io.systemd.CryptEnroll.Enroll \
+    "{\"node\":\"$VL_IMAGE\",\"mechanism\":\"tpm2\",\"unlockKeyFile\":\"/tmp/password\"}")
+(! varlinkctl call "$VL_ADDRESS" io.systemd.CryptEnroll.Enroll \
+    "{\"node\":\"$VL_IMAGE\",\"mechanism\":\"pkcs11\",\"unlockKeyFile\":\"/tmp/password\"}")
+
+rm -f "$VL_IMAGE"

@@ -8,20 +8,19 @@
 #include <unistd.h>
 
 #include "sd-id128.h"
+#include "sd-json.h"
 
 #include "alloc-util.h"
 #include "build.h"
 #include "errno-util.h"
 #include "fd-util.h"
-#include "format-table.h"
 #include "fs-util.h"
+#include "initrd-util.h"
 #include "io-util.h"
 #include "log.h"
 #include "main-func.h"
 #include "mkdir.h"
-#include "options.h"
 #include "parse-util.h"
-#include "pretty-print.h"
 #include "random-util.h"
 #include "sha256.h"
 #include "string-util.h"
@@ -43,6 +42,12 @@ typedef enum CreditEntropy {
 } CreditEntropy;
 
 static SeedAction arg_action = _ACTION_INVALID;
+
+COMMAND(
+        "systemd-random-seed\0",
+        "Load and save the system random seed at boot and shutdown.",
+        .man_pages = "systemd-random-seed(8)\0",
+);
 
 static CreditEntropy may_credit(int seed_fd) {
         const char *e;
@@ -88,8 +93,8 @@ static CreditEntropy may_credit(int seed_fd) {
         /* Don't credit the random seed if we are in first-boot mode, because we are supposed to start from
          * scratch. This is a safety precaution for cases where people ship "golden" images with empty
          * /etc but populated /var that contains a random seed. */
-        r = RET_NERRNO(access("/run/systemd/first-boot", F_OK));
-        if (r == -ENOENT)
+        r = in_first_boot();
+        if (r == 0)
                 /* All is good, we are not in first-boot mode. */
                 return CREDIT_ENTROPY_YES_PLEASE;
         if (r < 0) {
@@ -282,7 +287,7 @@ static int save_seed_file(
                 return log_error_errno(r, "Failed to write new random seed file: %m");
 
         if (ftruncate(seed_fd, k) < 0)
-                return log_error_errno(r, "Failed to truncate random seed file: %m");
+                return log_error_errno(errno, "Failed to truncate random seed file: %m");
 
         r = fsync_full(seed_fd);
         if (r < 0)
@@ -294,45 +299,6 @@ static int save_seed_file(
                 if (fsetxattr(seed_fd, "user.random-seed-creditable", "1", 1, 0) < 0)
                         log_full_errno(ERRNO_IS_NOT_SUPPORTED(errno) ? LOG_DEBUG : LOG_WARNING, errno,
                                        "Failed to mark seed file as creditable, ignoring: %m");
-        return 0;
-}
-
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        _cleanup_(table_unrefp) Table *options = NULL, *verbs = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-random-seed", "8", &link);
-        if (r < 0)
-                return log_oom();
-
-        r = verbs_get_help_table(&verbs);
-        if (r < 0)
-                return r;
-
-        r = option_parser_get_help_table(&options);
-        if (r < 0)
-                return r;
-
-        (void) table_sync_column_widths(0, verbs, options);
-
-        printf("%s [OPTIONS...] COMMAND\n"
-               "\n%sLoad and save the system random seed at boot and shutdown.%s\n"
-               "\nCommands:\n",
-               program_invocation_short_name,
-               ansi_highlight(),
-               ansi_normal());
-
-        r = table_print_or_warn(verbs);
-        if (r < 0)
-                return r;
-
-        printf("\nOptions:\n");
-        r = table_print_or_warn(options);
-        if (r < 0)
-                return r;
-
-        printf("\nSee the %s for details.\n", link);
         return 0;
 }
 
@@ -352,17 +318,20 @@ static int parse_argv(int argc, char *argv[]) {
         OptionParser opts = { argc, argv };
         int r;
 
-        FOREACH_OPTION(c, &opts, /* on_error= */ return c)
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return help();
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
-        r = dispatch_verb_with_args(option_parser_get_args(&opts), NULL);
+        r = dispatch_verb(option_parser_get_args(&opts), NULL);
         if (r < 0)
                 return r;
 

@@ -209,6 +209,11 @@
         to allow the service manager to track the service's internal state, and present it to the user.
         </para>
 
+        <para>Starting with version 259, transitioning to the STOPPING state is final and cannot be undone
+        with another notification. If after sending <literal>STOPPING=1</literal> the service doesn't
+        terminate within the stop timeout, all remaining processes in the unit will be killed.
+        </para>
+
         <xi:include href="version-info.xml" xpointer="v217"/></listitem>
       </varlistentry>
 
@@ -427,6 +432,17 @@
 
         <para>For further information on the file descriptor store see the <ulink
         url="https://systemd.io/FILE_DESCRIPTOR_STORE">File Descriptor Store</ulink> overview.</para>
+
+        <para>On kernels that support the <ulink
+        url="https://docs.kernel.org/userspace-api/liveupdate.html">Live Update Orchestrator</ulink>,
+        compatible file descriptors stored this way (such as <citerefentry
+        project='man-pages'><refentrytitle>memfd_create</refentrytitle><manvolnum>2</manvolnum></citerefentry>)
+        are additionally preserved across <literal>kexec</literal>-based reboots and handed back to the
+        service on the other side, provided <varname>FileDescriptorStorePreserve=yes</varname> is set on
+        the service (see
+        <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>).
+        See the <ulink url="https://systemd.io/FILE_DESCRIPTOR_STORE">File Descriptor Store</ulink>
+        overview for details.</para>
 
         <xi:include href="version-info.xml" xpointer="v219"/></listitem>
       </varlistentry>

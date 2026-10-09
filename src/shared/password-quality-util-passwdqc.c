@@ -1,22 +1,21 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "password-quality-util-passwdqc.h"
-
 #include "errno-util.h"          /* IWYU pragma: keep */
 #include "log.h"                 /* IWYU pragma: keep */
+#include "password-quality-util-passwdqc.h"
 
 #if HAVE_PASSWDQC
+#ifndef SYSTEMD_CFLAGS_MARKER_LIBPWQUALITY
+#  error "missing libpwquality_cflags in meson dependency."
+#endif
 
 #include <passwdqc.h>
-
-#include "sd-dlopen.h"
 
 #include "alloc-util.h"
 #include "dlfcn-util.h"
 #include "memory-util.h"
+#include "password-quality-util.h"
 #include "strv.h"
-
-static void *passwdqc_dl = NULL;
 
 static DLSYM_PROTOTYPE(passwdqc_params_reset) = NULL;
 static DLSYM_PROTOTYPE(passwdqc_params_load) = NULL;
@@ -140,11 +139,9 @@ int check_password_quality(
 
 int dlopen_passwdqc(int log_level) {
 #if HAVE_PASSWDQC
-        SD_ELF_NOTE_DLOPEN(
-                        "passwdqc",
-                        "Support for password quality checks",
-                        SD_ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED,
-                        "libpasswdqc.so.1");
+        static void *passwdqc_dl = NULL;
+
+        LIBPASSWDQC_NOTE(suggested);
 
         return dlopen_many_sym_or_warn(
                         &passwdqc_dl, "libpasswdqc.so.1", log_level,

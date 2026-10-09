@@ -251,6 +251,24 @@ cgroupfs_supports_user_xattrs() {
     [[ "$(getfattr --name="$xattr" --absolute-names --only-values /sys/fs/cgroup)" -eq 254 ]]
 }
 
+socket_inode_supports_user_xattrs() {
+    local socket xattr
+
+    # The XAttr*= socket settings and "varlinkctl list-sockets" rely on extended
+    # attributes on socket inodes. This needs a sufficiently new kernel, but the
+    # kernel version alone is not a reliable indicator: some kernels that report
+    # >= 7.0 still reject user.* xattrs on socket inodes (with EPERM/EOPNOTSUPP).
+    # Hence probe for actual support, mirroring socket_xattr_supported() in the
+    # C code, by binding a throwaway socket and trying to tag it.
+    socket="$(mktemp -u /run/socket-xattr-probe.XXXXXX.sock)"
+    xattr="user.probe_$RANDOM"
+    # shellcheck disable=SC2064
+    trap "rm -f '$socket'" RETURN
+
+    python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$socket" || return 1
+    setfattr --name="$xattr" --value=1 "$socket" 2>/dev/null
+}
+
 tpm_has_pcr() {
     local algorithm="${1:?}"
     local pcr="${2:?}"
@@ -557,4 +575,117 @@ find_qemu_binary() {
     esac
 
     command -v "qemu-system-$arch" >/dev/null 2>&1
+}
+
+# Waits for a systemd-vmspawn machine to register with machined. If vmspawn bailed out because
+# vhost-user-fs isn't available (e.g. inside a nested VM) the test is skipped gracefully; any other
+# early vmspawn exit is treated as a failure. Args: machine name, vmspawn PID, vmspawn console log.
+wait_for_machine() {
+    local machine="$1" pid="$2" log="$3"
+    timeout 30 bash -c "
+        while ! machinectl list --no-legend 2>/dev/null | grep >/dev/null '$machine'; do
+            if ! kill -0 $pid 2>/dev/null; then
+                if grep >/dev/null 'virtiofs.*QMP\|vhost-user-fs-pci' '$log'; then
+                    echo 'vhost-user-fs not supported (nested VM?), skipping'
+                    exit 77
+                fi
+                echo 'vmspawn exited before registering'
+                cat '$log'
+                exit 1
+            fi
+            sleep .5
+        done
+    "
+}
+
+assert_unit_state() {
+    local unit=${1:?}
+    local activestate=${2:?}
+    local substate=${3:?}
+    local syspath=${4:-}
+
+    assert_eq "$(systemctl show -q --property=ActiveState --value "$unit")" "$activestate"
+    assert_eq "$(systemctl show -q --property=SubState --value "$unit")" "$substate"
+
+    if [[ -n "$syspath" ]]; then
+        assert_eq "$(systemctl show -q --property=SysFSPath --value "$unit")" "$syspath"
+    fi
+}
+
+assert_wc_l() {
+    local path=${1:?}
+    local expected=${2:?}
+    local lines=0
+
+    if [[ -f "$path" ]]; then
+        lines=$(wc -l <"$path")
+    fi
+
+    assert_eq "$lines" "$expected"
+}
+
+start_bound_service() {
+    local path=${1:?}
+    local name=${2:?}
+    local escaped
+
+    escaped=$(systemd-escape --path "$path")
+    escaped=${escaped//\\/\\\\} # escape backslash, as systemd-run unescapes it.
+
+    systemd-run \
+        -p After="${escaped}.device" \
+        -p BindsTo="${escaped}.device" \
+        -p ReloadPropagatedFrom="${escaped}.device" \
+        -p ExecStartPre="rm -f /tmp/testsleep-reload-${name}.txt" \
+        -p ExecReload="bash -c 'echo reloaded >>/tmp/testsleep-reload-${name}.txt'" \
+        -u "testsleep-${name}.service" \
+        sleep 1h
+
+    assert_unit_state "testsleep-${name}.service" active running
+    assert_wc_l "/tmp/testsleep-reload-${name}.txt" 0
+}
+
+get_invocation_id() {
+    local unit=${1:?}
+
+    systemctl show -q --property=InvocationID --value "$unit"
+}
+
+wait_for_inactive() {
+    local unit=${1:?}
+
+    # Note that do not use 'systemctl stop foo.device' to wait for the device unit to become inactive. Unlike
+    # 'systemctl start foo.device', which waits for the device unit to become active,
+    # 'systemctl stop foo.device' also kills device units with the same sysfs path and the units that depend
+    # on these device units.
+
+    # shellcheck disable=SC2016
+    timeout 30 bash -c 'until [[ "$(systemctl show -q --property=ActiveState --value '"$unit"')" == inactive ]]; do sleep .5; done'
+}
+
+kill_sleep_by_udevd() {
+    local pid comm
+    local -a pids
+
+    # Collect PIDs first, then kill: killing while reading cgroup.procs would
+    # mutate the set we are iterating over.
+
+    while read -r pid; do
+        read -r comm <"/proc/$pid/comm" 2>/dev/null || continue
+        [[ "${comm##*/}" == sleep ]] && pids+=("$pid")
+    done <"/sys/fs/cgroup$(systemctl show -P ControlGroup systemd-udevd.service)/workers/cgroup.procs"
+
+    for pid in "${pids[@]}"; do
+        kill "$pid" || :
+    done
+
+    return 0
+}
+
+device_get_udev_db() {
+    local dev=${1:?}
+    local id
+
+    id=$(udevadm info "$dev" | awk '/^J:/ { print $2 }')
+    echo /run/udev/data/"$id"
 }

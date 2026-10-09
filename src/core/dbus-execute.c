@@ -123,19 +123,20 @@ static int property_get_cpu_affinity(
         _cleanup_(cpu_set_done) CPUSet s = {};
         _cleanup_free_ uint8_t *array = NULL;
         size_t allocated;
+        int r;
 
         assert(bus);
         assert(reply);
 
         if (c->cpu_affinity_from_numa) {
-                int r;
-
                 r = numa_to_cpu_set(&c->numa_policy, &s);
                 if (r < 0)
                         return r;
         }
 
-        (void) cpu_set_to_dbus(c->cpu_affinity_from_numa ? &s : &c->cpu_set,  &array, &allocated);
+        r = cpu_set_to_dbus(c->cpu_affinity_from_numa ? &s : &c->cpu_set, &array, &allocated);
+        if (r < 0)
+                return r;
 
         return sd_bus_message_append_array(reply, 'y', array, allocated);
 }
@@ -1633,14 +1634,6 @@ int bus_property_get_exec_ex_command_list(
         return sd_bus_message_close_container(reply);
 }
 
-static char* exec_command_flags_to_exec_chars(ExecCommandFlags flags) {
-        return strjoin(FLAGS_SET(flags, EXEC_COMMAND_IGNORE_FAILURE)   ? "-" : "",
-                       FLAGS_SET(flags, EXEC_COMMAND_NO_ENV_EXPAND)    ? ":" : "",
-                       FLAGS_SET(flags, EXEC_COMMAND_FULLY_PRIVILEGED) ? "+" : "",
-                       FLAGS_SET(flags, EXEC_COMMAND_NO_SETUID)        ? "!" : "",
-                       FLAGS_SET(flags, EXEC_COMMAND_VIA_SHELL)        ? "|" : "");
-}
-
 int bus_set_transient_exec_command(
                 Unit *u,
                 const char *name,
@@ -1766,32 +1759,13 @@ int bus_set_transient_exec_command(
                 fprintf(f, "%s=\n", written_name);
 
                 LIST_FOREACH(command, c, *exec_command) {
-                        _cleanup_free_ char *a = NULL, *exec_chars = NULL;
-                        UnitWriteFlags esc_flags = UNIT_ESCAPE_SPECIFIERS |
-                                (FLAGS_SET(c->flags, EXEC_COMMAND_NO_ENV_EXPAND) ? UNIT_ESCAPE_EXEC_SYNTAX : UNIT_ESCAPE_EXEC_SYNTAX_ENV);
-                        bool via_shell = FLAGS_SET(c->flags, EXEC_COMMAND_VIA_SHELL);
+                        _cleanup_free_ char *a = NULL;
 
-                        exec_chars = exec_command_flags_to_exec_chars(c->flags);
-                        if (!exec_chars)
-                                return -ENOMEM;
+                        r = exec_command_to_setting(c, &a);
+                        if (r < 0)
+                                return r;
 
-                        a = unit_concat_strv(via_shell ? strv_skip(c->argv, 1) : c->argv, esc_flags);
-                        if (!a)
-                                return -ENOMEM;
-
-                        if (via_shell || streq(c->path, c->argv[0]))
-                                fprintf(f, "%s=%s%s%s\n",
-                                        written_name, exec_chars, via_shell && c->argv[0][0] == '-' ? "@" : "", a);
-                        else {
-                                _cleanup_free_ char *t = NULL;
-                                const char *p;
-
-                                p = unit_escape_setting(c->path, esc_flags, &t);
-                                if (!p)
-                                        return -ENOMEM;
-
-                                fprintf(f, "%s=%s@%s %s\n", written_name, exec_chars, p, a);
-                        }
+                        fprintf(f, "%s=%s\n", written_name, a);
                 }
 
                 r = memstream_finalize(&m, &buf, NULL);
@@ -2536,6 +2510,7 @@ int bus_exec_context_set_transient_property(
                 return 1;
 
         } else if (STR_IN_SET(name, "SetCredential", "SetCredentialEncrypted")) {
+                bool encrypted = endswith(name, "Encrypted");
                 bool isempty = true;
 
                 r = sd_bus_message_enter_container(message, 'a', "(say)");
@@ -2546,6 +2521,7 @@ int bus_exec_context_set_transient_property(
                         const char *id;
                         const void *p;
                         size_t sz;
+                        const char *err = NULL;
 
                         r = sd_bus_message_enter_container(message, 'r', "say");
                         if (r < 0)
@@ -2565,34 +2541,13 @@ int bus_exec_context_set_transient_property(
                         if (r < 0)
                                 return r;
 
-                        if (!credential_name_valid(id))
-                                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Credential ID is invalid: %s", id);
-
                         isempty = false;
 
-                        if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
-                                bool encrypted = endswith(name, "Encrypted");
-                                _cleanup_free_ char *a = NULL, *b = NULL;
-                                _cleanup_free_ void *copy = NULL;
-
-                                copy = memdup(p, sz);
-                                if (!copy)
-                                        return -ENOMEM;
-
-                                a = specifier_escape(id);
-                                if (!a)
-                                        return -ENOMEM;
-
-                                b = cescape_length(p, sz);
-                                if (!b)
-                                        return -ENOMEM;
-
-                                r = exec_context_put_set_credential(c, id, TAKE_PTR(copy), sz, encrypted);
-                                if (r < 0)
-                                        return r;
-
-                                (void) unit_write_settingf(u, flags, name, "%s=%s:%s", name, a, b);
-                        }
+                        r = exec_context_apply_set_credential(u, c, id, p, sz, encrypted, flags, &err);
+                        if (r == -EINVAL)
+                                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "%s: %s", err, id);
+                        if (r < 0)
+                                return r;
                 }
 
                 r = sd_bus_message_exit_container(message);
@@ -3456,29 +3411,14 @@ int bus_exec_context_set_transient_property(
                 if (r < 0)
                         return r;
 
-                if (!strv_env_is_valid(l))
+                r = exec_context_apply_environment(u, c, l, flags);
+                if (r == -E2BIG)
+                        return sd_bus_error_set(reterr_error, SD_BUS_ERROR_LIMITS_EXCEEDED,
+                                                "Too many environment assignments.");
+                if (r == -EINVAL)
                         return sd_bus_error_set(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Invalid environment block.");
-
-                if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
-                        if (strv_isempty(l)) {
-                                c->environment = strv_free(c->environment);
-                                unit_write_setting(u, flags, name, "Environment=");
-                        } else {
-                                _cleanup_free_ char *joined = NULL;
-                                char **e;
-
-                                joined = unit_concat_strv(l, UNIT_ESCAPE_SPECIFIERS|UNIT_ESCAPE_C);
-                                if (!joined)
-                                        return -ENOMEM;
-
-                                e = strv_env_merge(c->environment, l);
-                                if (!e)
-                                        return -ENOMEM;
-
-                                strv_free_and_replace(c->environment, e);
-                                unit_write_settingf(u, flags, name, "Environment=%s", joined);
-                        }
-                }
+                if (r < 0)
+                        return r;
 
                 return 1;
 
@@ -3490,6 +3430,9 @@ int bus_exec_context_set_transient_property(
                 if (r < 0)
                         return r;
 
+                if (strv_length(l) > ENVIRONMENT_ASSIGNMENTS_MAX)
+                        return sd_bus_error_set(reterr_error, SD_BUS_ERROR_LIMITS_EXCEEDED,
+                                                "Too many environment variable names or assignments.");
                 if (!strv_env_name_or_assignment_is_valid(l))
                         return sd_bus_error_set(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Invalid UnsetEnvironment= list.");
 
@@ -3642,6 +3585,9 @@ int bus_exec_context_set_transient_property(
                 if (r < 0)
                         return r;
 
+                if (strv_length(l) > ENVIRONMENT_ASSIGNMENTS_MAX)
+                        return sd_bus_error_set(reterr_error, SD_BUS_ERROR_LIMITS_EXCEEDED,
+                                                "Too many environment variable names.");
                 if (!strv_env_name_is_valid(l))
                         return sd_bus_error_set(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Invalid PassEnvironment= block.");
 

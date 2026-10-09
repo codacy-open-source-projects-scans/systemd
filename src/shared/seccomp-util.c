@@ -8,15 +8,14 @@
 #include <linux/seccomp.h>
 #include <sched.h>
 #include <sys/mman.h>
-#include <sys/prctl.h>
+#include <sys/prctl.h> /* IWYU pragma: keep */
+#include <sys/ptrace.h>
 #include <sys/shm.h>
 #include <sys/stat.h>
 
 #ifdef __mips__
 #include <asm/sgidefs.h>
 #endif
-
-#include "sd-dlopen.h"
 
 #include "af-list.h"
 #include "alloc-util.h"
@@ -34,8 +33,6 @@
 #include "strv.h"
 
 #if HAVE_SECCOMP
-static void *libseccomp_dl = NULL;
-
 DLSYM_PROTOTYPE(seccomp_api_get) = NULL;
 DLSYM_PROTOTYPE(seccomp_arch_add) = NULL;
 DLSYM_PROTOTYPE(seccomp_arch_exist) = NULL;
@@ -305,12 +302,11 @@ int seccomp_init_for_arch(scmp_filter_ctx *ret, uint32_t arch, uint32_t default_
 }
 
 static bool is_basic_seccomp_available(void) {
-        return prctl(PR_GET_SECCOMP, 0, 0, 0, 0) >= 0;
+        return prctl_safe(PR_GET_SECCOMP, 0, 0, 0, 0) >= 0;
 }
 
 static bool is_seccomp_filter_available(void) {
-        return prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, NULL, 0, 0) < 0 &&
-                errno == EFAULT;
+        return prctl_safe(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, 0, 0, 0) == -EFAULT;
 }
 
 bool is_seccomp_available(void) {
@@ -1341,7 +1337,7 @@ int seccomp_parse_syscall_filter(
                         if (!FLAGS_SET(flags, SECCOMP_PARSE_PERMISSIVE))
                                 return r;
 
-                        log_syntax(unit, FLAGS_SET(flags, SECCOMP_PARSE_LOG) ? LOG_WARNING : LOG_DEBUG, filename, line, r,
+                        log_syntax(unit, FLAGS_SET(flags, SECCOMP_PARSE_LOG) ? LOG_INFO : LOG_DEBUG, filename, line, r,
                                    "System call %s cannot be resolved as libseccomp is not available, ignoring: %m", name);
                         return 0;
                 }
@@ -2157,6 +2153,47 @@ int seccomp_filter_set_add(Hashmap *filter, bool add, const SyscallFilterSet *se
         return 0;
 }
 
+/* Block PTRACE_POKE{TEXT,DATA} FOLL_FORCE writes. A missing filter is a bypass, so unlike the other helpers
+ * this fails when the native architecture cannot be filtered. A secondary architecture the kernel refuses a
+ * filter for is skipped as everywhere else: it cannot run binaries either. */
+int seccomp_restrict_ptrace(void) {
+        uint32_t arch;
+        int r;
+
+        r = dlopen_libseccomp(LOG_DEBUG);
+        if (r < 0)
+                return r;
+
+        SECCOMP_FOREACH_LOCAL_ARCH(arch) {
+                _cleanup_(seccomp_releasep) scmp_filter_ctx seccomp = NULL;
+
+                r = seccomp_init_for_arch(&seccomp, arch, SCMP_ACT_ALLOW);
+                if (r < 0)
+                        return r;
+
+                r = add_seccomp_syscall_filter(seccomp, arch, SCMP_SYS(ptrace),
+                                               1, SCMP_A0(SCMP_CMP_EQ, PTRACE_POKETEXT));
+                if (r < 0)
+                        return r;
+
+                r = add_seccomp_syscall_filter(seccomp, arch, SCMP_SYS(ptrace),
+                                               1, SCMP_A0(SCMP_CMP_EQ, PTRACE_POKEDATA));
+                if (r < 0)
+                        return r;
+
+                r = sym_seccomp_load(seccomp);
+                if (r < 0) {
+                        if (ERRNO_IS_NEG_SECCOMP_FATAL(r) || arch == sym_seccomp_arch_native())
+                                return log_debug_errno(r, "Failed to apply ptrace restrictions for architecture %s: %m",
+                                                       seccomp_arch_to_string(arch));
+                        log_debug_errno(r, "Failed to apply ptrace restrictions for architecture %s, skipping: %m",
+                                        seccomp_arch_to_string(arch));
+                }
+        }
+
+        return 0;
+}
+
 int seccomp_lock_personality(unsigned long personality) {
         uint32_t arch;
         int r;
@@ -2520,18 +2557,16 @@ static int block_open_flag(scmp_filter_ctx seccomp, int flag) {
         else
                 any = true;
 
-#if defined(__SNR_openat2)
-        /* The new openat2() system call can't be filtered sensibly, see above. */
-        r = sym_seccomp_rule_add_exact(
-                        seccomp,
-                        SCMP_ACT_ERRNO(ENOSYS),
-                        SCMP_SYS(openat2),
-                        0);
-        if (r < 0)
-                log_debug_errno(r, "Failed to add filter for openat2: %m");
-        else
-                any = true;
-#endif
+        /* We can't reasonably filter openat2() here, because the flags are in an indirect struct instead of
+         * a regular scalar argument, see also the comment in seccomp_restrict_sxid() above. However,
+         * blocking it here causes an increasing number of issues as more software moves to openat2() without
+         * any fallback to open()/openat().
+         *
+         * Given that calling openat2() with O_SYNC is rather rare, and most of the heavy-lifting is done by
+         * filtering out the sync-family syscalls in seccomp_suppress_sync() below, let's just blanket-allow
+         * openat2() to avoid unnecessarily breaking stuff left and right when nspawn is running with
+         * --suppress-sync=yes. This means that we might issue a synchronous write when something calls
+         * openat2() with O_SYNC, but it is the best we can do at least until a better solution pops up. */
 
         return any ? 0 : r;
 }
@@ -2543,7 +2578,7 @@ int seccomp_suppress_sync(void) {
         /* This behaves slightly differently from SystemCallFilter=~@sync:0, in that negative fds (which
          * we can determine to be invalid) are still refused with EBADF. See #34478.
          *
-         * Additionally, O_SYNC/O_DSYNC are masked. */
+         * Additionally, O_SYNC/O_DSYNC are masked (except for openat2(), see above). */
 
         r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
@@ -2604,11 +2639,9 @@ int seccomp_suppress_sync(void) {
 
 int dlopen_libseccomp(int log_level) {
 #if HAVE_SECCOMP
-        SD_ELF_NOTE_DLOPEN(
-                        "seccomp",
-                        "Support for Seccomp Sandboxes",
-                        SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED,
-                        "libseccomp.so.2");
+        static void *libseccomp_dl = NULL;
+
+        LIBSECCOMP_NOTE(suggested);
 
         return dlopen_many_sym_or_warn(
                         &libseccomp_dl,

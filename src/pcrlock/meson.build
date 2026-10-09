@@ -12,9 +12,8 @@ executables += [
                         'pcrlock-firmware.c',
                 ),
                 'dependencies' : [
-                        libm,
                         libopenssl_cflags,
-                        tpm2,
+                        tpm2_cflags,
                 ],
                 'public' : true,
         },

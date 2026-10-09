@@ -5,27 +5,27 @@
 #include <unistd.h>
 
 #include "sd-daemon.h"
+#include "sd-json.h"
 
 #include "alloc-util.h"
 #include "build.h"
 #include "daemon-util.h"
+#include "dlopen-note.h"
 #include "env-util.h"
 #include "errno-util.h"
 #include "escape.h"
 #include "fd-util.h"
-#include "format-table.h"
 #include "format-util.h"
 #include "log.h"
 #include "main-func.h"
-#include "options.h"
 #include "pidfd-util.h"
 #include "pidref.h"
-#include "pretty-print.h"
 #include "process-util.h"
 #include "socket-netlink.h"
 #include "socket-util.h"
 #include "string-util.h"
 #include "strv.h"
+#include "verbs.h"
 
 static char **arg_listen = NULL;
 static bool arg_accept = false;
@@ -34,6 +34,14 @@ static char **arg_setenv = NULL;
 static char **arg_fdnames = NULL;
 static bool arg_inetd = false;
 static bool arg_now = false;
+
+COMMAND(
+        "systemd-socket-activate\0",
+        "Listen on sockets and launch child on connection.",
+        .argspec = "COMMAND…\0",
+        .footer = "Note: file descriptors from sd_listen_fds() will be passed through.",
+        .man_pages = "systemd-socket-activate(1)\0",
+);
 
 static int add_epoll(int epoll_fd, int fd) {
         struct epoll_event ev = {
@@ -319,37 +327,6 @@ static int install_chld_handler(void) {
         return 0;
 }
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        _cleanup_(table_unrefp) Table *options = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-socket-activate", "1", &link);
-        if (r < 0)
-                return log_oom();
-
-        r = option_parser_get_help_table(&options);
-        if (r < 0)
-                return r;
-
-        printf("%s [OPTIONS...] COMMAND ...\n"
-               "\n%sListen on sockets and launch child on connection.%s\n"
-               "\n%sOptions:%s\n",
-               program_invocation_short_name,
-               ansi_highlight(),
-               ansi_normal(),
-               ansi_underline(),
-               ansi_normal());
-
-        r = table_print_or_warn(options);
-        if (r < 0)
-                return r;
-
-        printf("\nNote: file descriptors from sd_listen_fds() will be passed through.\n"
-               "\nSee the %s for details.\n", link);
-        return 0;
-}
-
 static int parse_argv(int argc, char *argv[], char ***remaining_args) {
         assert(argc >= 0);
         assert(argv);
@@ -358,11 +335,11 @@ static int parse_argv(int argc, char *argv[], char ***remaining_args) {
         OptionParser opts = { argc, argv, OPTION_PARSER_STOP_AT_FIRST_NONOPTION };
         int r;
 
-        FOREACH_OPTION(c, &opts, /* on_error= */ return c)
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return help();
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();
@@ -422,7 +399,7 @@ static int parse_argv(int argc, char *argv[], char ***remaining_args) {
                                         log_warning("File descriptor name \"%s\" is not valid.", esc);
                                 }
 
-                        /* Empty optargs means one empty name */
+                        /* Empty argument means one empty name */
                         r = strv_extend_strv(&arg_fdnames,
                                              strv_isempty(names) ? STRV_MAKE("") : names,
                                              false);
@@ -440,6 +417,9 @@ static int parse_argv(int argc, char *argv[], char ***remaining_args) {
                             "Start instantly instead of waiting for connection"):
                         arg_now = true;
                         break;
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
         *remaining_args = option_parser_get_args(&opts);
@@ -467,6 +447,8 @@ static int run(int argc, char **argv) {
         _cleanup_close_ int epoll_fd = -EBADF;
         _cleanup_strv_free_ char **exec_argv = NULL;
         int r, n;
+
+        LIBSELINUX_NOTE(recommended);
 
         log_setup();
 

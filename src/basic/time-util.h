@@ -4,7 +4,7 @@
 #include <limits.h>
 #include <time.h>
 
-#include "basic-forward.h"
+#include "forward.h"
 
 #define PRI_NSEC PRIu64
 #define PRI_USEC PRIu64
@@ -55,6 +55,18 @@ typedef enum TimestampStyle {
 #define NSEC_PER_MONTH ((nsec_t) (2629800ULL*NSEC_PER_SEC))
 #define USEC_PER_YEAR ((usec_t) (31557600ULL*USEC_PER_SEC))
 #define NSEC_PER_YEAR ((nsec_t) (31557600ULL*NSEC_PER_SEC))
+
+enum {
+        WEEKDAY_MON,
+        WEEKDAY_TUE,
+        WEEKDAY_WED,
+        WEEKDAY_THU,
+        WEEKDAY_FRI,
+        WEEKDAY_SAT,
+        WEEKDAY_SUN,
+        _WEEKDAY_MAX,
+        _WEEKDAY_INVALID = -EINVAL,
+};
 
 /* We assume a maximum timezone length of 6. TZNAME_MAX is not defined on Linux, but glibc internally initializes this
  * to 6. Let's rely on that. */
@@ -116,6 +128,8 @@ struct timespec* timespec_store_nsec(struct timespec *ts, nsec_t n);
 #define TIMESPEC_STORE(u) timespec_store(&(struct timespec) {}, (u))
 #define TIMESPEC_STORE_NSEC(n) timespec_store_nsec(&(struct timespec) {}, (n))
 
+struct __kernel_timespec* kernel_timespec_store(struct __kernel_timespec *ts, usec_t u);
+
 usec_t timeval_load(const struct timeval *tv) _pure_;
 struct timeval* timeval_store(struct timeval *tv, usec_t u);
 
@@ -124,6 +138,10 @@ struct timeval* timeval_store(struct timeval *tv, usec_t u);
 char* format_timestamp_style(char *buf, size_t l, usec_t t, TimestampStyle style) _warn_unused_result_;
 char* format_timestamp_relative_full(char *buf, size_t l, usec_t t, clockid_t clock, bool implicit_left) _warn_unused_result_;
 char* format_timespan(char *buf, size_t l, usec_t t, usec_t accuracy) _warn_unused_result_;
+
+/* Returns the abbreviated English weekday name for wd in Mon=0 … Sun=6 order
+ * (matching systemd's weekdays_bits layout). */
+const char* weekday_to_string(int i);
 
 _warn_unused_result_
 static inline char* format_timestamp_relative(char *buf, size_t l, usec_t t) {
@@ -178,6 +196,7 @@ bool clock_supported(clockid_t clock);
 usec_t usec_shift_clock(usec_t x, clockid_t from, clockid_t to);
 
 int get_timezone(char **ret);
+int get_timezone_prefer_env(char **ret);
 const char* etc_localtime(void);
 
 int mktime_or_timegm_usec(struct tm *tm, bool utc, usec_t *ret);
@@ -199,6 +218,8 @@ static inline int parse_calendar_date(const char *s, usec_t *ret) {
 static inline int parse_birth_date(const char *s, struct tm *ret) {
         return parse_calendar_date_full(s, /* allow_pre_epoch= */ true, NULL, ret);
 }
+
+uint64_t sysconf_clock_ticks_cached(void);
 
 uint32_t usec_to_jiffies(usec_t usec);
 usec_t jiffies_to_usec(uint32_t jiffies);

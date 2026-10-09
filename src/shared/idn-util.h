@@ -1,9 +1,14 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "shared-forward.h"
+#include "dlopen-note.h"
+#include "forward.h"
 
 #if HAVE_LIBIDN2
+#ifndef SYSTEMD_CFLAGS_MARKER_LIBIDN2
+#  error "missing libidn2_cflags in meson dependency."
+#endif
+
 #include <idn2.h>
 
 #include "dlfcn-util.h"
@@ -13,4 +18,4 @@ extern const char *(*sym_idn2_strerror)(int rc) _const_;
 extern DLSYM_PROTOTYPE(idn2_to_unicode_8z8z);
 #endif
 
-int dlopen_idn(int log_level);
+int dlopen_idn(int log_level) _dlopen_loader_;

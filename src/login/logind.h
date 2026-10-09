@@ -31,6 +31,8 @@ typedef struct Manager {
         sd_device_monitor *device_button_monitor;
         sd_device_monitor *device_uaccess_monitor;
 
+        char **device_trigger_args;
+
         sd_event_source *console_active_event_source;
 
 #if ENABLE_UTMP
@@ -159,7 +161,7 @@ int manager_spawn_autovt(Manager *m, unsigned vtnr);
 
 bool manager_shall_kill(Manager *m, const char *user);
 
-int manager_get_idle_hint(Manager *m, dual_timestamp *t);
+bool manager_get_idle_hint(Manager *m, dual_timestamp *ret_timestamp);
 
 int manager_get_user_by_pid(Manager *m, pid_t pid, User **ret);
 int manager_get_session_by_pidref(Manager *m, const PidRef *pid, Session **ret);

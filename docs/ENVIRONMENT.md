@@ -35,11 +35,19 @@ All tools:
   no-ops. If that's what's explicitly desired, you might consider setting
   `$SYSTEMD_OFFLINE=1`.
 
+* `$SYSTEMD_IN_INITRD` — takes a boolean. If set, overrides initrd detection.
+  This is useful for debugging and testing initrd-only programs in the main
+  system.
+
 * `$SYSTEMD_FIRST_BOOT=0|1` — if set, assume "first boot" condition to be false
   or true, instead of checking the flag file created by PID 1.
 
-* `$SD_EVENT_PROFILE_DELAYS=1` — if set, the sd-event event loop implementation
-  will print latency information at runtime.
+* `$SYSTEMD_INVOKED_AS=name` — override argv[0] for detection of a multicall
+  binary. E.g. `SYSTEMD_INVOKED_AS=systemd-udevd build/udevadm`.
+
+* `$SYSTEMD_EXPERIMENTAL=0|1` — if set to true, experimental features may be
+  used. This variable is not checked if the build was configured with
+  "-Dexperimental=disabled".
 
 * `$SYSTEMD_PROC_CMDLINE` — if set, the contents are used as the kernel command
   line instead of the actual one in `/proc/cmdline`. This is useful for
@@ -72,13 +80,21 @@ All tools:
   `/etc/veritytab`. Only useful for debugging. Currently only supported by
   `systemd-veritysetup-generator`.
 
+* `$SYSTEMD_CLONETAB` — if set, use this path instead of
+  `/etc/clonetab`. Only useful for debugging. Currently only supported by
+  `systemd-clonesetup-generator`.
+
 * `$SYSTEMD_DEFAULT_HOSTNAME` — override the compiled-in fallback hostname
   (relevant in particular for the system manager and `systemd-hostnamed`).
   Must be a valid hostname (either a single label or a FQDN).
 
-* `$SYSTEMD_IN_INITRD` — takes a boolean. If set, overrides initrd detection.
-  This is useful for debugging and testing initrd-only programs in the main
-  system.
+* `$SYSTEMD_HOSTNAME_WORDLIST_PATH` — search this directory for the numbered
+  hostname word list files used by the `$` wildcard in hostname patterns (see
+  `hostname(5)`), instead of the built-in search path. Only useful for
+  debugging and testing.
+
+* `$SD_EVENT_PROFILE_DELAYS=1` — if set, the sd-event event loop implementation
+  will print latency information at runtime.
 
 * `$SYSTEMD_BUS_TIMEOUT=SECS` — specifies the maximum time to wait for method call
   completion. If no time unit is specified, assumes seconds. The usual other units
@@ -500,6 +516,17 @@ is suppressed by default.
   operation. If not set, defaults to true. If disabled installation of images
   will be quicker, but not as safe.
 
+`systemd-importd`/`systemd-pull` and `systemd-sysupdate`:
+
+* `$SYSTEMD_OPENPGP_KEYRING` — takes an absolute path to an OpenPGP keyring
+  file. If set and non-empty, signature verification on download uses this
+  keyring instead of the default `/etc/systemd/import-pubring.pgp`,
+  `/etc/systemd/import-pubring.gpg`, and `/usr/lib/systemd/import-pubring.pgp`
+  keyrings.
+  Useful when running unprivileged in the user context, with custom transfer
+  definitions (e.g. `systemd-sysupdate --definitions=…`), or for testing.
+  Has no effect when signature verification is disabled.
+
 `systemd-dissect`, `systemd-nspawn` and all other tools that may operate on
 disk images with `--image=` or similar:
 
@@ -712,6 +739,17 @@ SYSTEMD_HOME_DEBUG_SUFFIX=foo \
   to override the filesystem type for all partitions with `Type=root`, you can
   set `SYSTEMD_REPART_OVERRIDE_FSTYPE_ROOT=ext4`.
 
+`systemd-sysinstall`:
+
+* `$SYSTEMD_SYSINSTALL_PERMIT_AUTO_TARGET_LOOP` – takes a boolean. If true,
+  loopback block devices are considered as candidates when the installation
+  target device is picked automatically (i.e. when `--device-auto` is used).
+  By default, loopback devices are never picked automatically, since they are
+  hardly ever the disk an unattended installation is supposed to end up on.
+  This is primarily useful for testing purposes, where loopback devices are
+  used as stand-ins for real disks. Only honoured if `systemd-sysinstall` is
+  not invoked with elevated privileges (i.e. via `secure_getenv()`).
+
 `systemd-nspawn`, `systemd-networkd`:
 
 * `$SYSTEMD_FIREWALL_BACKEND` – takes a string, either `iptables` or
@@ -862,3 +900,10 @@ Tools using the Varlink protocol (such as `varlinkctl`) or sd-bus (such as
   'freshness' check via `BEST-BEFORE-YYYY-MM-DD` files in `SHA256SUMS` manifest
   files is disabled, and updating from outdated manifests will not result in an
   error.
+
+* `$SYSTEMD_SYSUPDATE_FORCE_NOTIFY` – takes a boolean. If true the notification
+  callouts in `/run/systemd/sysupdate/notify/` are invoked even when no update
+  was applied (i.e. the system was already up-to-date). In this case the
+  notification carries no list of updated resources. This is useful to
+  unconditionally trigger follow-up work such as relinking a kernel or
+  recomputing a TPM policy.

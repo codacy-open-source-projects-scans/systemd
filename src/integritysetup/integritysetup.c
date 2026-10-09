@@ -1,17 +1,18 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <stdio.h>
 #include <sys/stat.h>
 
+#include "sd-json.h"
+
 #include "alloc-util.h"
-#include "argv-util.h"
+#include "build.h"
 #include "cryptsetup-util.h"
+#include "dlopen-note.h"
 #include "fileio.h"
 #include "integrity-util.h"
 #include "log.h"
 #include "main-func.h"
 #include "path-util.h"
-#include "pretty-print.h"
 #include "string-table.h"
 #include "string-util.h"
 #include "time-util.h"
@@ -40,24 +41,11 @@ static const char* const dm_integrity_algorithm_table[_INTEGRITY_ALGORITHM_MAX] 
 
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(dm_integrity_algorithm, IntegrityAlgorithm);
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-integritysetup@.service", "8", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%s attach VOLUME DEVICE [HMAC_KEY_FILE|-] [OPTIONS]\n"
-               "%s detach VOLUME\n\n"
-               "Attach or detach an integrity protected block device.\n"
-               "\nSee the %s for details.\n",
-               program_invocation_short_name,
-               program_invocation_short_name,
-               link);
-
-        return 0;
-}
+COMMAND(
+        "systemd-integritysetup\0",
+        "Attach or detach an integrity protected block device.",
+        .man_pages = "systemd-integritysetup@.service(8)\0",
+);
 
 static int load_key_file(
                 const char *key_file,
@@ -94,6 +82,8 @@ static const char *integrity_algorithm_select(const void *key_file_buf) {
         return dm_integrity_algorithm_to_string(a);
 }
 
+VERB(verb_attach, "attach", "VOLUME DEVICE [HMAC_KEY_FILE|-] [OPTIONS]\0", 3, 5, 0,
+     "Attach an integrity protected block device");
 static int verb_attach(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(crypt_freep) struct crypt_device *cd = NULL;
         crypt_status_info status;
@@ -161,6 +151,8 @@ static int verb_attach(int argc, char *argv[], uintptr_t _data, void *userdata) 
         return 0;
 }
 
+VERB(verb_detach, "detach", "VOLUME\0", 2, 2, 0,
+     "Detach an integrity protected block device");
 static int verb_detach(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(crypt_freep) struct crypt_device *cd = NULL;
         int r;
@@ -189,13 +181,43 @@ static int verb_detach(int argc, char *argv[], uintptr_t _data, void *userdata) 
         return 0;
 }
 
+VERB_COMMON_HELP_AUTO_HIDDEN();
+
+static int parse_argv(int argc, char *argv[], char ***ret_args) {
+        assert(argc >= 0);
+        assert(argv);
+        assert(ret_args);
+
+        OptionParser opts = { argc, argv };
+
+        FOREACH_OPTION_OR_RETURN(c, &opts)
+                switch (c) {
+
+                OPTION_COMMON_HELP:
+                        return command_print_help();
+
+                OPTION_COMMON_VERSION:
+                        return version();
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
+                }
+
+        *ret_args = option_parser_get_args(&opts);
+        return 1;
+}
+
 static int run(int argc, char *argv[]) {
         int r;
 
-        if (argv_looks_like_help(argc, argv))
-                return help();
+        char **args = NULL;
+        r = parse_argv(argc, argv, &args);
+        if (r <= 0)
+                return r;
 
         log_setup();
+
+        LIBCRYPTSETUP_NOTE(required);
 
         r = dlopen_cryptsetup(LOG_ERR);
         if (r < 0)
@@ -203,13 +225,7 @@ static int run(int argc, char *argv[]) {
 
         umask(0022);
 
-        static const Verb verbs[] = {
-                { "attach", 3, 5, 0, verb_attach },
-                { "detach", 2, 2, 0, verb_detach },
-                {}
-        };
-
-        return dispatch_verb(argc, argv, verbs, NULL);
+        return dispatch_verb(args, /* userdata= */ NULL);
 }
 
 DEFINE_MAIN_FUNCTION(run);

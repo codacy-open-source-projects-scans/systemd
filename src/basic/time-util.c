@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <linux/time_types.h>
 #include <stdlib.h>
 #include <sys/timerfd.h>
 #include <threads.h>
@@ -292,6 +293,18 @@ struct timespec *timespec_store_nsec(struct timespec *ts, nsec_t n) {
         return ts;
 }
 
+struct __kernel_timespec *kernel_timespec_store(struct __kernel_timespec *ts, usec_t u) {
+        assert(ts);
+        /* struct __kernel_timespec has no encoding for "no timeout": io_uring expects a NULL pointer for
+         * that, so callers have to resolve USEC_INFINITY themselves. */
+        assert(u != USEC_INFINITY);
+
+        ts->tv_sec  = u / USEC_PER_SEC;
+        ts->tv_nsec = (u % USEC_PER_SEC) * NSEC_PER_USEC;
+
+        return ts;
+}
+
 usec_t timeval_load(const struct timeval *tv) {
         assert(tv);
 
@@ -321,24 +334,26 @@ struct timeval *timeval_store(struct timeval *tv, usec_t u) {
         return tv;
 }
 
+/* Returns the abbreviated English weekday name for wd in Mon=0 … Sun=6 order.
+ * We use non-localized (English) form so that timestamps can be parsed with
+ * parse_timestamp() and always read the same regardless of locale. */
+static const char *const weekday_table[_WEEKDAY_MAX] = {
+        [WEEKDAY_MON] = "Mon",
+        [WEEKDAY_TUE] = "Tue",
+        [WEEKDAY_WED] = "Wed",
+        [WEEKDAY_THU] = "Thu",
+        [WEEKDAY_FRI] = "Fri",
+        [WEEKDAY_SAT] = "Sat",
+        [WEEKDAY_SUN] = "Sun",
+};
+
+DEFINE_STRING_TABLE_LOOKUP_TO_STRING(weekday, int);
+
 char* format_timestamp_style(
                 char *buf,
                 size_t l,
                 usec_t t,
                 TimestampStyle style) {
-
-        /* The weekdays in non-localized (English) form. We use this instead of the localized form, so that
-         * our generated timestamps may be parsed with parse_timestamp(), and always read the same. */
-        static const char * const weekdays[] = {
-                [0] = "Sun",
-                [1] = "Mon",
-                [2] = "Tue",
-                [3] = "Wed",
-                [4] = "Thu",
-                [5] = "Fri",
-                [6] = "Sat",
-        };
-
         struct tm tm;
         bool utc, us;
         size_t n;
@@ -387,8 +402,9 @@ char* format_timestamp_style(
                 return NULL;
 
         /* Start with the week day */
-        assert((size_t) tm.tm_wday < ELEMENTSOF(weekdays));
-        memcpy(buf, weekdays[tm.tm_wday], 4);
+        const char *weekday = weekday_to_string(tm.tm_wday == 0 ? 6 : tm.tm_wday - 1);
+        assert(weekday);
+        memcpy(buf, weekday, 4);
 
         if (style == TIMESTAMP_DATE) {
                 /* Special format string if only date should be shown. */
@@ -1697,6 +1713,16 @@ int get_timezone(char **ret) {
         return strdup_to(ret, e);
 }
 
+int get_timezone_prefer_env(char **ret) {
+        assert(ret);
+
+        const char *e = getenv("TZ");
+        if (e && e[0] == ':' && timezone_is_valid(e + 1, LOG_DEBUG))
+                return strdup_to(ret, e + 1);
+
+        return get_timezone(ret);
+}
+
 const char* etc_localtime(void) {
         static const char *cached = NULL;
 
@@ -1756,27 +1782,26 @@ int localtime_or_gmtime_usec(
         return 0;
 }
 
-static uint32_t sysconf_clock_ticks_cached(void) {
-        static thread_local uint32_t hz = 0;
-        long r;
+uint64_t sysconf_clock_ticks_cached(void) {
+        static thread_local uint64_t hz = 0;
 
-        if (hz == 0) {
-                r = sysconf(_SC_CLK_TCK);
+        if (hz != 0)
+                return hz;
 
-                assert(r > 0);
-                hz = r;
-        }
+        long t = sysconf(_SC_CLK_TCK);
+        assert(t > 0);
+        hz = (uint64_t) t;
 
         return hz;
 }
 
 uint32_t usec_to_jiffies(usec_t u) {
-        uint32_t hz = sysconf_clock_ticks_cached();
+        uint64_t hz = sysconf_clock_ticks_cached();
         return DIV_ROUND_UP(u, USEC_PER_SEC / hz);
 }
 
 usec_t jiffies_to_usec(uint32_t j) {
-        uint32_t hz = sysconf_clock_ticks_cached();
+        uint64_t hz = sysconf_clock_ticks_cached();
         return DIV_ROUND_UP(j * USEC_PER_SEC, hz);
 }
 

@@ -173,21 +173,29 @@ int bus_message_map_all_properties(
                         if (r < 0)
                                 return bus_log_parse_error_debug(r);
 
-                        r = sd_bus_message_enter_container(m, SD_BUS_TYPE_VARIANT, contents);
-                        if (r < 0)
-                                return bus_log_parse_error_debug(r);
+                        if (prop->signature && !streq(contents, prop->signature)) {
+                                log_debug("Unexpected type for property '%s': expected '%s', got '%s', ignoring.",
+                                          member, prop->signature, contents);
+                                r = sd_bus_message_skip(m, "v");
+                                if (r < 0)
+                                        return bus_log_parse_error_debug(r);
+                        } else {
+                                r = sd_bus_message_enter_container(m, SD_BUS_TYPE_VARIANT, contents);
+                                if (r < 0)
+                                        return bus_log_parse_error_debug(r);
 
-                        v = (uint8_t *)userdata + prop->offset;
-                        if (map[i].set)
-                                r = prop->set(sd_bus_message_get_bus(m), member, m, reterr_error, v);
-                        else
-                                r = map_basic(m, flags, v);
-                        if (r < 0)
-                                return bus_log_parse_error_debug(r);
+                                v = (uint8_t*) userdata + prop->offset;
+                                if (prop->set)
+                                        r = prop->set(sd_bus_message_get_bus(m), member, m, reterr_error, v);
+                                else
+                                        r = map_basic(m, flags, v);
+                                if (r < 0)
+                                        return bus_log_parse_error_debug(r);
 
-                        r = sd_bus_message_exit_container(m);
-                        if (r < 0)
-                                return bus_log_parse_error_debug(r);
+                                r = sd_bus_message_exit_container(m);
+                                if (r < 0)
+                                        return bus_log_parse_error_debug(r);
+                        }
                 } else {
                         r = sd_bus_message_skip(m, "v");
                         if (r < 0)
@@ -206,6 +214,37 @@ int bus_message_map_all_properties(
                 return bus_log_parse_error_debug(r);
 
         return r;
+}
+
+int bus_get_all_properties(
+                sd_bus *bus,
+                const char *destination,
+                const char *path,
+                sd_bus_error *reterr_error,
+                sd_bus_message **ret_reply) {
+
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        int r;
+
+        assert(bus);
+        assert(destination);
+        assert(path);
+        assert(ret_reply);
+
+        r = sd_bus_call_method(
+                        bus,
+                        destination,
+                        path,
+                        "org.freedesktop.DBus.Properties",
+                        "GetAll",
+                        reterr_error,
+                        &reply,
+                        "s", "");
+        if (r < 0)
+                return r;
+
+        *ret_reply = TAKE_PTR(reply);
+        return 0;
 }
 
 int bus_map_all_properties(
@@ -227,15 +266,7 @@ int bus_map_all_properties(
         assert(map);
         assert(ret_reply || (flags & BUS_MAP_STRDUP));
 
-        r = sd_bus_call_method(
-                        bus,
-                        destination,
-                        path,
-                        "org.freedesktop.DBus.Properties",
-                        "GetAll",
-                        reterr_error,
-                        &reply,
-                        "s", "");
+        r = bus_get_all_properties(bus, destination, path, reterr_error, &reply);
         if (r < 0)
                 return r;
 

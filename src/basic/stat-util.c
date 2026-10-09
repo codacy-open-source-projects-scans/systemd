@@ -32,7 +32,7 @@ static int verify_stat_at(
         struct stat st;
         int r;
 
-        assert(fd >= 0 || IN_SET(fd, AT_FDCWD, XAT_FDROOT));
+        assert(wildcard_fd_is_valid(fd));
         assert(!isempty(path) || !follow);
         assert(verify_func);
 
@@ -342,21 +342,39 @@ bool stat_is_empty(struct stat *st) {
 }
 
 int null_or_empty_path_with_root(const char *fn, const char *root) {
+        _cleanup_free_ char *resolved = NULL;
+        _cleanup_close_ int fd = -EBADF;
         struct stat st;
         int r;
 
         assert(fn);
 
-        /* A symlink to /dev/null or an empty file?
-         * When looking under root_dir, we can't expect /dev/ to be mounted,
-         * so let's see if the path is a (possibly dangling) symlink to /dev/null. */
+        /* fn includes the root prefix. */
 
         if (path_equal(path_startswith(fn, root ?: "/"), "dev/null"))
                 return true;
 
-        r = chase_and_stat(fn, root, CHASE_PREFIX_ROOT, NULL, &st);
+        if (empty_or_root(root)) {
+                if (stat(fn, &st) < 0)
+                        return -errno;
+
+                return null_or_empty(&st);
+        }
+
+        /* An image below a root directory usually has no /dev/null, so a symlink to /dev/null dangles there.
+         * CHASE_NONEXISTENT resolves such a symlink without requiring the target to exist. */
+        r = chase(fn, root, CHASE_NONEXISTENT, &resolved, &fd);
         if (r < 0)
                 return r;
+
+        if (path_equal(path_startswith(resolved, root), "dev/null"))
+                return true;
+
+        if (r == 0)
+                return -ENOENT;
+
+        if (fstat(fd, &st) < 0)
+                return -errno;
 
         return null_or_empty(&st);
 }
@@ -418,7 +436,7 @@ int xstatx_full(int fd,
          *    STATX_MNT_ID if not.
          */
 
-        assert(fd >= 0 || IN_SET(fd, AT_FDCWD, XAT_FDROOT));
+        assert(wildcard_fd_is_valid(fd));
         assert((mandatory_mask & optional_mask) == 0);
         assert(!FLAGS_SET(xstatx_flags, XSTATX_MNT_ID_BEST) || !((mandatory_mask|optional_mask) & (STATX_MNT_ID|STATX_MNT_ID_UNIQUE)));
         assert(ret);
@@ -480,7 +498,7 @@ static int xfstatfs(int fd, struct statfs *ret) {
 int xstatfsat(int dir_fd, const char *path, struct statfs *ret) {
         _cleanup_close_ int fd = -EBADF;
 
-        assert(dir_fd >= 0 || IN_SET(dir_fd, AT_FDCWD, XAT_FDROOT));
+        assert(wildcard_fd_is_valid(dir_fd));
         assert(ret);
 
         if (!isempty(path)) {
@@ -737,6 +755,9 @@ bool stat_inode_unmodified(const struct stat *a, const struct stat *b) {
          * about contents of the file. The purpose here is to detect file contents changes, and nothing
          * else. */
 
+        assert(a);
+        assert(b);
+
         return stat_inode_same(a, b) &&
                 a->st_mtim.tv_sec == b->st_mtim.tv_sec &&
                 a->st_mtim.tv_nsec == b->st_mtim.tv_nsec &&
@@ -773,13 +794,17 @@ int statx_mount_same(const struct statx *a, const struct statx *b) {
 }
 
 usec_t statx_timestamp_load(const struct statx_timestamp *ts) {
+        assert(ts);
         return timespec_load(&(const struct timespec) { .tv_sec = ts->tv_sec, .tv_nsec = ts->tv_nsec });
 }
 nsec_t statx_timestamp_load_nsec(const struct statx_timestamp *ts) {
+        assert(ts);
         return timespec_load_nsec(&(const struct timespec) { .tv_sec = ts->tv_sec, .tv_nsec = ts->tv_nsec });
 }
 
 void inode_hash_func(const struct stat *q, struct siphash *state) {
+        assert(q);
+
         siphash24_compress_typesafe(q->st_dev, state);
         siphash24_compress_typesafe(q->st_ino, state);
 
@@ -790,6 +815,9 @@ void inode_hash_func(const struct stat *q, struct siphash *state) {
 
 int inode_compare_func(const struct stat *a, const struct stat *b) {
         int r;
+
+        assert(a);
+        assert(b);
 
         r = CMP(a->st_dev, b->st_dev);
         if (r != 0)
@@ -805,6 +833,8 @@ int inode_compare_func(const struct stat *a, const struct stat *b) {
 DEFINE_HASH_OPS_WITH_KEY_DESTRUCTOR(inode_hash_ops, struct stat, inode_hash_func, inode_compare_func, free);
 
 void inode_unmodified_hash_func(const struct stat *q, struct siphash *state) {
+        assert(q);
+
         inode_hash_func(q, state);
 
         siphash24_compress_typesafe(q->st_mtim.tv_sec, state);
@@ -827,6 +857,9 @@ void inode_unmodified_hash_func(const struct stat *q, struct siphash *state) {
 
 int inode_unmodified_compare_func(const struct stat *a, const struct stat *b) {
         int r;
+
+        assert(a);
+        assert(b);
 
         r = inode_compare_func(a, b);
         if (r != 0)

@@ -3,6 +3,8 @@
 #include <fcntl.h>
 #include <sys/vfs.h>
 
+#include "sd-json.h"
+
 #include "alloc-util.h"
 #include "blockdev-util.h"
 #include "btrfs-util.h"
@@ -11,19 +13,25 @@
 #include "device-util.h"
 #include "devnum-util.h"
 #include "dissect-image.h"
+#include "dlopen-note.h"
 #include "fd-util.h"
-#include "format-table.h"
 #include "format-util.h"
 #include "log.h"
 #include "main-func.h"
 #include "mountpoint-util.h"
-#include "options.h"
-#include "pretty-print.h"
 #include "resize-fs.h"
 #include "string-util.h"
+#include "verbs.h"
 
 static const char *arg_target = NULL;
 static bool arg_dry_run = false;
+
+COMMAND(
+        "systemd-growfs\0",
+        "Grow filesystem or encrypted payload to device size.",
+        .argspec = "MOUNTPOINT\0",
+        .man_pages = "systemd-growfs@.service(8)\0",
+);
 
 #if HAVE_LIBCRYPTSETUP
 static int resize_crypt_luks_device(dev_t devno, const char *fstype, dev_t main_devno) {
@@ -33,7 +41,7 @@ static int resize_crypt_luks_device(dev_t devno, const char *fstype, dev_t main_
         uint64_t size;
         int r;
 
-        r = dlopen_cryptsetup(LOG_ERR);
+        r = dlopen_cryptsetup(LOG_WARNING);
         if (r < 0)
                 return r;
 
@@ -127,46 +135,17 @@ static int maybe_resize_underlying_device(
         return 0;
 }
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        _cleanup_(table_unrefp) Table *options = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-growfs@.service", "8", &link);
-        if (r < 0)
-                return log_oom();
-
-        r = option_parser_get_help_table(&options);
-        if (r < 0)
-                return r;
-
-        printf("%s [OPTIONS...] /path/to/mountpoint\n\n"
-               "Grow filesystem or encrypted payload to device size.\n",
-               program_invocation_short_name);
-
-        printf("\n%sOptions:%s\n",
-               ansi_underline(),
-               ansi_normal());
-
-        r = table_print_or_warn(options);
-        if (r < 0)
-                return r;
-
-        printf("\nSee the %s for details.\n", link);
-        return 0;
-}
-
 static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
         OptionParser opts = { argc, argv };
 
-        FOREACH_OPTION(c, &opts, /* on_error= */ return c)
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return help();
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();
@@ -174,6 +153,9 @@ static int parse_argv(int argc, char *argv[]) {
                 OPTION('n', "dry-run", NULL, "Just print what would be done"):
                         arg_dry_run = true;
                         break;
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
         if (option_parser_get_n_args(&opts) != 1)
@@ -181,8 +163,7 @@ static int parse_argv(int argc, char *argv[]) {
                                        "%s expects exactly one argument (the mount point).",
                                        program_invocation_short_name);
 
-        arg_target = option_parser_get_args(&opts)[0];
-
+        arg_target = option_parser_get_arg(&opts, 0);
         return 1;
 }
 
@@ -192,6 +173,9 @@ static int run(int argc, char *argv[]) {
         uint64_t size, newsize;
         dev_t devno;
         int r;
+
+        LIBBLKID_NOTE(recommended);
+        LIBCRYPTSETUP_NOTE(recommended);
 
         log_setup();
 

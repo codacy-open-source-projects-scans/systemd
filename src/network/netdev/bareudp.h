@@ -3,13 +3,12 @@
 #pragma once
 
 #include "netdev.h"
-#include "shared-forward.h"
 
 typedef enum BareUDPProtocol {
-        BARE_UDP_PROTOCOL_IPV4    = ETH_P_IP,
-        BARE_UDP_PROTOCOL_IPV6    = ETH_P_IPV6,
-        BARE_UDP_PROTOCOL_MPLS_UC = ETH_P_MPLS_UC,
-        BARE_UDP_PROTOCOL_MPLS_MC = ETH_P_MPLS_MC,
+        BARE_UDP_PROTOCOL_IPV4,
+        BARE_UDP_PROTOCOL_IPV6,
+        BARE_UDP_PROTOCOL_MPLS_UC,
+        BARE_UDP_PROTOCOL_MPLS_MC,
         _BARE_UDP_PROTOCOL_MAX,
         _BARE_UDP_PROTOCOL_INVALID = -EINVAL,
 } BareUDPProtocol;

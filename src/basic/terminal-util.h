@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "basic-forward.h"
+#include "forward.h"
 
 /* Erase characters until the end of the line */
 #define ANSI_ERASE_TO_END_OF_LINE "\x1B[K"
@@ -88,9 +88,15 @@ int chvt(int vt);
 int read_one_char(FILE *f, char *ret, usec_t timeout, bool echo, bool *need_nl);
 int ask_char(char *ret, const char *replies, const char *fmt, ...) _printf_(3, 4);
 
-typedef int (*GetCompletionsCallback)(const char *key, char ***ret_list, void *userdata);
-int ask_string_full(char **ret, GetCompletionsCallback get_completions, void *userdata, const char *text, ...) _printf_(4, 5);
-#define ask_string(ret, text, ...) ask_string_full(ret, NULL, NULL, text, ##__VA_ARGS__)
+typedef enum GetCompletionsFlags {
+        /* Only return the items subject to preselection: typically you want to suppress meta entries such as
+         * "list" or alias entries if this flag is set. */
+        GET_COMPLETIONS_PRESELECT = 1 << 0,
+} GetCompletionsFlags;
+
+typedef int (*GetCompletionsCallback)(const char *key, GetCompletionsFlags flags, char ***ret_list, void *userdata);
+int ask_string_full(char **ret, const char *prefill, GetCompletionsCallback get_completions, void *userdata, const char *text, ...) _printf_(5, 6);
+#define ask_string(ret, text, ...) ask_string_full(ret, NULL, NULL, NULL, text, ##__VA_ARGS__)
 
 bool any_key_to_proceed(void);
 int show_menu(char **x, size_t n_columns, size_t column_width, unsigned ellipsize_percentage, const char *grey_prefix, bool with_numbers);
@@ -106,7 +112,7 @@ int vtnr_from_tty(const char *tty);
 
 void reset_dev_console_fd(int fd, bool switch_to_text);
 int lock_dev_console(void);
-int make_console_stdio(void);
+int make_console_stdio(bool switch_to_text);
 
 int getenv_columns(void);
 int fd_columns(int fd);

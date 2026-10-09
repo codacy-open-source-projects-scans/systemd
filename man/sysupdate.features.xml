@@ -81,8 +81,11 @@
       <varlistentry>
         <term><varname>Documentation=</varname></term>
 
-        <listitem><para>A user-presentable URL to documentation about this feature.
-        This setting supports specifier expansion; see below for details on supported specifiers.</para>
+        <listitem><para>One or more user-presentable URLs to documentation about this feature. This setting may be
+        specified more than once. If the empty string is assigned to this option, the list is reset, and all prior
+        assignments have no effect. It supports specifier expansion; see below for details on supported specifiers.</para>
+
+        <para>Support for specifying this setting more than once was added in version 262.</para>
 
         <xi:include href="version-info.xml" xpointer="v257"/></listitem>
       </varlistentry>
@@ -108,6 +111,53 @@
         by default.</para>
 
         <xi:include href="version-info.xml" xpointer="v257"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>Suggest=</varname></term>
+
+        <listitem><para>Takes a boolean argument. If true, this feature is suggested for enablement, if
+        false it is not. This does not enable the feature on its own, but is a hint surfaced by the update
+        tools (for example via the <option>--feature-suggested</option> switch of
+        <citerefentry><refentrytitle>systemd-sysupdate</refentrytitle><manvolnum>8</manvolnum></citerefentry>)
+        so that the system administrator or higher-level tooling may act on it.</para>
+
+        <para>If this setting is not specified, the <varname>SuggestOn…=</varname> conditions described below
+        are evaluated instead to determine whether the feature is suggested. If neither this setting nor any
+        <varname>SuggestOn…=</varname> condition is specified, the feature is not suggested.</para>
+
+        <xi:include href="version-info.xml" xpointer="v262"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>SuggestOnArchitecture=</varname></term>
+        <term><varname>SuggestOnFirmware=</varname></term>
+        <term><varname>SuggestOnVirtualization=</varname></term>
+        <term><varname>SuggestOnHost=</varname></term>
+        <term><varname>SuggestOnFraction=</varname></term>
+        <term><varname>SuggestOnKernelCommandLine=</varname></term>
+        <term><varname>SuggestOnVersion=</varname></term>
+        <term><varname>SuggestOnCredential=</varname></term>
+        <term><varname>SuggestOnSecurity=</varname></term>
+        <term><varname>SuggestOnOSRelease=</varname></term>
+        <term><varname>SuggestOnMachineTag=</varname></term>
+
+        <listitem><para>Suggest this feature for enablement depending on system properties. These settings
+        take the same arguments and implement the same semantics — including the leading <literal>!</literal>
+        for negation — as the identically-named
+        <varname>ConditionArchitecture=</varname>, <varname>ConditionFirmware=</varname>,
+        <varname>ConditionVirtualization=</varname>, <varname>ConditionHost=</varname>,
+        <varname>ConditionFraction=</varname>, <varname>ConditionKernelCommandLine=</varname>,
+        <varname>ConditionVersion=</varname>, <varname>ConditionCredential=</varname>,
+        <varname>ConditionSecurity=</varname>, <varname>ConditionOSRelease=</varname> and
+        <varname>ConditionMachineTag=</varname> settings for unit files, which are documented in
+        <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
+        The feature is suggested if all specified conditions apply. As with the <varname>Condition…=</varname>
+        settings, assigning an empty string to one of these resets the list.</para>
+
+        <para>These conditions are only evaluated if <varname>Suggest=</varname> is not specified.</para>
+
+        <xi:include href="version-info.xml" xpointer="v262"/></listitem>
       </varlistentry>
     </variablelist>
   </refsect1>
@@ -334,6 +384,7 @@ InstancesMax=2
       <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
       <member><citerefentry><refentrytitle>systemd-sysupdate</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
       <member><citerefentry><refentrytitle>sysupdate.d</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sysupdate.components</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
     </simplelist></para>
   </refsect1>
 

@@ -8,7 +8,7 @@
 #include "json-stream.h"
 #include "list.h"
 #include "pidref.h"
-#include "sd-forward.h"
+#include "forward.h"
 
 typedef enum VarlinkState {
         /* Client side states */
@@ -26,9 +26,13 @@ typedef enum VarlinkState {
         VARLINK_PROCESSING_METHOD,
         VARLINK_PROCESSING_METHOD_MORE,
         VARLINK_PROCESSING_METHOD_ONEWAY,
+        VARLINK_PROCESSING_METHOD_UPGRADE,
         VARLINK_PROCESSED_METHOD,
+        VARLINK_PROCESSED_METHOD_UPGRADE,
         VARLINK_PENDING_METHOD,
         VARLINK_PENDING_METHOD_MORE,
+        VARLINK_PENDING_METHOD_UPGRADE,
+        VARLINK_UPGRADING,
 
         /* Common states (only during shutdown) */
         VARLINK_PENDING_DISCONNECT,
@@ -60,23 +64,27 @@ typedef enum VarlinkState {
                VARLINK_PROCESSING_METHOD,               \
                VARLINK_PROCESSING_METHOD_MORE,          \
                VARLINK_PROCESSING_METHOD_ONEWAY,        \
+               VARLINK_PROCESSING_METHOD_UPGRADE,       \
                VARLINK_PROCESSED_METHOD,                \
+               VARLINK_PROCESSED_METHOD_UPGRADE,        \
                VARLINK_PENDING_METHOD,                  \
-               VARLINK_PENDING_METHOD_MORE)
+               VARLINK_PENDING_METHOD_MORE,             \
+               VARLINK_PENDING_METHOD_UPGRADE,          \
+               VARLINK_UPGRADING)
 
 /* Tests whether we are expected to generate a method call reply, i.e. are processing a method call, except
  * one with the ONEWAY flag set. */
 #define VARLINK_STATE_WANTS_REPLY(state)                \
         IN_SET(state,                                   \
                VARLINK_PROCESSING_METHOD,               \
-               VARLINK_PROCESSING_METHOD_MORE)
+               VARLINK_PROCESSING_METHOD_MORE,          \
+               VARLINK_PROCESSING_METHOD_UPGRADE)
 
 typedef struct sd_varlink {
         unsigned n_ref;
 
-        sd_varlink_server *server;
-
         VarlinkState state;
+        sd_varlink_server *server;
 
         /* Transport layer: input/output buffers, fd passing, output queue, read/write/parse
          * step functions, sd-event integration (input/output/time event sources, idle
@@ -88,6 +96,7 @@ typedef struct sd_varlink {
         unsigned n_pending;
 
         sd_varlink_reply_t reply_callback;
+        sd_varlink_upgrade_t upgrade_callback;
 
         sd_json_variant *current;
         sd_json_variant *current_collected;
@@ -101,13 +110,6 @@ typedef struct sd_varlink {
         int *previous_fds;
         size_t n_previous_fds;
         char *sentinel;
-
-        /* Per-call protocol-upgrade marker: set when the *current* method call carries the
-         * SD_VARLINK_METHOD_UPGRADE flag. Validated by sd_varlink_reply_and_upgrade() to
-         * ensure the caller's contract is honored. The transport-layer "stop reading at the
-         * next message boundary" behavior is governed independently by the JsonStream's
-         * bounded_reads flag. */
-        bool protocol_upgrade:1;
 
         void *userdata;
 
@@ -136,7 +138,8 @@ typedef struct sd_varlink_server {
 
         LIST_HEAD(VarlinkServerSocket, sockets);
 
-        Hashmap *methods;              /* Fully qualified symbol name of a method → VarlinkMethod */
+        Hashmap *methods;              /* Fully qualified symbol name of a method → sd_varlink_method_t */
+        Hashmap *fiber_methods;        /* Fully qualified symbol name of a fiber method → sd_varlink_method_t */
         Hashmap *interfaces;           /* Fully qualified interface name → VarlinkInterface* */
         Hashmap *symbols;              /* Fully qualified symbol name of method/error → VarlinkSymbol* */
         sd_varlink_connect_t connect_callback;
@@ -145,8 +148,12 @@ typedef struct sd_varlink_server {
         sd_event *event;
         int64_t event_priority;
 
-        unsigned n_connections;
         Hashmap *by_uid;               /* UID_TO_PTR(uid) → UINT_TO_PTR(n_connections) */
+        unsigned n_connections;
+        unsigned connections_max;
+        unsigned connections_per_uid_max;
+
+        bool exit_on_idle;
 
         void *userdata;
 
@@ -155,11 +162,6 @@ typedef struct sd_varlink_server {
         char *product;
         char *version;
         char *url;
-
-        unsigned connections_max;
-        unsigned connections_per_uid_max;
-
-        bool exit_on_idle;
 } sd_varlink_server;
 
 #define varlink_log_errno(v, error, fmt, ...)                           \

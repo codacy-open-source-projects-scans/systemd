@@ -1039,7 +1039,8 @@ void json_escape(
         assert(f);
         assert(p);
 
-        if (!(flags & OUTPUT_SHOW_ALL) && l >= JSON_THRESHOLD)
+        if (((flags & OUTPUT_SKIP_UNPRINTABLE) && !utf8_is_printable(p, l)) ||
+            (!(flags & OUTPUT_SHOW_ALL) && l >= JSON_THRESHOLD))
                 fputs("null", f);
 
         else if (!(flags & OUTPUT_SHOW_ALL) && !utf8_is_printable(p, l)) {
@@ -1124,6 +1125,8 @@ static int update_json_data(
                 r = sd_json_variant_new_null(&v);
         else if (utf8_is_printable(value, size))
                 r = sd_json_variant_new_stringn(&v, value, size);
+        else if (flags & OUTPUT_SKIP_UNPRINTABLE)
+                r = sd_json_variant_new_null(&v);
         else
                 r = sd_json_variant_new_array_bytes(&v, value, size);
         if (r < 0)
@@ -1249,6 +1252,12 @@ int journal_entry_to_json(
 
         h = hashmap_new(&json_data_hash_ops_free);
         if (!h)
+                return log_oom();
+
+        /* A typical entry has around twenty fields and this hashmap is built fresh for each one, so
+         * size it up front rather than rehashing repeatedly while filling it. */
+        r = hashmap_reserve(h, 32);
+        if (r < 0)
                 return log_oom();
 
         r = update_json_data(h, flags, "__CURSOR", cursor, SIZE_MAX);
@@ -1704,9 +1713,7 @@ static int add_matches_for_coredump_uid(sd_journal *j, MatchUnitFlag flags, cons
                 return 0;
 
         if (cached_uid == 0) {
-                const char *user = "systemd-coredump";
-
-                r = get_user_creds(&user, &cached_uid, NULL, NULL, NULL, 0);
+                r = get_user_creds("systemd-coredump", /* flags= */ 0, NULL, &cached_uid, NULL, NULL, NULL);
                 if (r < 0) {
                         log_debug_errno(r, "Failed to resolve systemd-coredump user, ignoring: %m");
                         cached_uid = UID_INVALID;

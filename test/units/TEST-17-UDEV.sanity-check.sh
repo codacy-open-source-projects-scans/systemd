@@ -8,7 +8,7 @@ set -o pipefail
 
 # Coverage test for udevadm
 
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 cleanup() {
     set +e
 
@@ -55,6 +55,7 @@ udevadm control -l notice
 udevadm control --log-level info
 udevadm control --log-level debug
 (! udevadm control -l hello)
+(! udevadm control -m 2147483648)
 
 # Check if processing queued events has been stopped.
 udevadm control --stop-exec-queue
@@ -119,7 +120,9 @@ udevadm info -e --json=short | jq . >/dev/null
 udevadm info -e --subsystem-match acpi >/dev/null
 udevadm info -e --subsystem-nomatch acpi >/dev/null
 udevadm info -e --attr-match ifindex=2 >/dev/null
+udevadm info -e --attr-match ifindex >/dev/null
 udevadm info -e --attr-nomatch ifindex=2 >/dev/null
+udevadm info -e --attr-nomatch ifindex >/dev/null
 udevadm info -e --property-match SUBSYSTEM=acpi >/dev/null
 udevadm info -e --tag-match systemd >/dev/null
 udevadm info -e --sysname-match lo >/dev/null
@@ -149,6 +152,7 @@ udevadm monitor -h
 udevadm settle
 udevadm settle -t 5
 udevadm settle -E /sys/class/net/$netdev
+(! udevadm settle /no/such/argument)
 udevadm settle -h
 
 udevadm test /dev/null
@@ -177,6 +181,8 @@ udevadm test -h
 
 # Builtins
 (! udevadm test-builtin aaaaa /dev/null)
+(! udevadm test-builtin k /dev/null)
+(! udevadm test-builtin key /dev/null)
 udevadm test-builtin blkid "$loopdev"
 (! udevadm test-builtin "btrfs" "$loopdev")
 (! udevadm test-builtin "btrfs aaaaa" "$loopdev")
@@ -276,6 +282,7 @@ udevadm trigger --parent-match /sys/class/net/$netdev --name-match /dev/null
 udevadm trigger --initialized-match
 udevadm trigger --initialized-nomatch
 udevadm trigger -w
+(! udevadm trigger --dry-run --wait-daemon=bad)
 udevadm trigger --uuid /sys/class/net/$netdev
 udevadm settle -t 300
 udevadm trigger --wait-daemon
@@ -298,6 +305,9 @@ udevadm wait -t 5 /sys/class/net/$netdev
 udevadm wait --initialized true /sys/class/net/$netdev
 udevadm wait --initialized false /sys/class/net/$netdev
 (! udevadm wait --initialized hello /sys/class/net/$netdev)
+udevadm wait --timeout=0 --removed /dev/no-such-test-device
+udevadm wait --timeout=0 --removed --initialized=no /dev/no-such-test-device
+udevadm wait --timeout=0 --initialized=no --removed /dev/no-such-test-device
 assert_rc 124 timeout 5 udevadm wait --removed /sys/class/net/$netdev
 udevadm wait --settle /sys/class/net/$netdev
 udevadm wait -h
@@ -307,7 +317,13 @@ udevadm lock --version
 for i in /dev/block/*; do
     udevadm lock --device "$i" --print
     udevadm lock --device "$i" true
+    # The command 'udevadm lock' opens and closes the whole block device, so it triggers an inotify event for
+    # the device and udevd triggers synthetic uevents for the device and its partitions. If the triggered
+    # uevents are being processed when the next command is called, the command may tentatively fail to
+    # resolve the referenced devlink. Hence, let's wait for all queued uevents to be processed.
+    udevadm settle --timeout=30
     (! udevadm lock --device "$i" false)
+    udevadm settle --timeout=30
 done
 for i in / /usr; do
     udevadm lock --backing "$i" --print

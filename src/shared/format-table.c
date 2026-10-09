@@ -1411,154 +1411,156 @@ int table_hide_column_from_display_internal(Table *t, ...) {
         return 0;
 }
 
-static int cell_data_compare(TableData *a, size_t index_a, TableData *b, size_t index_b) {
+static int cell_data_compare(TableData *a, TableData *b) {
         int r;
 
         assert(a);
         assert(b);
 
-        if (a->type == b->type) {
+        r = CMP(a->type == TABLE_EMPTY, b->type == TABLE_EMPTY);
+        if (r != 0)
+                return r;
 
-                /* We only define ordering for cells of the same data type. If cells with different data types are
-                 * compared we follow the order the cells were originally added in */
+        r = CMP(a->type, b->type);
+        if (r != 0)
+                return r;
 
-                switch (a->type) {
+        switch (a->type) {
 
-                case TABLE_STRING:
-                case TABLE_STRING_WITH_ANSI:
-                case TABLE_FIELD:
-                case TABLE_HEADER:
-                        return strcmp(a->string, b->string);
+        case TABLE_STRING:
+        case TABLE_STRING_WITH_ANSI:
+        case TABLE_FIELD:
+        case TABLE_HEADER:
+                return strcmp(a->string, b->string);
 
-                case TABLE_PATH:
-                case TABLE_PATH_BASENAME:
-                        return path_compare(a->string, b->string);
+        case TABLE_PATH:
+        case TABLE_PATH_BASENAME:
+                return path_compare(a->string, b->string);
 
-                case TABLE_VERSION:
-                        return strverscmp_improved(a->string, b->string);
+        case TABLE_VERSION:
+                return strverscmp_improved(a->string, b->string);
 
-                case TABLE_STRV:
-                case TABLE_STRV_WRAPPED:
-                        return strv_compare(a->strv, b->strv);
+        case TABLE_STRV:
+        case TABLE_STRV_WRAPPED:
+                return strv_compare(a->strv, b->strv);
 
-                case TABLE_BOOLEAN:
-                case TABLE_BOOLEAN_CHECKMARK:
-                        if (!a->boolean && b->boolean)
-                                return -1;
-                        if (a->boolean && !b->boolean)
-                                return 1;
-                        return 0;
+        case TABLE_BOOLEAN:
+        case TABLE_BOOLEAN_CHECKMARK:
+                if (!a->boolean && b->boolean)
+                        return -1;
+                if (a->boolean && !b->boolean)
+                        return 1;
+                return 0;
 
-                case TABLE_TRISTATE:
-                        /* NB: we do not use CMP() here, since we want to collapse all negative and all
-                         * positive into one bucket each. */
-                        if ((a->tristate < 0 && b->tristate >= 0) ||
-                            (a->tristate == 0 && b->tristate > 0))
-                                return -1;
+        case TABLE_TRISTATE:
+                /* NB: we do not use CMP() here, since we want to collapse all negative and all
+                 * positive into one bucket each. */
+                if ((a->tristate < 0 && b->tristate >= 0) ||
+                    (a->tristate == 0 && b->tristate > 0))
+                        return -1;
 
-                        if ((b->tristate < 0 && a->tristate >= 0) ||
-                            (b->tristate == 0 && a->tristate > 0))
-                                return 1;
-                        return 0;
+                if ((b->tristate < 0 && a->tristate >= 0) ||
+                    (b->tristate == 0 && a->tristate > 0))
+                        return 1;
+                return 0;
 
-                case TABLE_TIMESTAMP:
-                case TABLE_TIMESTAMP_UTC:
-                case TABLE_TIMESTAMP_RELATIVE:
-                case TABLE_TIMESTAMP_RELATIVE_MONOTONIC:
-                case TABLE_TIMESTAMP_LEFT:
-                case TABLE_TIMESTAMP_DATE:
-                        return CMP(a->timestamp, b->timestamp);
+        case TABLE_TIMESTAMP:
+        case TABLE_TIMESTAMP_UTC:
+        case TABLE_TIMESTAMP_RELATIVE:
+        case TABLE_TIMESTAMP_RELATIVE_MONOTONIC:
+        case TABLE_TIMESTAMP_LEFT:
+        case TABLE_TIMESTAMP_DATE:
+                return CMP(a->timestamp, b->timestamp);
 
-                case TABLE_TIMESPAN:
-                case TABLE_TIMESPAN_MSEC:
-                case TABLE_TIMESPAN_DAY:
-                        return CMP(a->timespan, b->timespan);
+        case TABLE_TIMESPAN:
+        case TABLE_TIMESPAN_MSEC:
+        case TABLE_TIMESPAN_DAY:
+                return CMP(a->timespan, b->timespan);
 
-                case TABLE_SIZE:
-                case TABLE_BPS:
-                        return CMP(a->size, b->size);
+        case TABLE_SIZE:
+        case TABLE_BPS:
+                return CMP(a->size, b->size);
 
-                case TABLE_INT:
-                case TABLE_SIGNAL:
-                        return CMP(a->int_val, b->int_val);
+        case TABLE_INT:
+        case TABLE_SIGNAL:
+                return CMP(a->int_val, b->int_val);
 
-                case TABLE_INT8:
-                        return CMP(a->int8, b->int8);
+        case TABLE_INT8:
+                return CMP(a->int8, b->int8);
 
-                case TABLE_INT16:
-                        return CMP(a->int16, b->int16);
+        case TABLE_INT16:
+                return CMP(a->int16, b->int16);
 
-                case TABLE_INT32:
-                        return CMP(a->int32, b->int32);
+        case TABLE_INT32:
+                return CMP(a->int32, b->int32);
 
-                case TABLE_INT64:
-                        return CMP(a->int64, b->int64);
+        case TABLE_INT64:
+                return CMP(a->int64, b->int64);
 
-                case TABLE_UINT:
-                        return CMP(a->uint_val, b->uint_val);
+        case TABLE_UINT:
+                return CMP(a->uint_val, b->uint_val);
 
-                case TABLE_UINT8:
-                        return CMP(a->uint8, b->uint8);
+        case TABLE_UINT8:
+                return CMP(a->uint8, b->uint8);
 
-                case TABLE_UINT16:
-                        return CMP(a->uint16, b->uint16);
+        case TABLE_UINT16:
+                return CMP(a->uint16, b->uint16);
 
-                case TABLE_UINT32:
-                case TABLE_UINT32_HEX:
-                case TABLE_UINT32_HEX_0x:
-                        return CMP(a->uint32, b->uint32);
+        case TABLE_UINT32:
+        case TABLE_UINT32_HEX:
+        case TABLE_UINT32_HEX_0x:
+                return CMP(a->uint32, b->uint32);
 
-                case TABLE_UINT64:
-                case TABLE_UINT64_HEX:
-                case TABLE_UINT64_HEX_0x:
-                        return CMP(a->uint64, b->uint64);
+        case TABLE_UINT64:
+        case TABLE_UINT64_HEX:
+        case TABLE_UINT64_HEX_0x:
+                return CMP(a->uint64, b->uint64);
 
-                case TABLE_PERCENT:
-                        return CMP(a->percent, b->percent);
+        case TABLE_PERCENT:
+                return CMP(a->percent, b->percent);
 
-                case TABLE_IFINDEX:
-                        return CMP(a->ifindex, b->ifindex);
+        case TABLE_IFINDEX:
+                return CMP(a->ifindex, b->ifindex);
 
-                case TABLE_IN_ADDR:
-                        return CMP(a->address.in.s_addr, b->address.in.s_addr);
+        case TABLE_IN_ADDR:
+                return CMP(a->address.in.s_addr, b->address.in.s_addr);
 
-                case TABLE_IN6_ADDR:
-                        return memcmp(&a->address.in6, &b->address.in6, FAMILY_ADDRESS_SIZE(AF_INET6));
+        case TABLE_IN6_ADDR:
+                return memcmp(&a->address.in6, &b->address.in6, FAMILY_ADDRESS_SIZE(AF_INET6));
 
-                case TABLE_UUID:
-                case TABLE_ID128:
-                        return memcmp(&a->id128, &b->id128, sizeof(sd_id128_t));
+        case TABLE_UUID:
+        case TABLE_ID128:
+                return memcmp(&a->id128, &b->id128, sizeof(sd_id128_t));
 
-                case TABLE_UID:
-                        return CMP(a->uid, b->uid);
+        case TABLE_UID:
+                return CMP(a->uid, b->uid);
 
-                case TABLE_GID:
-                        return CMP(a->gid, b->gid);
+        case TABLE_GID:
+                return CMP(a->gid, b->gid);
 
-                case TABLE_PID:
-                        return CMP(a->pid, b->pid);
+        case TABLE_PID:
+                return CMP(a->pid, b->pid);
 
-                case TABLE_MODE:
-                case TABLE_MODE_INODE_TYPE:
-                        return CMP(a->mode, b->mode);
+        case TABLE_MODE:
+        case TABLE_MODE_INODE_TYPE:
+                return CMP(a->mode, b->mode);
 
-                case TABLE_DEVNUM:
-                        r = CMP(major(a->devnum), major(b->devnum));
-                        if (r != 0)
-                                return r;
+        case TABLE_DEVNUM:
+                r = CMP(major(a->devnum), major(b->devnum));
+                if (r != 0)
+                        return r;
 
-                        return CMP(minor(a->devnum), minor(b->devnum));
+                return CMP(minor(a->devnum), minor(b->devnum));
 
-                case TABLE_JSON:
-                        return json_variant_compare(a->json, b->json);
+        case TABLE_JSON:
+                return json_variant_compare(a->json, b->json);
 
-                default:
-                        ;
-                }
+        case TABLE_EMPTY:
+                return 0;
+
+        default:
+                assert_not_reached();
         }
-
-        /* Generic fallback using the original order in which the cells where added. */
-        return CMP(index_a, index_b);
 }
 
 static int table_data_compare(const size_t *a, const size_t *b, Table *t) {
@@ -1586,7 +1588,7 @@ static int table_data_compare(const size_t *a, const size_t *b, Table *t) {
                 d = t->data[*a + t->sort_map[i]];
                 dd = t->data[*b + t->sort_map[i]];
 
-                r = cell_data_compare(d, *a, dd, *b);
+                r = cell_data_compare(d, dd);
                 if (r != 0)
                         return t->reverse_map && t->reverse_map[t->sort_map[i]] ? -r : r;
         }
@@ -2077,18 +2079,23 @@ static char* align_string_mem(const char *str, const char *url, size_t new_lengt
         } else
                 clickable_length = old_length;
 
-        /* Determine current width on screen */
+        /* Determine current width on screen. Use the same helper the measuring pass uses, so that this
+         * function cannot keep a second, more permissive idea of both validity and width of its own.
+         * Note that our caller only gets here after utf8_console_width() succeeded on the very same
+         * string, so the invalid case below should not be reachable in practice. */
         p = str;
         while (p < str + old_length) {
-                char32_t c;
-
-                if (utf8_encoded_to_unichar(p, &c) < 0) {
-                        p++, w++; /* count invalid chars as 1 */
+                int n = utf8_char_console_width(p);
+                if (n < 0) {
+                        /* Count an invalid sequence as one character of width one. Skip all of it, so
+                         * that its continuation bytes are not charged a cell each of their own. */
+                        p = utf8_next_char(p);
+                        w++;
                         continue;
                 }
 
                 p = utf8_next_char(p);
-                w += unichar_iswide(c) ? 2 : 1;
+                w += n;
         }
 
         /* Already wider than the target, if so, don't do anything */
@@ -2170,7 +2177,7 @@ static const char* table_data_rgap_underline(const TableData *d) {
         return NULL;
 }
 
-int table_data_requested_width(Table *table, size_t column, size_t *ret) {
+static int table_data_requested_width(Table *table, size_t column, size_t *ret) {
         size_t width = 0;
         int r;
 
@@ -2216,44 +2223,31 @@ int table_set_column_width(Table *t, size_t column, size_t width) {
         return r;
 }
 
-int _table_sync_column_widths(size_t column, Table *a, ...) {
+int table_sync_all_column_widths(size_t column, Table **a) {
         size_t max = 0;
-        va_list ap;
-        int r = 0;
-
-        assert(a);
+        int r;
 
         /* Make the specified column have the same width in the tables. */
 
-        va_start(ap, a);
-        for (Table *t = a; t; t = va_arg(ap, Table*)) {
+        for (Table **t = a; t && *t; t++) {
                 size_t w;
 
-                r = table_data_requested_width(t, column, &w);
+                r = table_data_requested_width(*t, column, &w);
                 if (r < 0)
-                        break;
+                        return log_error_errno(r, "Failed to query table column width: %m");
 
                 max = MAX(max, w);
         }
-        va_end(ap);
-        if (r < 0)
-                return log_error_errno(r, "Failed to query table column width: %m");
 
         r = 0;
-        va_start(ap, a);
-        for (Table *t = a; t; t = va_arg(ap, Table*))
-                RET_GATHER(r, table_set_column_width(t, column, max));
-        va_end(ap);
+        for (Table **t = a; t && *t; t++)
+                RET_GATHER(r, table_set_column_width(*t, column, max));
 
         return r;
 }
 
 int table_print_full(Table *t, FILE *f, bool flush) {
-        size_t n_rows, *minimum_width, *maximum_width, display_columns, *requested_width,
-                table_minimum_width, table_maximum_width, table_requested_width, table_effective_width,
-                *width = NULL;
         _cleanup_free_ size_t *sorted = NULL;
-        uint64_t *column_weight, weight_sum;
         int r;
 
         assert(t);
@@ -2264,7 +2258,7 @@ int table_print_full(Table *t, FILE *f, bool flush) {
         /* Ensure we have no incomplete rows */
         assert(t->n_cells % t->n_columns == 0);
 
-        n_rows = t->n_cells / t->n_columns;
+        size_t n_rows = t->n_cells / t->n_columns;
         assert(n_rows > 0); /* at least the header row must be complete */
 
         if (t->sort_map) {
@@ -2280,17 +2274,14 @@ int table_print_full(Table *t, FILE *f, bool flush) {
                 typesafe_qsort_r(sorted, n_rows, table_data_compare, t);
         }
 
-        if (t->display_map)
-                display_columns = t->n_display_map;
-        else
-                display_columns = t->n_columns;
-
+        size_t display_columns = t->display_map ? t->n_display_map : t->n_columns;
         assert(display_columns > 0);
 
-        minimum_width = newa(size_t, display_columns);
-        maximum_width = newa(size_t, display_columns);
-        requested_width = newa(size_t, display_columns);
-        column_weight = newa0(uint64_t, display_columns);
+        size_t *minimum_width = newa(size_t, display_columns),
+                *maximum_width = newa(size_t, display_columns),
+                *requested_width = newa(size_t, display_columns),
+                *width = NULL;
+        uint64_t *column_weight = newa0(uint64_t, display_columns);
 
         for (size_t j = 0; j < display_columns; j++) {
                 minimum_width[j] = 1;
@@ -2373,10 +2364,11 @@ int table_print_full(Table *t, FILE *f, bool flush) {
                 }
 
                 /* One space between each column */
+                size_t table_requested_width, table_minimum_width, table_maximum_width, table_effective_width;
                 table_requested_width = table_minimum_width = table_maximum_width = display_columns - 1;
 
                 /* Calculate the total weight for all columns, plus the minimum, maximum and requested width for the table. */
-                weight_sum = 0;
+                uint64_t weight_sum = 0;
                 for (size_t j = 0; j < display_columns; j++) {
                         weight_sum += column_weight[j];
 

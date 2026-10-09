@@ -80,6 +80,7 @@ fchmodat2	452
 fchown	55
 fchown32
 fchownat	54
+fchroot	472
 fcntl
 fcntl64	25
 fdatasync	83
@@ -359,6 +360,7 @@ riscv_flush_icache	259
 riscv_hwprobe	258
 rmdir
 rseq	293
+rseq_slice_yield	471
 rt_sigaction	134
 rt_sigpending	136
 rt_sigprocmask	135

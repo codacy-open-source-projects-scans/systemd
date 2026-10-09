@@ -94,6 +94,28 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   }
   ```
 
+- Braces in `if` blocks are not required to be symmetric. Write this:
+
+  ```c
+  if (foobar)
+          waldo();
+  else {
+          foo();
+          bar();
+  }
+  ```
+
+  instead of this:
+
+  ```c
+  if (foobar) {
+          waldo();
+  } else {
+          foo();
+          bar();
+  }
+  ```
+
 - Do not write `foo ()`, write `foo()`.
 
 - `else` blocks should generally start on the same line as the closing `}`:
@@ -280,9 +302,9 @@ SPDX-License-Identifier: LGPL-2.1-or-later
     inline functions that require the full definition of a struct into the
     implementation file so that only a forward declaration of the struct is
     required and not the full definition.
-  - `src/basic/basic-forward.h` contains forward declarations for common types.
-    If possible, only include `basic-forward.h` in header files which makes
-    circular header dependencies a non-issue.
+  - `src/basic/forward.h` contains forward declarations for common types. If
+    possible, only include `forward.h` in header files which makes circular
+    header dependencies a non-issue.
 
   Bad:
 
@@ -360,16 +382,15 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 
   For common code, there are three different forward declaration headers:
 
-  - `src/basic`: `basic-forward.h`
-  - `src/libsystemd`: `sd-forward.h`
-  - `src/libsystemd-network`: `sd-forward.h`
-  - `src/shared`: `shared-forward.h`
+  - `src/basic/forward.h`
+  - `src/libsystemd/forward.h`
+  - `src/shared/forward.h`
 
   Header files that extend other header files can include the original header
-  file. For example, `iovec-util.h` includes `iovec-fundamental.h` and
-  `sys/uio.h`. To identify headers that are exported from other headers, add a
-  `IWYU pragma: export` comment to the includes so that these exports are
-  recognized by clang static analysis tooling.
+  file. For example, `iovec-util.h` includes `sys/uio.h`. To identify headers
+  that are exported from other headers, add a `IWYU pragma: export` comment
+  to the includes so that these exports are recognized by clang static analysis
+  tooling.
 
   Bad:
 
@@ -390,7 +411,7 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   ```c
   // source.h
 
-  #include "basic-forward.h"
+  #include "forward.h"
 
   void my_function_that_logs(size_t sz);
 
@@ -615,6 +636,31 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   …
   r = RET_NERRNO(open("/some/file", O_RDONLY|O_CLOEXEC));
   …
+  ```
+
+- Handle an error in an `if (r < 0)` block that returns, and do the work that
+  depends on success after that block. The error path then has nothing to undo.
+  Write this:
+
+  ```c
+  r = set_ensure_put(&m->watchers, &trivial_hash_ops, w);
+  if (r < 0)
+          return log_error_errno(r, "Failed to add watcher: %m");
+
+  w->manager = m;
+  return 0;
+  ```
+
+  instead of this:
+
+  ```c
+  w->manager = m;
+  r = set_ensure_put(&m->watchers, &trivial_hash_ops, w);
+  if (r >= 0)
+          return 0;
+
+  w->manager = NULL;
+  return log_error_errno(r, "Failed to add watcher: %m");
   ```
 
 - Do not bother with error checking whether writing to stdout/stderr worked.

@@ -8,16 +8,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "sd-json.h"
+
 #include "alloc-util.h"
 #include "build.h"
 #include "device-nodes.h"
 #include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "format-table.h"
-#include "help-util.h"
 #include "main-func.h"
-#include "options.h"
 #include "parse-util.h"
 #include "scsi_id.h"
 #include "string-util.h"
@@ -25,6 +24,7 @@
 #include "strxcpyx.h"
 #include "udev-util.h"
 #include "utf8.h"
+#include "verbs.h"
 
 static bool all_good = false;
 static bool dev_specified = false;
@@ -39,6 +39,12 @@ static char vendor_enc_str[256];
 static char model_enc_str[256];
 static char revision_str[16];
 static char type_str[16];
+
+COMMAND(
+        "scsi_id\0",
+        "Identify SCSI devices.",
+        .argspec = "[DEVICE]\0",
+);
 
 static void set_type(unsigned type_num, char *to, size_t len) {
         const char *type;
@@ -206,21 +212,6 @@ static int parse_page_code(const char *value, enum page_code *ret) {
         return 0;
 }
 
-static int help(void) {
-        _cleanup_(table_unrefp) Table *options = NULL;
-        int r;
-
-        r = option_parser_get_help_table(&options);
-        if (r < 0)
-                return r;
-
-        help_cmdline("[OPTION...] DEVICE");
-        help_abstract("SCSI device identification.");
-        help_section("Options:");
-
-        return table_print_or_warn(options);
-}
-
 static int set_options(int argc, char **argv, char *maj_min_dev) {
         assert(argc >= 0);
         assert(argv);
@@ -228,13 +219,14 @@ static int set_options(int argc, char **argv, char *maj_min_dev) {
         OptionParser opts = { argc, argv };
         int r;
 
-        FOREACH_OPTION(c, &opts, /* on_error= */ return c)
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return help();
+                        return command_print_help();
 
-                OPTION_COMMON_VERSION_WITH_HIDDEN_V:
+                OPTION_COMMON_VERSION: {}
+                OPTION_SHORT('V', NULL, /* help= */ NULL): /* -V is accepted but not documented. */
                         return version();
 
                 OPTION('d', "device", "PATH", "Device node for SG_IO commands"):
@@ -284,6 +276,9 @@ static int set_options(int argc, char **argv, char *maj_min_dev) {
                 OPTION('x', "export", NULL, "Print values as environment keys"):
                         export = true;
                         break;
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
         char **args = option_parser_get_args(&opts);
@@ -319,7 +314,7 @@ static int per_dev_options(struct scsi_id_device *dev_scsi, int *good_bad, enum 
         /* We reuse the option parser, but only a subset of the options is supported here.
          * If any others are encountered, return an error. */
 
-        FOREACH_OPTION(c, &opts, /* on_error= */ return c)
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 if (opts.opt->short_code == 'b')
                         *good_bad = 0;
                 else if (opts.opt->short_code == 'g')
@@ -328,10 +323,13 @@ static int per_dev_options(struct scsi_id_device *dev_scsi, int *good_bad, enum 
                         r = parse_page_code(opts.arg, page_code);
                         if (r < 0)
                                 return r;
-                } else
+                } else {
+                        _cleanup_free_ char *synopsis =
+                                option_get_synopsis(opts.opt, "/", /* show_metavar=*/ false);
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "Option %s not supported in the config file.",
-                                               strnull(option_get_synopsis(opts.opt, "/", /* show_metavar=*/ false)));
+                                               strnull(synopsis));
+                }
 
         return 0;
 }

@@ -11,7 +11,7 @@ SD_PCREXTEND="/usr/lib/systemd/systemd-pcrextend"
 
 if [[ ! -x "${SD_PCREXTEND:?}" ]] || ! tpm_has_pcr sha256 16 || ! tpm_has_pcr sha256 15; then
     echo "$SD_PCREXTEND or PCR sysfs files not found, skipping PCR extension tests"
-    exit 0
+    exit 77
 fi
 
 at_exit() {
@@ -19,6 +19,16 @@ at_exit() {
         # Dump the event log on fail, to make debugging a bit easier
         jq --seq --slurp </run/log/systemd/tpm2-measure.log
     fi
+
+    set +e
+
+    if [[ -e /etc/machine-id.save ]]; then
+        mv /etc/machine-id.save /etc/machine-id
+    fi
+
+    rm -rf /run/systemd/system/systemd-pcrextend.socket.d
+    systemctl daemon-reload
+    rm -f /tmp/oldpcr16 /tmp/oldpcr15 /tmp/newpcr16 /tmp/newpcr15
 }
 
 trap at_exit EXIT

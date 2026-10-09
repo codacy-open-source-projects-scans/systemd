@@ -9,6 +9,7 @@
 #include "device-util.h"
 #include "devnum-util.h"
 #include "dissect-image.h"
+#include "dlopen-note.h"
 #include "dropin.h"
 #include "efi-loader.h"
 #include "efivars.h"
@@ -882,7 +883,7 @@ static int add_root_mount(void) {
         if (in_initrd()) {
                 r = generator_write_initrd_root_device_deps(arg_dest_late, bdev);
                 if (r < 0)
-                        return 0;
+                        return r;
 
                 r = add_root_cryptsetup();
                 if (r < 0)
@@ -1358,6 +1359,10 @@ static int parse_proc_cmdline_item(const char *key, const char *value, void *dat
 
 static int run(const char *dest, const char *dest_early, const char *dest_late) {
         int r;
+
+        LIBBLKID_NOTE(recommended);
+        LIBMOUNT_NOTE(recommended);
+        LIBSELINUX_NOTE(recommended);
 
         assert_se(arg_dest = dest);
         assert_se(arg_dest_late = dest_late);

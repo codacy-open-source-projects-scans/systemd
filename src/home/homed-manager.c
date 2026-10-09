@@ -3,7 +3,6 @@
 #include <grp.h>
 #include <linux/fscrypt.h>
 #include <linux/magic.h>
-#include <math.h>
 #include <pwd.h>
 #include <sys/inotify.h>
 #include <sys/ioctl.h>
@@ -41,6 +40,7 @@
 #include "homed-manager-bus.h"
 #include "homed-operation.h"
 #include "homed-varlink.h"
+#include "logarithm.h"
 #include "mkdir.h"
 #include "notify-recv.h"
 #include "ordered-set.h"
@@ -65,6 +65,7 @@
 #include "varlink-io.systemd.UserDatabase.h"
 #include "varlink-io.systemd.service.h"
 #include "varlink-util.h"
+#include "xattr-util.h"
 
 /* Where to look for private/public keys that are used to sign the user records. We are not using
  * CONF_PATHS_NULSTR() here since we want to insert /var/lib/systemd/home/ in the middle. And we insert that
@@ -1083,6 +1084,7 @@ static int manager_bind_varlink(Manager *m) {
                         "io.systemd.UserDatabase.GetMemberships", vl_method_get_memberships,
                         "io.systemd.service.Ping",                varlink_method_ping,
                         "io.systemd.service.SetLogLevel",         varlink_method_set_log_level,
+                        "io.systemd.service.GetLogLevel",         varlink_method_get_log_level,
                         "io.systemd.service.GetEnvironment",      varlink_method_get_environment);
         if (r < 0)
                 return log_error_errno(r, "Failed to register varlink methods: %m");
@@ -1101,6 +1103,13 @@ static int manager_bind_varlink(Manager *m) {
         r = sd_varlink_server_listen_address(m->varlink_server, socket_path, 0666 | SD_VARLINK_SERVER_MODE_MKDIR_0755);
         if (r < 0)
                 return log_error_errno(r, "Failed to bind to varlink socket '%s': %m", socket_path);
+
+        /* Reduce the noise routed to us: advertise that only look-ups for non-system users in the 16bit
+         * range are routed to us (excluding 'nobody', i.e. 0xfffe) */
+        char text[DECIMAL_STR_MAX(uid_t) + 1 + DECIMAL_STR_MAX(gid_t) + 1];
+        xsprintf(text, UID_FMT "-" UID_FMT, (uid_t) (SYSTEM_UID_MAX + 1), UID_NOBODY - 1);
+        FOREACH_STRING(xattr, "user.userdb.uid", "user.userdb.gid")
+                (void) xsetxattr(AT_FDCWD, socket_path, /* at_flags= */ 0, xattr, text);
 
         r = sd_varlink_server_attach_event(m->varlink_server, m->event, SD_EVENT_PRIORITY_NORMAL);
         if (r < 0)
@@ -1338,7 +1347,7 @@ static int manager_load_key_pair(Manager *m) {
 
         m->private_key = sym_PEM_read_PrivateKey(f, NULL, NULL, NULL);
         if (!m->private_key)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to load private key pair");
+                return log_openssl_errors(LOG_ERR, "Failed to load private key pair");
 
         log_info("Successfully loaded private key pair.");
 
@@ -1358,15 +1367,15 @@ static int manager_generate_key_pair(Manager *m) {
 
         ctx = sym_EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, NULL);
         if (!ctx)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to allocate Ed25519 key generation context.");
+                return log_openssl_errors(LOG_ERR, "Failed to allocate Ed25519 key generation context.");
 
         if (sym_EVP_PKEY_keygen_init(ctx) <= 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to initialize Ed25519 key generation context.");
+                return log_openssl_errors(LOG_ERR, "Failed to initialize Ed25519 key generation context.");
 
         log_info("Generating key pair for signing local user identity records.");
 
         if (sym_EVP_PKEY_keygen(ctx, &m->private_key) <= 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to generate Ed25519 key pair");
+                return log_openssl_errors(LOG_ERR, "Failed to generate Ed25519 key pair");
 
         log_info("Successfully created Ed25519 key pair.");
 
@@ -1378,7 +1387,7 @@ static int manager_generate_key_pair(Manager *m) {
                 return log_error_errno(r, "Failed to open key file for writing: %m");
 
         if (sym_PEM_write_PUBKEY(fpublic, m->private_key) <= 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to write public key.");
+                return log_openssl_errors(LOG_ERR, "Failed to write public key.");
 
         (void) fchmod(fileno(fpublic), 0444); /* Make public key world readable */
 
@@ -1394,7 +1403,7 @@ static int manager_generate_key_pair(Manager *m) {
                 return log_error_errno(r, "Failed to open key file for writing: %m");
 
         if (sym_PEM_write_PrivateKey(fprivate, m->private_key, NULL, NULL, 0, NULL, NULL) <= 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to write private key pair.");
+                return log_openssl_errors(LOG_ERR, "Failed to write private key pair.");
 
         (void) fchmod(fileno(fprivate), 0400); /* Make private key root readable */
 
@@ -1497,7 +1506,7 @@ static int manager_load_public_key_one(Manager *m, const char *path) {
 
         pkey = sym_PEM_read_PUBKEY(f, &pkey, NULL, NULL);
         if (!pkey)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to parse public key file %s.", path);
+                return log_openssl_errors(LOG_ERR, "Failed to parse public key file %s.", path);
 
         r = hashmap_ensure_put(&m->public_keys, &public_key_hash_ops, fn, pkey);
         if (r < 0)
@@ -1909,7 +1918,7 @@ static int manager_rebalance_calculate(Manager *m) {
                 /* Keep track of home directory with the least amount of space left: we want to schedule the
                  * next rebalance more quickly if this is low */
                 if (new_free < min_free)
-                        min_free = h->rebalance_size;
+                        min_free = new_free;
 
                 if (new_free > UINT64_MAX - h->rebalance_usage)
                         h->rebalance_goal = UINT64_MAX-1; /* maximum size */
@@ -1937,9 +1946,9 @@ static int manager_rebalance_calculate(Manager *m) {
         }
 
         /* Scale next rebalancing interval based on the least amount of space of any of the home
-         * directories. We pick a time in the range 1min … 15min, scaled by log2(min_free), so that:
-         * 10M → ~0.7min, 100M → ~2.7min, 1G → ~4.6min, 10G → ~6.5min, 100G ~8.4 */
-        m->rebalance_interval_usec = (usec_t) CLAMP((LESS_BY(log2(min_free), 22)*15*USEC_PER_MINUTE)/26,
+         * directories. We pick a time in the range 1min … 15min, scaled by floor(log2(min_free)),
+         * so that: 10M → ~0.6min, 100M → ~2.3min, 1G → ~4.0min, 10G → ~6.3min, 100G → ~8.1min */
+        m->rebalance_interval_usec = (usec_t) CLAMP((LESS_BY(log2u64(min_free), 22u)*15*USEC_PER_MINUTE)/26,
                                                     1 * USEC_PER_MINUTE,
                                                     15 * USEC_PER_MINUTE);
 

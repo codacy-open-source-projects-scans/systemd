@@ -5,7 +5,7 @@ set -o pipefail
 
 if ! command -v nft >/dev/null; then
     echo "nftables is not installed. Skipped NFTSet= tests."
-    exit 0
+    exit 77
 fi
 
 RUN_OUT="$(mktemp)"
@@ -24,12 +24,14 @@ systemd-run --unit test-nft.service --service-type=exec -p DynamicUser=yes \
             -p 'NFTSet=cgroup:inet:sd_test:c user:inet:sd_test:u group:inet:sd_test:g' sleep 10000
 run nft list set inet sd_test c
 grep -qF "test-nft.service" "$RUN_OUT"
-uid=$(userdbctl user --json=short test-nft | jq .uid)
-run nft list set inet sd_test u
-grep -qF "$uid" "$RUN_OUT"
-gid=$(userdbctl user --json=short test-nft | jq .gid)
-run nft list set inet sd_test g
-grep -qF "$gid" "$RUN_OUT"
+if command -v userdbctl >/dev/null; then
+    uid=$(userdbctl user --json=short test-nft | jq .uid)
+    run nft list set inet sd_test u
+    grep -qF "$uid" "$RUN_OUT"
+    gid=$(userdbctl user --json=short test-nft | jq .gid)
+    run nft list set inet sd_test g
+    grep -qF "$gid" "$RUN_OUT"
+fi
 systemctl stop test-nft.service
 
 # scope

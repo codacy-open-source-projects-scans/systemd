@@ -603,7 +603,7 @@ static int normalize_root_fd(const char *root, int *root_fd, int *ret_opened_fd)
         /* Normalizes a root dir specification: if root_fd is already valid, keep it. Otherwise, we open the
          * specified dir */
 
-        if (*root_fd >= 0 || IN_SET(*root_fd, AT_FDCWD, XAT_FDROOT)) {
+        if (wildcard_fd_is_valid(*root_fd)) {
                 *ret_opened_fd = -EBADF;
                 return 0;
         }
@@ -992,12 +992,42 @@ int config_parse_iec_size(
         assert(rvalue);
 
         r = parse_size(rvalue, 1024, &v);
-        if (r >= 0 && (uint64_t) (size_t) v != v)
+        if (r >= 0 && v > SIZE_MAX)
                 r = -ERANGE;
         if (r < 0)
                 return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
 
         *sz = (size_t) v;
+        return 1;
+}
+
+int config_parse_iec_size_long(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        long *sz = ASSERT_PTR(data);
+        uint64_t v;
+        int r;
+
+        assert(filename);
+        assert(lvalue);
+        assert(rvalue);
+
+        r = parse_size(rvalue, 1024, &v);
+        if (r >= 0 && v > LONG_MAX)
+                r = -ERANGE;
+        if (r < 0)
+                return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
+
+        *sz = (long) v;
         return 1;
 }
 

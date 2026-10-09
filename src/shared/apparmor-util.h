@@ -1,9 +1,14 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "shared-forward.h"
+#include "dlopen-note.h"
+#include "forward.h"
 
 #if HAVE_APPARMOR
+#  ifndef SYSTEMD_CFLAGS_MARKER_LIBAPPARMOR
+#    error "missing libapparmor_cflags in meson dependency."
+#  endif
+
 #  include <sys/apparmor.h>
 
 #  include "dlfcn-util.h"
@@ -26,4 +31,4 @@ static inline bool mac_apparmor_use(void) {
 }
 #endif
 
-int dlopen_libapparmor(int log_level);
+int dlopen_libapparmor(int log_level) _dlopen_loader_;

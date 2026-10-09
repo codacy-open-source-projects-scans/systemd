@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "shared-forward.h"
+#include "forward.h"
 
 typedef int (*qmp_event_callback_t)(
                 QmpClient *client,
@@ -68,15 +68,29 @@ int qmp_client_invoke(
                 qmp_command_callback_t callback,
                 void *userdata);
 
-/* Synchronous send + receive. Pumps the event loop until the reply arrives. *ret_result and
- * *ret_error_desc are borrowed pointers into the last reply, valid until the next
- * qmp_client_call(). Same contract as sd_varlink_call(). */
 int qmp_client_call(
                 QmpClient *client,
                 const char *command,
                 QmpClientArgs *args,
                 sd_json_variant **ret_result,
-                const char **ret_error_desc);
+                char **reterr_error_desc);
+
+int qmp_client_call_and_log(
+                QmpClient *client,
+                const char *command,
+                QmpClientArgs *args,
+                sd_json_variant **ret_result);
+
+int qmp_client_call_future(
+                QmpClient *client,
+                const char *command,
+                QmpClientArgs *args,
+                sd_future **ret);
+
+int future_get_qmp_reply(
+                sd_future *f,
+                sd_json_variant **ret_result,
+                char **reterr_error_desc);
 
 void qmp_client_bind_event(QmpClient *c, qmp_event_callback_t callback, void *userdata);
 void qmp_client_bind_disconnect(QmpClient *c, qmp_disconnect_callback_t callback, void *userdata);

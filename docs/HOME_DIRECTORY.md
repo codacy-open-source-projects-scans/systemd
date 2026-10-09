@@ -54,11 +54,15 @@ mechanism, except that the home directory is encrypted using `fscrypt`.
 Key management is implemented via extended attributes on the directory itself:
 for each password an extended attribute `trusted.fscrypt_slot0`, `trusted.fscrypt_slot1`,
 `trusted.fscrypt_slot2`, … is maintained.
-Its value contains a colon-separated pair of Base64 encoded data fields.
-The first field contains a salt value, the second field the encrypted volume key.
-The latter is encrypted using AES256 in counter mode, using a key derived from the password via PBKDF2-HMAC-SHA512,
-together with the salt value.
-The construction is similar to what LUKS does for`dm-crypt` encrypted volumes.
+New slots are written in the `v2` format: a colon-separated string of the form
+`$v2:<iterations>:<salt>:<iv>:<ciphertext>:<tag>`, where `<iterations>` is a decimal integer
+and the salt, IV, ciphertext and tag fields are Base64 encoded.
+The volume key is wrapped with AES-256-GCM (authenticated encryption with a random IV)
+under a key derived from the password via PBKDF2-HMAC-SHA512 with the stored iteration count.
+For backward compatibility, legacy slots written by older versions of systemd-homed
+(a colon-separated `<salt>:<ciphertext>` pair encrypted with AES-256-CTR and a 0xFFFF-iteration
+PBKDF2-HMAC-SHA512 KDF) continue to be readable, and they are upgraded to the v2 format the next
+time the password is changed.
 Note that extended attributes are not encrypted by `fscrypt` and hence are suitable for carrying the key slots.
 Moreover, by using extended attributes, the slots are directly attached to the directory and
 an independent sidecar key database is not required.
@@ -129,7 +133,7 @@ maliciously formatted file systems; there's a good chance that file system
 images can be used as attack vectors, exploiting the kernel.
 Thus it is necessary to validate the home directory image *before* mounting it and establishing a minimal level of trust.
 Since the user record data is cryptographically signed and user records not signed with a recognized private
-key are not accepted, a minimal level of trust between the system and the homedirectory image is established.
+key are not accepted, a minimal level of trust between the system and the home directory image is established.
 
 Rationale for storing the home directory one level below to root directory of
 the contained file system:

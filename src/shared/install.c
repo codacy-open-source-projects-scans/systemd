@@ -22,7 +22,7 @@
 #include "install.h"
 #include "install-printf.h"
 #include "log.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "path-lookup.h"
 #include "path-util.h"
 #include "rm-rf.h"
@@ -251,6 +251,7 @@ static int path_is_runtime(const LookupPaths *lp, const char *path, bool check_p
 
 static int path_is_vendor_or_generator(const LookupPaths *lp, const char *path) {
         const char *rpath;
+        int r;
 
         assert(lp);
         assert(path);
@@ -262,8 +263,10 @@ static int path_is_vendor_or_generator(const LookupPaths *lp, const char *path) 
         if (path_startswith(rpath, "/usr"))
                 return true;
 
-        if (path_is_generator(lp, rpath))
-                return true;
+        /* The lookup paths are root prefixed, so we have to pass in a root prefixed path. */
+        r = path_is_generator(lp, path);
+        if (r != 0)
+                return r;
 
         return path_equal(rpath, SYSTEM_DATA_UNIT_DIR);
 }
@@ -328,7 +331,7 @@ static void install_change_done(InstallChange *change) {
 
 DEFINE_ARRAY_FREE_FUNC(install_changes_free, InstallChange, install_change_done);
 
-static void install_change_dump_success(const InstallChange *change) {
+void install_change_dump_success(const InstallChange *change) {
         assert(change);
         assert(change->path);
 
@@ -2438,8 +2441,10 @@ int unit_file_unmask(
                                    path_is_generator(&lp, info.path)) {
                                 r = install_changes_add(changes, n_changes,
                                                         INSTALL_CHANGE_IS_MASKED_GENERATOR, info.name, info.path);
-                                if (r < 0)
+                                if (r < 0) {
+                                        TAKE_PTR(info.name); /* Return the borrowed name before bailing */
                                         return r;
+                                }
                         }
 
                         TAKE_PTR(info.name);  /* … and give it back here */
@@ -2980,6 +2985,10 @@ static int normalize_linked_files(
 
         _cleanup_strv_free_ char **files = NULL, **names = NULL;
         int r;
+
+        assert(lp);
+        assert(ret_names);
+        assert(ret_files);
 
         STRV_FOREACH(a, names_or_paths) {
                 _cleanup_(install_context_done) InstallContext ctx = { .scope = scope };
@@ -3682,7 +3691,7 @@ int unit_file_preset(
                 InstallChange **changes,
                 size_t *n_changes) {
 
-        _cleanup_(install_context_done) InstallContext plus = {}, minus = {};
+        _cleanup_(install_context_done) InstallContext plus = { .scope = scope }, minus = { .scope = scope };
         _cleanup_(lookup_paths_done) LookupPaths lp = {};
         _cleanup_(unit_file_presets_done) UnitFilePresets presets = {};
         const char *config_path;
@@ -3721,7 +3730,7 @@ int unit_file_preset_all(
                 InstallChange **changes,
                 size_t *n_changes) {
 
-        _cleanup_(install_context_done) InstallContext plus = {}, minus = {};
+        _cleanup_(install_context_done) InstallContext plus = { .scope = scope }, minus = { .scope = scope };
         _cleanup_(lookup_paths_done) LookupPaths lp = {};
         _cleanup_(unit_file_presets_done) UnitFilePresets presets = {};
         const char *config_path = NULL;

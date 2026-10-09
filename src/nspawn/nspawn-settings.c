@@ -95,7 +95,9 @@ int settings_load(FILE *f, const char *path, Settings **ret) {
         /* Make sure that if userns_mode is set, userns_chown is set to something appropriate, and vice versa. Either
          * both fields shall be initialized or neither. */
         if (s->userns_mode >= 0 && s->userns_ownership < 0)
-                s->userns_ownership = s->userns_mode == USER_NAMESPACE_PICK ? USER_NAMESPACE_OWNERSHIP_CHOWN : USER_NAMESPACE_OWNERSHIP_OFF;
+                s->userns_ownership = IN_SET(s->userns_mode, USER_NAMESPACE_PICK, USER_NAMESPACE_MANAGED)
+                        ? USER_NAMESPACE_OWNERSHIP_AUTO
+                        : USER_NAMESPACE_OWNERSHIP_OFF;
         if (s->userns_ownership >= 0 && s->userns_mode < 0)
                 s->userns_mode = USER_NAMESPACE_NO;
 
@@ -696,6 +698,11 @@ int config_parse_private_users(
                 /* identity: User namespacing on, UID range is 0:65536 */
                 settings->userns_mode = USER_NAMESPACE_FIXED;
                 settings->uid_shift = 0;
+                settings->uid_range = UINT32_C(0x10000);
+        } else if (streq(rvalue, "managed")) {
+                /* managed: User namespace on, and acquire it from systemd-nsresourced */
+                settings->userns_mode = USER_NAMESPACE_MANAGED;
+                settings->uid_shift = UID_INVALID;
                 settings->uid_range = UINT32_C(0x10000);
         } else {
                 const char *range, *shift;

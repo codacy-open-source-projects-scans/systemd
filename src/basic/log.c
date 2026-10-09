@@ -65,6 +65,7 @@ static int show_color = -1; /* tristate */
 static bool show_location = false;
 static bool show_time = false;
 static bool show_tid = false;
+static bool show_executable = false;
 
 static bool upgrade_syslog_to_journal = false;
 static bool always_reopen_console = false;
@@ -86,6 +87,12 @@ bool _log_message_dummy = false; /* Always false */
                         abort();                                        \
                 }                                                       \
         } while (false)
+
+void log_prefix_swap(const char **prefix) {
+        assert(prefix);
+
+        SWAP_TWO(log_prefix, *prefix);
+}
 
 static void log_close_console(void) {
         /* See comment in log_close_journal() */
@@ -417,7 +424,7 @@ static int write_to_console(
              header_time[FORMAT_TIMESTAMP_MAX],
              prefix[1 + DECIMAL_STR_MAX(int) + 2],
              tid_string[3 + DECIMAL_STR_MAX(pid_t) + 1];
-        struct iovec iovec[11];
+        struct iovec iovec[13];
         const char *on = NULL, *off = NULL;
         size_t n = 0;
 
@@ -439,6 +446,11 @@ static int write_to_console(
             format_timestamp(header_time, sizeof(header_time), now(CLOCK_REALTIME))) {
                 iovec[n++] = IOVEC_MAKE_STRING(header_time);
                 iovec[n++] = IOVEC_MAKE_STRING(" ");
+        }
+
+        if (show_executable) {
+                iovec[n++] = IOVEC_MAKE_STRING(program_invocation_short_name);
+                iovec[n++] = IOVEC_MAKE_STRING(": ");
         }
 
         if (show_tid) {
@@ -720,7 +732,11 @@ static int write_to_journal(
         if (LOG_PRI(level) > log_target_max_level[LOG_TARGET_JOURNAL])
                 return 0;
 
-        iovec_len = MIN(6 + log_context_num_fields() * 3, IOVEC_MAX);
+        if (!MUL_SAFE(&iovec_len, log_context_num_fields(), 3) ||
+            !ADD_SAFE(&iovec_len, iovec_len, 6))
+                iovec_len = IOVEC_MAX;
+        else
+                iovec_len = MIN(iovec_len, IOVEC_MAX);
         iovec = newa(struct iovec, iovec_len);
 
         log_do_header(header, sizeof(header), level, error, file, line, func, object_field, object, extra_field, extra);
@@ -1018,7 +1034,11 @@ int log_struct_internal(
                         int r;
                         bool fallback = false;
 
-                        iovec_len = MIN(17 + log_context_num_fields() * 3, IOVEC_MAX);
+                        if (!MUL_SAFE(&iovec_len, log_context_num_fields(), 3) ||
+                            !ADD_SAFE(&iovec_len, iovec_len, 17))
+                                iovec_len = IOVEC_MAX;
+                        else
+                                iovec_len = MIN(iovec_len, IOVEC_MAX);
                         iovec = newa(struct iovec, iovec_len);
 
                         /* If the journal is available do structured logging.
@@ -1117,15 +1137,21 @@ int log_struct_iovec_internal(
 
                 char header[LINE_MAX];
                 struct iovec *iovec;
-                size_t n = 0, iovec_len;
+                size_t n = 0, iovec_len, n_context_iovec, n_input_iovec_expanded;
 
-                iovec_len = MIN(1 + n_input_iovec * 2 + log_context_num_fields() * 3, IOVEC_MAX);
+                if (!MUL_SAFE(&n_input_iovec_expanded, n_input_iovec, 2) ||
+                    !MUL_SAFE(&n_context_iovec, log_context_num_fields(), 3) ||
+                    !ADD_SAFE(&iovec_len, 1, n_input_iovec_expanded) ||
+                    !ADD_SAFE(&iovec_len, iovec_len, n_context_iovec))
+                        iovec_len = IOVEC_MAX;
+                else
+                        iovec_len = MIN(iovec_len, IOVEC_MAX);
                 iovec = newa(struct iovec, iovec_len);
 
                 log_do_header(header, sizeof(header), level, error, file, line, func, NULL, NULL, NULL, NULL);
 
                 iovec[n++] = IOVEC_MAKE_STRING(header);
-                for (size_t i = 0; i < n_input_iovec; i++) {
+                for (size_t i = 0; i < n_input_iovec && n + 2 <= iovec_len; i++) {
                         iovec[n++] = input_iovec[i];
                         iovec[n++] = IOVEC_MAKE_STRING("\n");
                 }
@@ -1364,6 +1390,10 @@ void log_parse_environment_variables(void) {
         e = getenv("SYSTEMD_LOG_RATELIMIT_KMSG");
         if (e && log_set_ratelimit_kmsg_from_string(e) < 0)
                 log_warning("Failed to parse log ratelimit kmsg boolean '%s', ignoring.", e);
+
+        e = getenv("SYSTEMD_LOG_EXECUTABLE");
+        if (e && log_show_executable_from_string(e) < 0)
+                log_warning("Failed to parse log executable '%s', ignoring.", e);
 }
 
 void log_parse_environment(void) {
@@ -1439,6 +1469,14 @@ bool log_get_show_tid(void) {
         return show_tid;
 }
 
+void log_show_executable(bool b) {
+        show_executable = b;
+}
+
+bool log_get_show_executable(void) {
+        return show_executable;
+}
+
 int log_show_color_from_string(const char *e) {
         int r;
 
@@ -1480,6 +1518,17 @@ int log_show_tid_from_string(const char *e) {
                 return r;
 
         log_show_tid(r);
+        return 0;
+}
+
+int log_show_executable_from_string(const char *e) {
+        int r;
+
+        r = parse_boolean(e);
+        if (r < 0)
+                return r;
+
+        log_show_executable(r);
         return 0;
 }
 

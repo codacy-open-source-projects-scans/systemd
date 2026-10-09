@@ -1,8 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
-#include <getopt.h>
 #include <stdlib.h>
 
+#include "sd-json.h"
+
+#include "build.h"
 #include "conf-parser.h"
 #include "cpu-set-util.h"
 #include "daemon-util.h"
@@ -10,8 +12,8 @@
 #include "fileio.h"
 #include "hashmap.h"
 #include "limits-util.h"
+#include "options.h"
 #include "parse-util.h"
-#include "pretty-print.h"
 #include "proc-cmdline.h"
 #include "serialize.h"
 #include "signal-util.h"
@@ -24,7 +26,7 @@
 #include "udev-rules.h"
 #include "udev-util.h"
 #include "udev-worker.h"
-#include "version.h"
+#include "verbs.h"
 
 #define WORKER_NUM_MAX UINT64_C(2048)
 
@@ -148,111 +150,83 @@ static int parse_proc_cmdline_item(const char *key, const char *value, void *dat
         return 0;
 }
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-udevd.service", "8", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%s [OPTIONS...]\n\n"
-               "Rule-based manager for device events and files.\n\n"
-               "  -h --help                   Print this message\n"
-               "  -V --version                Print version of the program\n"
-               "  -d --daemon                 Detach and run in the background\n"
-               "  -D --debug                  Enable debug output\n"
-               "  -c --children-max=INT       Set maximum number of workers\n"
-               "  -e --exec-delay=SECONDS     Seconds to wait before executing RUN=\n"
-               "  -t --event-timeout=SECONDS  Seconds to wait before terminating an event\n"
-               "  -N --resolve-names=early|late|never\n"
-               "                              When to resolve users and groups\n"
-               "\nSee the %s for details.\n",
-               program_invocation_short_name,
-               link);
-
-        return 0;
-}
+/* systemd-udevd is the same binary as udevadm. This COMMAND intentionally owns no verbs: all of
+ * udevadm's verbs are defined in udevadm.c right after its own COMMAND, so that they are attributed
+ * to it. */
+COMMAND(
+        "systemd-udevd\0",
+        "Rule-based manager for device events and files.",
+        .man_pages = "systemd-udevd.service(8)\0",
+        .option_namespace = "udevd",
+);
 
 static int parse_argv(int argc, char *argv[], UdevConfig *config) {
-        enum {
-                ARG_TIMEOUT_SIGNAL,
-        };
-
-        static const struct option options[] = {
-                { "daemon",             no_argument,            NULL, 'd'                 },
-                { "debug",              no_argument,            NULL, 'D'                 },
-                { "children-max",       required_argument,      NULL, 'c'                 },
-                { "exec-delay",         required_argument,      NULL, 'e'                 },
-                { "event-timeout",      required_argument,      NULL, 't'                 },
-                { "resolve-names",      required_argument,      NULL, 'N'                 },
-                { "help",               no_argument,            NULL, 'h'                 },
-                { "version",            no_argument,            NULL, 'V'                 },
-                { "timeout-signal",     required_argument,      NULL,  ARG_TIMEOUT_SIGNAL },
-                {}
-        };
-
-        int c, r;
+        int r;
 
         assert(argc >= 0);
         assert(argv);
         assert(config);
 
-        while ((c = getopt_long(argc, argv, "c:de:Dt:N:hV", options, NULL)) >= 0) {
+        OptionParser opts = { argc, argv, OPTION_PARSER_NORMAL, "udevd" };
+
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'd':
+                OPTION_NAMESPACE("udevd"): {}
+
+                OPTION_COMMON_HELP:
+                        return command_print_help_name("systemd-udevd");
+
+                OPTION_COMMON_VERSION_WITH_V:
+                        return version_only();
+
+                OPTION('d', "daemon", NULL, "Detach and run in the background"):
                         arg_daemonize = true;
                         break;
-                case 'c':
-                        r = safe_atou(optarg, &config->children_max);
-                        if (r < 0)
-                                log_warning_errno(r, "Failed to parse --children-max= value '%s', ignoring: %m", optarg);
-                        break;
-                case 'e':
-                        r = parse_sec(optarg, &config->exec_delay_usec);
-                        if (r < 0)
-                                log_warning_errno(r, "Failed to parse --exec-delay= value '%s', ignoring: %m", optarg);
-                        break;
-                case ARG_TIMEOUT_SIGNAL:
-                        r = signal_from_string(optarg);
-                        if (r <= 0)
-                                log_warning_errno(r, "Failed to parse --timeout-signal= value '%s', ignoring: %m", optarg);
-                        else
-                                config->timeout_signal = r;
 
-                        break;
-                case 't':
-                        r = parse_sec(optarg, &config->timeout_usec);
-                        if (r < 0)
-                                log_warning_errno(r, "Failed to parse --event-timeout= value '%s', ignoring: %m", optarg);
-                        break;
-                case 'D':
+                OPTION('D', "debug", NULL, "Enable debug output"):
                         arg_debug = true;
                         config->log_level = LOG_DEBUG;
                         break;
-                case 'N': {
-                        ResolveNameTiming t;
 
-                        t = resolve_name_timing_from_string(optarg);
+                OPTION('c', "children-max", "INT", "Set maximum number of workers"):
+                        r = safe_atou(opts.arg, &config->children_max);
+                        if (r < 0)
+                                log_warning_errno(r, "Failed to parse --children-max= value '%s', ignoring: %m", opts.arg);
+                        break;
+
+                OPTION('e', "exec-delay", "SECONDS", "Seconds to wait before executing RUN="):
+                        r = parse_sec(opts.arg, &config->exec_delay_usec);
+                        if (r < 0)
+                                log_warning_errno(r, "Failed to parse --exec-delay= value '%s', ignoring: %m", opts.arg);
+                        break;
+
+                OPTION('t', "event-timeout", "SECONDS", "Seconds to wait before terminating an event"):
+                        r = parse_sec(opts.arg, &config->timeout_usec);
+                        if (r < 0)
+                                log_warning_errno(r, "Failed to parse --event-timeout= value '%s', ignoring: %m", opts.arg);
+                        break;
+
+                OPTION_COMMON_RESOLVE_NAMES: {
+                        ResolveNameTiming t = resolve_name_timing_from_string(opts.arg);
                         if (t < 0)
-                                log_warning("Invalid --resolve-names= value '%s', ignoring.", optarg);
+                                log_warning("Invalid --resolve-names= value '%s', ignoring.", opts.arg);
                         else
                                 config->resolve_name_timing = t;
                         break;
                 }
-                case 'h':
-                        return help();
-                case 'V':
-                        printf("%s\n", GIT_VERSION);
-                        return 0;
-                case '?':
-                        return -EINVAL;
-                default:
-                        assert_not_reached();
 
+                OPTION_LONG("timeout-signal", "SIGNAL", "Signal used when terminating an event"):
+                        r = signal_from_string(opts.arg);
+                        if (r <= 0)
+                                log_warning_errno(r, "Failed to parse --timeout-signal= value '%s', ignoring: %m", opts.arg);
+                        else
+                                config->timeout_signal = r;
+                        break;
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
-        }
 
         return 1;
 }
@@ -299,6 +273,7 @@ static void manager_merge_config(Manager *manager) {
 
         manager_merge_config_log_level(manager);
         MERGE_NON_NEGATIVE(resolve_name_timing, RESOLVE_NAME_EARLY);
+        MERGE_NON_ZERO(children_max, 0);
         MERGE_NON_ZERO(exec_delay_usec, 0);
         MERGE_NON_ZERO(timeout_usec, DEFAULT_WORKER_TIMEOUT_USEC);
         MERGE_NON_ZERO(timeout_signal, SIGKILL);

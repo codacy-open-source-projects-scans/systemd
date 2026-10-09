@@ -3,8 +3,6 @@
 #include <sys/stat.h>
 #include <sys/syslog.h>
 
-#include "sd-dlopen.h"
-
 #include "acl-util.h"
 #include "alloc-util.h"
 #include "errno-util.h"
@@ -17,8 +15,6 @@
 #include "user-util.h"
 
 #if HAVE_ACL
-static void *libacl_dl = NULL;
-
 DLSYM_PROTOTYPE(acl_add_perm);
 DLSYM_PROTOTYPE(acl_calc_mask);
 DLSYM_PROTOTYPE(acl_copy_entry);
@@ -49,11 +45,9 @@ DLSYM_PROTOTYPE(acl_to_any_text);
 
 int dlopen_libacl(int log_level) {
 #if HAVE_ACL
-        SD_ELF_NOTE_DLOPEN(
-                        "acl",
-                        "Support for file Access Control Lists (ACLs)",
-                        SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED,
-                        "libacl.so.1");
+        static void *libacl_dl = NULL;
+
+        LIBACL_NOTE(suggested);
 
         return dlopen_many_sym_or_warn(
                         &libacl_dl,

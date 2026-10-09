@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
-#include <microhttpd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -10,6 +9,7 @@
 #include "sd-bus.h"
 #include "sd-daemon.h"
 #include "sd-journal.h"
+#include "sd-json.h"
 
 #include "alloc-util.h"
 #include "build.h"
@@ -17,7 +17,6 @@
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "format-table.h"
 #include "glob-util.h"
 #include "hostname-setup.h"
 #include "hostname-util.h"
@@ -28,15 +27,14 @@
 #include "main-func.h"
 #include "memory-util.h"
 #include "microhttpd-util.h"
-#include "options.h"
 #include "os-util.h"
 #include "output-mode.h"
 #include "parse-util.h"
-#include "pretty-print.h"
 #include "signal-util.h"
 #include "string-util.h"
 #include "time-util.h"
 #include "tmpfile-util.h"
+#include "verbs.h"
 
 #define JOURNAL_WAIT_TIMEOUT (10*USEC_PER_SEC)
 
@@ -53,6 +51,12 @@ STATIC_DESTRUCTOR_REGISTER(arg_cert_pem, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_trust_pem, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_directory, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_file, strv_freep);
+
+COMMAND(
+        "systemd-journal-gatewayd\0",
+        "Serve journal events over HTTP.",
+        .man_pages = "systemd-journal-gatewayd.service(8)\0",
+);
 
 typedef struct RequestMeta {
         sd_journal *journal;
@@ -184,9 +188,12 @@ static ssize_t request_reader_entries(
                     m->n_entries <= 0)
                         return MHD_CONTENT_READER_END_OF_STREAM;
 
-                if (m->n_skip < 0)
+                if (m->n_skip < 0) {
+                        /* request_parse_range_skip_and_n_entries() rejects INT64_MIN, so the negation
+                         * below cannot overflow. */
+                        assert(m->n_skip >= -INT64_MAX);
                         r = sd_journal_previous_skip(m->journal, (uint64_t) -m->n_skip + 1);
-                else if (m->n_skip > 0) {
+                } else if (m->n_skip > 0) {
                         r = sd_journal_next_skip(m->journal, (uint64_t) m->n_skip + 1);
                         if (r < 0) {
                                 log_error_errno(r, "Failed to skip journal entries: %m");
@@ -194,7 +201,7 @@ static ssize_t request_reader_entries(
                         }
                         /* We skipped beyond the end, make sure entries between the cursor and n_skip offset
                          * from it are not returned. */
-                        if (r < m->n_skip + 1) {
+                        if ((uint64_t) r < (uint64_t) m->n_skip + 1) {
                                 m->n_skip -= r;
 
                                 if (!m->follow)
@@ -348,6 +355,11 @@ static int request_parse_range_skip_and_n_entries(
                 r = safe_atoi64(t, &m->n_skip);
                 if (r < 0)
                         return r;
+
+                /* The consumer negates n_skip, and negating INT64_MIN in signed arithmetic is undefined
+                 * behaviour, so reject it up front. */
+                if (m->n_skip == INT64_MIN)
+                        return -ERANGE;
         }
 
         p = (colon2 ?: colon) + 1;
@@ -1089,31 +1101,6 @@ static mhd_result request_handler(
         return mhd_respond(connection, MHD_HTTP_NOT_FOUND, "Not found.");
 }
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        _cleanup_(table_unrefp) Table *options = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-journal-gatewayd.service", "8", &link);
-        if (r < 0)
-                return log_oom();
-
-        r = option_parser_get_help_table(&options);
-        if (r < 0)
-                return r;
-
-        printf("%s [OPTIONS...] ...\n\n"
-               "HTTP server for journal events.\n\n",
-               program_invocation_short_name);
-
-        r = table_print_or_warn(options);
-        if (r < 0)
-                return r;
-
-        printf("\nSee the %s for details.\n", link);
-        return 0;
-}
-
 static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
@@ -1121,11 +1108,11 @@ static int parse_argv(int argc, char *argv[]) {
         OptionParser opts = { argc, argv };
         int r;
 
-        FOREACH_OPTION(c, &opts, /* on_error= */ return c)
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return help();
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();
@@ -1200,6 +1187,9 @@ static int parse_argv(int argc, char *argv[]) {
                         if (r < 0)
                                 return log_error_errno(r, "Failed to add paths: %m");
                         break;
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
         if (option_parser_get_n_args(&opts) > 0)
@@ -1251,6 +1241,10 @@ static int run(int argc, char *argv[]) {
                 MHD_USE_POLL_INTERNAL_THREAD |
                 MHD_USE_THREAD_PER_CONNECTION;
         int r, n;
+
+        COMPRESS_JOURNAL_NOTE;
+        LIBGNUTLS_NOTE(suggested);
+        LIBMICROHTTPD_NOTE(required);
 
         log_setup();
 

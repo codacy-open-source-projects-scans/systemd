@@ -239,7 +239,7 @@
 
         <listitem><para>Takes a boolean argument. By default the interactive user creation via
         <command>firstboot --prompt-new-user</command> screen will show reverse color "chrome" bars at the
-        top and and the bottom of the terminal screen, which may be disabled by setting this option to
+        top and the bottom of the terminal screen, which may be disabled by setting this option to
         false.</para>
 
         <xi:include href="version-info.xml" xpointer="v259"/></listitem>
@@ -691,6 +691,17 @@
         may be entered instead of a regular password to unlock the account.</para>
 
         <xi:include href="version-info.xml" xpointer="v247"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--recovery-key-file=<replaceable>PATH</replaceable></option></term>
+
+        <listitem><para>Attempts to write the generated recovery key to the specified file. The file is
+        created with access mode <literal>0600</literal> and must not exist yet. This option may only be used
+        together with <option>--recovery-key=yes</option>. If the file cannot be written, a warning is shown
+        and the account operation still succeeds. The recovery key is always shown on screen.</para>
+
+        <xi:include href="version-info.xml" xpointer="v262"/></listitem>
       </varlistentry>
     </variablelist>
   </refsect1>

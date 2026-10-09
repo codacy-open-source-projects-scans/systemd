@@ -1,7 +1,13 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-json.h"
+
+#include "ansi-color.h"
+#include "env-util.h"
+#include "format-table.h"
 #include "options.h"
 #include "strv.h"
+#include "terminal-util.h"
 #include "tests.h"
 
 typedef struct Entry {
@@ -58,7 +64,12 @@ static void test_option_parse_one(
         ASSERT_TRUE(strv_equal(args, remaining));
         ASSERT_STREQ(argv[0], saved_argv0);
 
-        ASSERT_EQ(option_parser_get_n_args(&opts), strv_length(remaining));
+        size_t l = strv_length(remaining);
+        ASSERT_EQ(option_parser_get_n_args(&opts), l);
+        ASSERT_STREQ(option_parser_get_arg(&opts, 0), l > 0 ? remaining[0] : NULL);
+        ASSERT_STREQ(option_parser_get_arg(&opts, 1), l > 1 ? remaining[1] : NULL);
+        ASSERT_STREQ(option_parser_get_arg(&opts, 2), l > 2 ? remaining[2] : NULL);
+        ASSERT_STREQ(option_parser_get_arg(&opts, 3), l > 3 ? remaining[3] : NULL);
 }
 
 static void test_option_invalid_one(
@@ -189,6 +200,20 @@ TEST(option_parse) {
                               STRV_MAKE("string1",
                                         "--help"),
                               OPTION_PARSER_STOP_AT_FIRST_NONOPTION,
+                              NULL);
+
+        test_option_parse_one(STRV_MAKE("arg0",
+                                        "string1",
+                                        "--help",
+                                        "string2"),
+                              options,
+                              (Entry[]) {
+                                      { "help" },
+                                      {}
+                              },
+                              STRV_MAKE("string1",
+                                        "string2"),
+                              OPTION_PARSER_NORMAL,
                               NULL);
 
         test_option_parse_one(STRV_MAKE("arg0",
@@ -813,6 +838,77 @@ TEST(option_optional_arg) {
                               NULL);
 }
 
+/* Check that we correctly implement the behaviour of
+ *   systemd-analyze -a -b unit-shell -c -d name -e -f
+ *   systemd-analyze -a -b other-verb -c -d name -e -f
+ *   systemd-analyze -a -b -c -d -e -f
+ * where '-a', '-b', '-c', '-d' are "our" options, but '-e -f' is part of the commandline
+ * for unit-shell, but not in the other cases. */
+static void test_option_parsing_stops_at_second_nonoption_one(
+                char **cmdline,
+                unsigned options_to_see,
+                unsigned verbs_to_see,
+                char **args_to_see) {
+
+        static const Option options[] = {
+                { 1, .short_code = 'a' },
+                { 2, .short_code = 'b' },
+                { 3, .short_code = 'c' },
+                { 4, .short_code = 'd' },
+                { 5, .short_code = 'e' },
+                { 6, .short_code = 'f' },
+                { 7, .long_code = "(positional)", .flags = OPTION_POSITIONAL_ENTRY },
+                {},
+        };
+
+        OptionParser opts = { strv_length(cmdline), cmdline,
+                              .mode = OPTION_PARSER_RETURN_POSITIONAL_ARGS };
+        unsigned options_seen = 0;
+        unsigned verbs_seen = 0;
+        for (int c; (c = option_parse(options, options + ELEMENTSOF(options) - 1, &opts)) != 0; ) {
+                ASSERT_OK(c);
+                ASSERT_NOT_NULL(opts.opt);
+
+                switch (opts.opt->id) {
+                case 1 ... 6:
+                        options_seen++;
+                        break;
+                case 7:
+                        verbs_seen++;
+                        ASSERT_EQ(opts.mode, (OptionParserMode) OPTION_PARSER_RETURN_POSITIONAL_ARGS);
+
+                        if (streq(opts.arg, "unit-shell"))
+                                opts.mode = OPTION_PARSER_STOP_AT_FIRST_NONOPTION;
+                        else if (streq(opts.arg, "other-verb"))
+                                opts.mode = OPTION_PARSER_NORMAL;
+                        else
+                                assert_not_reached();
+                        break;
+                default:
+                        assert_not_reached();
+                }
+        }
+
+        ASSERT_EQ(options_seen, options_to_see);
+        ASSERT_EQ(verbs_seen, verbs_to_see);
+        ASSERT_TRUE(strv_equal(option_parser_get_args(&opts), args_to_see));
+}
+
+TEST(option_parsing_stops_at_second_nonoption) {
+        test_option_parsing_stops_at_second_nonoption_one(
+                        STRV_MAKE("systemd-analyze", "-a", "-b", "unit-shell", "-c", "-d", "name", "-e", "-f"),
+                        4, 1,
+                        STRV_MAKE("name", "-e", "-f"));
+        test_option_parsing_stops_at_second_nonoption_one(
+                        STRV_MAKE("systemd-analyze", "-a", "-b", "other-verb", "-c", "-d", "name", "-e", "-f"),
+                        6, 1,
+                        STRV_MAKE("name"));
+        test_option_parsing_stops_at_second_nonoption_one(
+                        STRV_MAKE("systemd-analyze", "-a", "-b", "-c", "-d", "-e"),
+                        5, 0,
+                        STRV_EMPTY);
+}
+
 /* Test the OPTION, OPTION_LONG, OPTION_SHORT, OPTION_FULL, OPTION_GROUP macros
  * by using them in a FOREACH_OPTION switch, as they would be used in real code. */
 
@@ -837,7 +933,10 @@ static void test_macros_parse_one(
 
         OptionParser opts = { argc, argv, mode, namespace };
 
-        FOREACH_OPTION(c, &opts, assert_not_reached()) {
+        FOREACH_OPTION(c, &opts) {
+
+                assert(c >= 0);
+
                 log_debug("%c %s: %s=%s",
                           opts.opt->short_code != 0 ? opts.opt->short_code : ' ',
                           opts.opt->long_code ?: "",
@@ -1331,7 +1430,7 @@ TEST(option_optional_arg_consume) {
 
         /* --user without arg: next arg is positional (doesn't start with -).
          * The option parser returns NULL for the arg. The caller would then
-         * use option_parser_next_arg/consume_next_arg to grab it. */
+         * use option_parser_peek_next_arg/consume_next_arg to grab it. */
         {
                 char **argv = STRV_MAKE("arg0", "--user", "someuser", "pos1");
                 int argc = strv_length(argv);
@@ -1341,7 +1440,7 @@ TEST(option_optional_arg_consume) {
                 ASSERT_OK_POSITIVE(option_parse(options, options + 3, &opts));
                 ASSERT_STREQ(opts.opt->long_code, "user");
                 ASSERT_NULL(opts.arg);
-                ASSERT_STREQ(option_parser_next_arg(&opts), "someuser");
+                ASSERT_STREQ(option_parser_peek_next_arg(&opts), "someuser");
                 ASSERT_STREQ(option_parser_consume_next_arg(&opts), "someuser");
 
                 ASSERT_EQ(option_parse(options, options + 3, &opts), 0);
@@ -1361,7 +1460,7 @@ TEST(option_optional_arg_consume) {
                 ASSERT_OK_POSITIVE(option_parse(options, options + 3, &opts));
                 ASSERT_STREQ(opts.opt->long_code, "user");
                 ASSERT_NULL(opts.arg);
-                ASSERT_NULL(option_parser_next_arg(&opts));
+                ASSERT_NULL(option_parser_peek_next_arg(&opts));
                 ASSERT_NULL(option_parser_consume_next_arg(&opts));
 
                 ASSERT_EQ(option_parse(options, options + 3, &opts), 0);
@@ -1381,12 +1480,12 @@ TEST(option_optional_arg_consume) {
                 ASSERT_OK_POSITIVE(option_parse(options, options + 3, &opts));
                 ASSERT_STREQ(opts.opt->long_code, "user");
                 ASSERT_NULL(opts.arg);
-                ASSERT_STREQ(option_parser_next_arg(&opts), "-u");
+                ASSERT_STREQ(option_parser_peek_next_arg(&opts), "-u");
 
                 ASSERT_OK_POSITIVE(option_parse(options, options + 3, &opts));
                 ASSERT_STREQ(opts.opt->long_code, "uid");
                 ASSERT_STREQ(opts.arg, "nobody");
-                ASSERT_NULL(option_parser_next_arg(&opts));
+                ASSERT_NULL(option_parser_peek_next_arg(&opts));
                 ASSERT_NULL(option_parser_consume_next_arg(&opts));
 
                 ASSERT_EQ(option_parse(options, options + 3, &opts), 0);
@@ -1413,7 +1512,7 @@ TEST(option_optional_arg_consume) {
                                 const char *arg = opts.arg;
 
                                 if (!arg) {
-                                        const char *t = option_parser_next_arg(&opts);
+                                        const char *t = option_parser_peek_next_arg(&opts);
                                         if (t && t[0] != '-')
                                                 arg = option_parser_consume_next_arg(&opts);
                                 }
@@ -1485,6 +1584,92 @@ TEST(option_get_synopsis) {
 
         test_option_get_synopsis_one(&(const Option) { 0, OPTION_HELP_ENTRY_VERBATIM, 'u', "special special",  "unused" }, "/",  true, "special special");
         test_option_get_synopsis_one(&(const Option) { 0, OPTION_POSITIONAL_ENTRY, 'u', "(fixed)", "unused" }, "/",  true, "(fixed)");
+}
+
+TEST(option_empty_long_name) {
+        static const Option one_option[] = {
+                { 1, .short_code = 'o', .long_code = "output", .metavar = "ARG" },
+                {}
+        };
+
+        static const Option two_options[] = {
+                { 1, .short_code = 'o', .long_code = "output", .metavar = "ARG" },
+                { 2, .long_code = "help" },
+                {}
+        };
+
+        /* "--=…" carries an empty long option name, which must not prefix-match every defined option.
+         * With a single option defined that would otherwise look like a unique partial match. */
+        test_option_invalid_one(STRV_MAKE("arg0", "--=foo"), one_option);
+        test_option_invalid_one(STRV_MAKE("arg0", "--="), one_option);
+        test_option_invalid_one(STRV_MAKE("arg0", "--=foo"), two_options);
+        test_option_invalid_one(STRV_MAKE("arg0", "--="), two_options);
+}
+
+TEST(option_experimental) {
+        static const Option options[] = {
+                { 1, .short_code = 'o', .long_code = "output", .metavar = "ARG", .help = "A stable option" },
+                { 2, .long_code = "future", .flags = OPTION_EXPERIMENTAL, .help = "An experimental option" },
+                {}
+        };
+        const Option *options_end = options + ELEMENTSOF(options) - 1;
+
+        _cleanup_free_ char *saved_term = NULL, *saved_color = NULL, *saved_columns = NULL;
+        const char *e;
+
+        e = getenv("TERM");
+        if (e)
+                ASSERT_NOT_NULL((saved_term = strdup(e)));
+        e = getenv("SYSTEMD_COLORS");
+        if (e)
+                ASSERT_NOT_NULL((saved_color = strdup(e)));
+        e = getenv("COLUMNS");
+        if (e)
+                ASSERT_NOT_NULL((saved_columns = strdup(e)));
+
+        /* The color of the option name is decided when the table is built, so enable colors first. */
+        ASSERT_OK_ERRNO(setenv("COLUMNS", "200", /* overwrite= */ true));
+        ASSERT_OK_ERRNO(setenv("SYSTEMD_COLORS", "1", /* overwrite= */ true));
+        ASSERT_OK_ERRNO(setenv("TERM", FALLBACK_TERM, /* overwrite= */ true));
+        reset_terminal_feature_caches();
+
+        _cleanup_(table_unrefp) Table *table = NULL;
+        ASSERT_OK(options_get_help_table_group(options, options_end, /* option_groups= */ NULL,
+                                               &table, /* ret_group= */ NULL));
+
+        /* The experimental option gets a note appended to its help text and its name is highlighted. */
+        _cleanup_free_ char *formatted = NULL;
+        ASSERT_OK(table_format(table, &formatted));
+        ASSERT_STREQ(formatted,
+                     "  -o --output=ARG A stable option\n"
+                     ANSI_BRIGHT_YELLOW "     --future    " ANSI_NORMAL
+                     " An experimental option (experimental)\n");
+
+        /* Without colors, only the note remains. */
+        ASSERT_OK_ERRNO(setenv("SYSTEMD_COLORS", "0", /* overwrite= */ true));
+        reset_terminal_feature_caches();
+
+        formatted = mfree(formatted);
+        ASSERT_OK(table_format(table, &formatted));
+        ASSERT_STREQ(formatted,
+                     "  -o --output=ARG A stable option\n"
+                     "     --future     An experimental option (experimental)\n");
+
+        ASSERT_OK(set_unset_env("COLUMNS", saved_columns, /* overwrite= */ true));
+        ASSERT_OK(set_unset_env("SYSTEMD_COLORS", saved_color, /* overwrite= */ true));
+        ASSERT_OK(set_unset_env("TERM", saved_term, /* overwrite= */ true));
+        reset_terminal_feature_caches();
+
+        /* The flag is also exposed in the --introspect-cli output. */
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *json = NULL;
+        ASSERT_OK(options_build_json(options, options_end, /* namespace= */ NULL,
+                                     /* option_groups= */ NULL, &json));
+        ASSERT_EQ(sd_json_variant_elements(json), 2u);
+        ASSERT_NULL(sd_json_variant_by_key(sd_json_variant_by_index(json, 0), "isExperimental"));
+
+        sd_json_variant *flag = sd_json_variant_by_key(sd_json_variant_by_index(json, 1), "isExperimental");
+        ASSERT_NOT_NULL(flag);
+        ASSERT_TRUE(sd_json_variant_boolean(flag));
 }
 
 DEFINE_TEST_MAIN(LOG_DEBUG);

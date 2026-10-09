@@ -105,7 +105,7 @@ systemd itself requires random numbers as well, including for the following uses
   and thus the runtime context the service manager maintains can be neatly matched up with
   the log data a specific service invocation generated.
   systemd also initializes `/etc/machine-id` with a randomized UUID.
-  (systemd also makes use of the randomized "boot id" the kernel exposes in `/proc/sys/kernel/random boot_id`).
+  (systemd also makes use of the randomized "boot id" the kernel exposes in `/proc/sys/kernel/random/boot_id`).
   These UUIDs are exclusively Type 4 UUIDs, i.e. randomly generated ones.
 
 * systemd maintains various hash tables internally.
@@ -215,6 +215,13 @@ boot, in order to ensure the entropy pool is filled up quickly.
    sector write (since hard-disk sectors typically happen to be 512 bytes long,
    too), which should be safe even with FAT file system drivers built into
    low-quality EFI firmwares.
+
+   If the random seed file has the read-only FAT file attribute set, or if the
+   ESP file system is read-only as a whole, the seed is neither updated nor
+   used: a seed that cannot be updated would be identical on every boot, and
+   hence must not be credited. Setting the read-only file attribute on
+   `/loader/random-seed` may thus be used to explicitly turn off random seed
+   handling, for example in OS images that are replicated to multiple systems.
 
 4. A kernel command line option `systemd.random_seed=` may be used to pass in a
    base64 encoded seed to initialize the kernel's entropy pool from during

@@ -5,7 +5,7 @@ set -o pipefail
 
 if [[ ! -x /usr/lib/systemd/systemd-journal-gatewayd ]]; then
     echo "Built without systemd-journal-gatewayd support, skipping the test"
-    exit 0
+    exit 77
 fi
 
 LOG_FILE="$(mktemp)"
@@ -88,6 +88,12 @@ curl -LSfs \
      --header "Range: entries=$TEST_CURSOR:1:1" \
      http://localhost:19531/entries?SYSLOG_IDENTIFIER="$TEST_TAG" >"$LOG_FILE"
 jq -se "length == 0" "$LOG_FILE"
+# A skip of INT64_MIN must not crash the daemon
+curl -LSs \
+     --header "Accept: application/json" \
+     --header "Range: entries=:-9223372036854775808:1" \
+     http://localhost:19531/entries >/dev/null || true
+curl -LSfs http://localhost:19531/entries >"$LOG_FILE"
 # Check if the specified cursor refers to an existing entry and return just that entry
 curl -LSfs \
      --header "Accept: application/json" \

@@ -6,11 +6,13 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <stdlib.h>
-#include <sys/prctl.h>
+#include <sys/prctl.h> /* IWYU pragma: keep */
 #include <sys/signalfd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#include "sd-json.h"
 
 #include "alloc-util.h"
 #include "ask-password-api.h"
@@ -19,20 +21,18 @@
 #include "daemon-util.h"
 #include "devnum-util.h"
 #include "dirent-util.h"
+#include "dlopen-note.h"
 #include "errno-util.h"
 #include "exit-status.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "format-table.h"
 #include "format-util.h"
 #include "inotify-util.h"
 #include "io-util.h"
 #include "main-func.h"
-#include "mkdir-label.h"
-#include "options.h"
+#include "mkdir.h"
 #include "path-util.h"
 #include "pidref.h"
-#include "pretty-print.h"
 #include "process-util.h"
 #include "set.h"
 #include "signal-util.h"
@@ -42,6 +42,7 @@
 #include "strv.h"
 #include "terminal-util.h"
 #include "time-util.h"
+#include "verbs.h"
 #include "wall.h"
 
 static enum {
@@ -56,6 +57,12 @@ static bool arg_console = false;
 static char *arg_device = NULL;
 
 STATIC_DESTRUCTOR_REGISTER(arg_device, freep);
+
+COMMAND(
+        "systemd-tty-ask-password-agent\0",
+        "Process system password requests.",
+        .man_pages = "systemd-tty-ask-password-agent(1)\0",
+);
 
 static int send_passwords(const char *socket_name, char **passwords) {
         int r;
@@ -441,33 +448,6 @@ static int process_and_watch_password_files(bool watch) {
         return 0;
 }
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        _cleanup_(table_unrefp) Table *options = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-tty-ask-password-agent", "1", &link);
-        if (r < 0)
-                return log_oom();
-
-        r = option_parser_get_help_table(&options);
-        if (r < 0)
-                return r;
-
-        printf("%s [OPTIONS...]\n"
-               "\n%sProcess system password requests.%s\n\n",
-               program_invocation_short_name,
-               ansi_highlight(),
-               ansi_normal());
-
-        r = table_print_or_warn(options);
-        if (r < 0)
-                return r;
-
-        printf("\nSee the %s for details.\n", link);
-        return 0;
-}
-
 static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
@@ -475,11 +455,11 @@ static int parse_argv(int argc, char *argv[]) {
         OptionParser opts = { argc, argv };
         int r;
 
-        FOREACH_OPTION(c, &opts, /* on_error= */ return c)
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return help();
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();
@@ -518,6 +498,9 @@ static int parse_argv(int argc, char *argv[]) {
                                         return r;
                         }
                         break;
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
         if (option_parser_get_n_args(&opts) > 0)
@@ -559,7 +542,7 @@ static int ask_on_this_console(const char *tty, char **arguments, PidRef *ret) {
         if (r < 0)
                 return r;
         if (r == 0) {
-                assert_se(prctl(PR_SET_PDEATHSIG, SIGHUP) >= 0);
+                assert_se(prctl_safe(PR_SET_PDEATHSIG, SIGHUP, 0, 0, 0) >= 0);
 
                 STRV_FOREACH(i, arguments) {
                         char *k;
@@ -699,6 +682,8 @@ static int ask_on_consoles(char *argv[]) {
 
 static int run(int argc, char *argv[]) {
         int r;
+
+        LIBSELINUX_NOTE(recommended);
 
         log_setup();
 

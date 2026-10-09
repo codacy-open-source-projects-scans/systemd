@@ -2,16 +2,19 @@
 
 systemd_sysupdate_sources = files(
         'sysupdate-cache.c',
+        'sysupdate-cleanup.c',
+        'sysupdate-config.c',
         'sysupdate-feature.c',
         'sysupdate-instance.c',
         'sysupdate-partition.c',
         'sysupdate-pattern.c',
         'sysupdate-resource.c',
+        'sysupdate-target.c',
         'sysupdate-transfer.c',
         'sysupdate-update-set.c',
         'sysupdate.c',
 )
-systemd_sysupdate_extract_sources = files(
+systemd_sysupdate_export_sources = files(
         'sysupdate-update-set-flags.c',
         'sysupdate-util.c',
 )
@@ -26,26 +29,29 @@ executables += [
                 'public' : true,
                 'conditions' : ['ENABLE_SYSUPDATE'],
                 'sources' : systemd_sysupdate_sources,
-                'extract' : systemd_sysupdate_extract_sources,
+                'export' : systemd_sysupdate_export_sources,
                 'dependencies' : [
                         libfdisk_cflags,
                         libopenssl_cflags,
-                        threads,
                 ],
         },
         libexec_template + {
                 'name' : 'systemd-sysupdated',
                 'dbus' : true,
                 'conditions' : ['ENABLE_SYSUPDATED'],
-                'sources' : files('sysupdated.c'),
-                'dependencies' : threads,
+                'sources' : files('sysupdated.c', 'sysupdate-target.c', 'sysupdate-util.c'),
         },
         executable_template + {
                 'name' : 'updatectl',
                 'public' : true,
                 'sources' : systemd_updatectl_sources,
-                'objects' : ['systemd-sysupdate'],
+                'import' : ['systemd-sysupdate'],
                 'conditions' : ['ENABLE_SYSUPDATED'],
+        },
+        test_template + {
+                'sources' : files('test-sysupdate-util.c'),
+                'import' : ['systemd-sysupdate'],
+                'conditions' : ['ENABLE_SYSUPDATE'],
         },
 ]
 

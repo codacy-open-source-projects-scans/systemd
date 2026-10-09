@@ -110,6 +110,13 @@ sensor:modalias:acpi:BMA250E:*:dmi:*:svnAcer:*:rnAigner:*       # Iconia Tab 8W 
  ACCEL_MOUNT_MATRIX=1, 0, 0; 0, -1, 0; 0, 0, 1
 
 #########################################
+# Advan
+#########################################
+
+sensor:modalias:acpi:NSA2513:*:dmi*:svnADVAN*:pn1301:*          # Evo-X 13 (Intel N150)
+ ACCEL_MOUNT_MATRIX=-1, 0, 0; 0, -1, 0; 0, 0, 1
+
+#########################################
 # Aquarius
 #########################################
 
@@ -343,7 +350,7 @@ sensor:modalias:acpi:KIOX000A:*:dmi:*:rvnDefaultstring:rnCherryTrailCR:*:sku2017
 # Cytrix (Mytrix)
 #########################################
 
-sensor:modalias:acpi:KIOX000A:*:dmi:svnCytrixTechnology:pnComplex11t:*    # Complex 11t
+sensor:modalias:acpi:KIOX000A:*:dmi:*:svnCytrixTechnology:pnComplex11t:*    # Complex 11t
  ACCEL_MOUNT_MATRIX=-1, 0, 0; 0, 1, 0; 0, 0, 1
 
 #########################################
@@ -374,6 +381,7 @@ sensor:modalias:platform:HID-SENSOR-200073:dmi:*:svnDellInc.:*:sku0CC4:*    # La
 sensor:modalias:platform:HID-SENSOR-200073:dmi:*:svnDellInc.:*:sku0CC5:*
 sensor:modalias:platform:HID-SENSOR-200073:dmi:*:svnDellInc.:*:sku0CC7:*    # Precision 5490
 sensor:modalias:platform:HID-SENSOR-200073:dmi:*:svnDellInc.:*:sku0CC8:*    # Precision 5690
+sensor:modalias:acpi:HID-SENSOR-200076:dmi:*:svnDellInc.:*:sku0A42:*    # Latitude 5320
  ACCEL_LOCATION=base
 
 sensor:modalias:acpi:INVN6500:*:dmi:*:svnDellInc.:pnVenue8Pro3845:*         # Venue 8 Pro 3845
@@ -520,7 +528,7 @@ sensor:modalias:acpi:BMI0160:*:dmi:*:svnGPD:pnG1619-04:*    # Win Max 2
  ACCEL_MOUNT_MATRIX=0, -1, 0; -1, 0, 0; 0, 0, 1
 
 sensor:modalias:acpi:MXC6655:*:dmi:*:svnGPD:pnG1688-08:*    # MicroPC 2
- ACCEL_MOUNT_MATRIX=0, -1, 0; -1, 0, 0; 0, 0, -1
+ ACCEL_MOUNT_MATRIX=-1, 0, 0; 0, 1, 0; 0, 0, -1
 
 #########################################
 # Hometech
@@ -617,6 +625,14 @@ sensor:modalias:acpi:KIOX0009:*:dmi:*:bvrJumper12x.WJ2012.bsBKRCP*:svnJumper:pnE
 # EZpad Go
 sensor:modalias:acpi:KIOX000A:*:dmi:bvnAmericanMegatrendsInc.:bvrZB-BI-11.6-SF133AR200-059-J:*:svnjumper:pnEZpad:*
  ACCEL_MOUNT_MATRIX=1, 0, 0; 0, -1, 0; 0, 0, 1
+
+#########################################
+# Juno Computers
+#########################################
+
+# Juno Tablet 4 (Wifi)
+sensor:modalias:acpi:MXC6655*:dmi:bvnAMI:bvr*:svnJunoComputers:pnjunotab4-wifi:*
+ ACCEL_MOUNT_MATRIX=0, -1, 0; 1, 0, 0; 0, 0, 1
 
 #########################################
 # Kazam
@@ -779,6 +795,13 @@ sensor:modalias:acpi:KIOX000A:*:dmi:*:svnMicrotech:pne-tabPro:*    # Microtech e
  ACCEL_MOUNT_MATRIX=-1, 0, 0; 0, 1, 0; 0, 0, 1
 
 #########################################
+# Minisforum
+#########################################
+
+sensor:modalias:acpi:SMOCF05:*:dmi:*:svnMicroComputer(HK)TechLimited:pnV3*:*    # V3, V3 SE
+ ACCEL_MOUNT_MATRIX=-1, 0, 0; 0, -1, 0; 0, 0, 1
+
+#########################################
 # MPMAN
 #########################################
 
@@ -823,6 +846,9 @@ sensor:modalias:acpi:KIOX000A:*:dmi:*:svnTMAX:pnTM101W610L:*    # Solo 10 Draw. 
 sensor:modalias:acpi:BOSC0200:*:dmi:bvnINSYDECorp.:bvrODYS.FUSIONWIN12:*    # Fusion Win 12 2in1
  ACCEL_MOUNT_MATRIX=-1, 0, 0; 0, 1, 0; 0, 0, 1
 
+sensor:modalias:acpi:SMO8500:*:dmi:*:svnAXDIAInternationalGmbH:pnWindeskX10:*    # Windesk X10
+ ACCEL_MOUNT_MATRIX=0, -1, 0; -1, 0, 0; 0, 0, 1
+
 #########################################
 # Onda
 #########################################
@@ -858,6 +884,10 @@ sensor:modalias:acpi:BOSC0200:*:dmi:bvnAmericanMegatrendsInc.:bvr5.12:bd07/17/20
 sensor:modalias:acpi:BMI0160:*:dmi:*:rnONEXPLAYER:rvrV01:*
  ACCEL_MOUNT_MATRIX=-1, 0, 0; 0, 1, 0; 0, 0, -1
 
+# One-Netbook OneXPlayer Super X
+sensor:modalias:acpi:BMI0160:*:dmi:*:svnONE-NETBOOK:pnONEXPLAYERSUPERX:*
+ ACCEL_MOUNT_MATRIX=0, -1, 0; 1, 0, 0; 0, 0, 1
+
 #########################################
 # OrangePi
 #########################################
@@ -878,13 +908,6 @@ sensor:modalias:acpi:MXC6655:*:dmi:*:svnDefaultstring*:pnP612F:*    # P612F
 
 sensor:modalias:acpi:SMO8500:*:dmi:*:svnPEAQ:pnPEAQPMMC1010MD99187:*    # MMC1010 2-in-1
  ACCEL_MOUNT_MATRIX=-1, 0, 0; 0, 1, 0; 0, 0, 1
-
-#########################################
-# Pine64
-#########################################
-
-sensor:modalias:of:NaccelerometerT_null_Csilan,sc7a20:*    # PineTab2
- ACCEL_MOUNT_MATRIX=0, 0, -1; 1, 0, 0; 0, -1, 0
 
 #########################################
 # Pipo
@@ -978,6 +1001,13 @@ sensor:modalias:acpi:KIOX000A:*:dmi:*:svnRCA:pnW101SA23T1:*    # W101SA23T1
 
 sensor:modalias:acpi:BOSC0200*:dmi:bvnAmericanMegatrendsInc.:bvrSCH12i.WJ210Z.KtBJRCA*:*    # SCT101CTM
  ACCEL_MOUNT_MATRIX=-1, 0, 0; 0, 1, 0; 0, 0, 1
+
+#########################################
+# Shift
+#########################################
+
+sensor:modalias:acpi:SMOCF00:*:dmi:*:svnSHIFT:pnSHIFT13mi:*    # SHIFTbook 1
+ ACCEL_MOUNT_MATRIX=1, 0, 0; 0, -1, 0; 0, 0, 1
 
 #########################################
 # Teclast
@@ -1084,6 +1114,14 @@ sensor:modalias:acpi:SMO8500*:dmi:*:svnUMAX:pnVisionBook10WiPlus:*
 
 sensor:modalias:acpi:MXC6655*:dmi:*:svnUMAX:pnVisionbook12WrTab:*
  ACCEL_MOUNT_MATRIX=0, 1, 0; 1, 0, 0; 0, 0, 1
+
+#########################################
+# Valve
+#########################################
+
+# Lizard mode must be off for the IMU to activate
+evdev:input:b0003v28DEp1205*
+ ACCEL_MOUNT_MATRIX=0, -1, 0; 1, 0, 0; 0, 0, 1
 
 #########################################
 # Voyo

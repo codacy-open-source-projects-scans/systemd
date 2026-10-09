@@ -2,6 +2,7 @@
 
 #include "bus-polkit.h"
 #include "fd-util.h"
+#include "fs-util.h"
 #include "json-util.h"
 #include "log.h"
 #include "string-util.h"
@@ -189,13 +190,21 @@ int manager_start_varlink_server(Manager *manager, int fd) {
                 return log_error_errno(r, "Failed to attach Varlink connection to event loop: %m");
 
         if (fd < 0)
-                r = sd_varlink_server_listen_address(v, UDEV_VARLINK_ADDRESS, 0600);
+                r = sd_varlink_server_listen_address(v, UDEV_VARLINK_ADDRESS, 0644);
         else
                 r = sd_varlink_server_listen_fd(v, fd);
         if (r < 0)
                 return log_error_errno(r, "Failed to bind to Varlink socket: %m");
 
         TAKE_FD(fd_close);
+
+        /* For backward compatibility. The existence of the file is used by udevadm settle, sd-device,
+         * libudev, and many external projects for checking if udevd is running. Note, it may be already
+         * created by PID1 through systemd-udevd-varlink.socket. But, we need to explicitly create it here,
+         * to make it created even in systemd-less systems or systemd-less initrd. */
+        r = symlink_idempotent(UDEV_VARLINK_ADDRESS, "/run/udev/control", /* make_relative= */ false);
+        if (r < 0)
+                log_warning_errno(r, "Failed to create symlink /run/udev/control to "UDEV_VARLINK_ADDRESS", ignoring: %m");
 
         r = sd_varlink_server_add_interface_many(
                         v,
@@ -209,6 +218,7 @@ int manager_start_varlink_server(Manager *manager, int fd) {
                         "io.systemd.service.Ping",           varlink_method_ping,
                         "io.systemd.service.Reload",         vl_method_reload,
                         "io.systemd.service.SetLogLevel",    vl_method_set_log_level,
+                        "io.systemd.service.GetLogLevel",    varlink_method_get_log_level,
                         "io.systemd.service.GetEnvironment", varlink_method_get_environment,
                         "io.systemd.Udev.SetTrace",          vl_method_set_trace,
                         "io.systemd.Udev.SetChildrenMax",    vl_method_set_children_max,

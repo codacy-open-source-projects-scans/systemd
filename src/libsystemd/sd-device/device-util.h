@@ -3,11 +3,11 @@
 
 #include "sd-device.h"
 
-#include "sd-forward.h"
+#include "forward.h"
 #include "log.h"
 
-#define device_unref_and_replace(a, b)                                  \
-        unref_and_replace_full(a, b, sd_device_ref, sd_device_unref)
+#define device_unref_and_replace_new_ref(a, b)                          \
+        unref_and_replace_new_ref(a, b, sd_device_ref, sd_device_unref)
 
 #define FOREACH_DEVICE_PROPERTY(device, key, value)                     \
         for (const char *value, *key = sd_device_get_property_first(device, &value); \
@@ -110,3 +110,10 @@ int device_sysname_startswith_strv(sd_device *device, char * const *prefixes, co
         device_sysname_startswith_strv(device, STRV_MAKE(__VA_ARGS__), NULL)
 
 bool device_property_can_set(const char *property) _pure_;
+
+int device_build_default_trigger_args(bool with_timestamp, char ***ret);
+int device_trigger_with_timestamp(
+                sd_device *dev,
+                sd_device_action_t action,
+                char * const *args,
+                sd_id128_t *ret_uuid);

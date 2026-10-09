@@ -2,26 +2,25 @@
 
 #include <unistd.h>
 
+#include "sd-json.h"
+
 #include "alloc-util.h"
-#include "ansi-color.h"
 #include "ask-password-api.h"
 #include "authenticode.h"
 #include "build.h"
 #include "copy.h"
 #include "crypto-util.h"
-#include "efi-fundamental.h"
+#include "dlopen-note.h"
+#include "efi.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "format-table.h"
 #include "fs-util.h"
 #include "install-file.h"
 #include "io-util.h"
 #include "log.h"
 #include "main-func.h"
-#include "options.h"
 #include "parse-argument.h"
 #include "pe-binary.h"
-#include "pretty-print.h"
 #include "stat-util.h"
 #include "string-util.h"
 #include "time-util.h"
@@ -47,46 +46,13 @@ STATIC_DESTRUCTOR_REGISTER(arg_private_key_source, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_signed_data, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_signed_data_signature, freep);
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        _cleanup_(table_unrefp) Table *options = NULL, *verbs = NULL;
-        int r;
+COMMAND(
+        "systemd-sbsign\0",
+        "Sign PE binaries for EFI Secure Boot.",
+        .man_pages = "systemd-sbsign(1)\0",
+);
 
-        r = terminal_urlify_man("systemd-sbsign", "1", &link);
-        if (r < 0)
-                return log_oom();
-
-        r = verbs_get_help_table(&verbs);
-        if (r < 0)
-                return r;
-
-        r = option_parser_get_help_table(&options);
-        if (r < 0)
-                return r;
-
-        (void) table_sync_column_widths(0, verbs, options);
-
-        printf("%s [OPTIONS...] COMMAND ...\n"
-               "\n%sSign binaries for EFI Secure Boot%s\n"
-               "\n%sCommands:%s\n",
-               program_invocation_short_name,
-               ansi_highlight(), ansi_normal(),
-               ansi_underline(), ansi_normal());
-
-        r = table_print_or_warn(verbs);
-        if (r < 0)
-                return r;
-
-        printf("\n%sOptions:%s\n", ansi_underline(), ansi_normal());
-        r = table_print_or_warn(options);
-        if (r < 0)
-                return r;
-
-        printf("\nSee the %s for details.\n", link);
-        return 0;
-}
-
-VERB_COMMON_HELP_HIDDEN(help);
+VERB_COMMON_HELP_AUTO_HIDDEN();
 
 static int parse_argv(int argc, char *argv[], char ***ret_args) {
         assert(argc >= 0);
@@ -96,11 +62,11 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
         OptionParser opts = { argc, argv };
         int r;
 
-        FOREACH_OPTION(c, &opts, /* on_error= */ return c)
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return help();
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();
@@ -162,6 +128,9 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                                 return r;
 
                         break;
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
         if (arg_private_key_source && !arg_certificate)
@@ -208,8 +177,7 @@ static int spc_indirect_data_content_new(const void *digest, size_t digestsz, ui
                 return log_oom();
 
         if (sym_ASN1_STRING_set(link->value.file->value.unicode, obsolete, sizeof(obsolete)) == 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to set ASN1 string: %s",
-                                       sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                return log_openssl_errors(LOG_ERR, "Failed to set ASN1 string");
 
         _cleanup_(SpcPeImageData_freep) SpcPeImageData *peid = SpcPeImageData_new();
         if (!peid)
@@ -220,8 +188,7 @@ static int spc_indirect_data_content_new(const void *digest, size_t digestsz, ui
         _cleanup_free_ uint8_t *peidraw = NULL;
         int peidrawsz = i2d_SpcPeImageData(peid, &peidraw);
         if (peidrawsz < 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to convert SpcPeImageData to BER: %s",
-                                       sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                return log_openssl_errors(LOG_ERR, "Failed to convert SpcPeImageData to BER");
 
         _cleanup_(SpcIndirectDataContent_freep) SpcIndirectDataContent *idc = SpcIndirectDataContent_new();
         idc->data->value = sym_ASN1_TYPE_new();
@@ -235,16 +202,14 @@ static int spc_indirect_data_content_new(const void *digest, size_t digestsz, ui
 
         idc->data->type = sym_OBJ_txt2obj(SPC_PE_IMAGE_DATA_OBJID, /* no_name= */ 1);
         if (!idc->data->type)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to get SpcPeImageData object: %s",
-                                       sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                return log_openssl_errors(LOG_ERR, "Failed to get SpcPeImageData object");
 
         if (!sym_ASN1_STRING_set(idc->data->value->value.sequence, peidraw, peidrawsz))
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to set ASN1_STRING data.");
+                return log_openssl_errors(LOG_ERR, "Failed to set ASN1_STRING data.");
 
         idc->messageDigest->digestAlgorithm->algorithm = sym_OBJ_nid2obj(NID_sha256);
         if (!idc->messageDigest->digestAlgorithm->algorithm)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to get SHA256 object: %s",
-                                       sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                return log_openssl_errors(LOG_ERR, "Failed to get SHA256 object");
 
         idc->messageDigest->digestAlgorithm->parameters = sym_ASN1_TYPE_new();
         if (!idc->messageDigest->digestAlgorithm->parameters)
@@ -253,14 +218,12 @@ static int spc_indirect_data_content_new(const void *digest, size_t digestsz, ui
         idc->messageDigest->digestAlgorithm->parameters->type = V_ASN1_NULL;
 
         if (sym_ASN1_OCTET_STRING_set(idc->messageDigest->digest, digest, digestsz) == 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to set digest: %s",
-                                       sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                return log_openssl_errors(LOG_ERR, "Failed to set digest");
 
         _cleanup_free_ uint8_t *idcraw = NULL;
         int idcrawsz = i2d_SpcIndirectDataContent(idc, &idcraw);
         if (idcrawsz < 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to convert SpcIndirectDataContent to BER: %s",
-                                       sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                return log_openssl_errors(LOG_ERR, "Failed to convert SpcIndirectDataContent to BER");
 
         *ret_idc = TAKE_PTR(idcraw);
         *ret_idcsz = (size_t) idcrawsz;
@@ -278,8 +241,7 @@ static int asn1_timestamp(ASN1_TIME **ret) {
         if (epoch == USEC_INFINITY) {
                 time = sym_X509_gmtime_adj(NULL, 0);
                 if (!time)
-                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to get current time: %s",
-                                               sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                        return log_openssl_errors(LOG_ERR, "Failed to get current time");
         } else {
                 time = sym_ASN1_TIME_set(NULL, (time_t) (epoch / USEC_PER_SEC));
                 if (!time)
@@ -328,12 +290,10 @@ static int pkcs7_new_with_attributes(
                 return log_oom();
 
         if (sym_PKCS7_add_attrib_smimecap(si, smcap) == 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to add smimecap signed attribute to signer info: %s",
-                                       sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                return log_openssl_errors(LOG_ERR, "Failed to add smimecap signed attribute to signer info");
 
         if (sym_PKCS7_add_attrib_content_type(si, NULL) == 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to add content type signed attribute to signer info: %s",
-                                       sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                return log_openssl_errors(LOG_ERR, "Failed to add content type signed attribute to signer info");
 
         _cleanup_(ASN1_TIME_freep) ASN1_TIME *time = NULL;
         r = asn1_timestamp(&time);
@@ -341,19 +301,16 @@ static int pkcs7_new_with_attributes(
                 return r;
 
         if (sym_PKCS7_add0_attrib_signing_time(si, time) == 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to add signing time signed attribute to signer info: %s",
-                                       sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                return log_openssl_errors(LOG_ERR, "Failed to add signing time signed attribute to signer info");
 
         TAKE_PTR(time);
 
         ASN1_OBJECT *idc = sym_OBJ_txt2obj(SPC_INDIRECT_DATA_OBJID, /* no_name= */ true);
         if (!idc)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to get SpcIndirectDataContent object: %s",
-                                       sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                return log_openssl_errors(LOG_ERR, "Failed to get SpcIndirectDataContent object");
 
         if (sym_PKCS7_add_signed_attribute(si, NID_pkcs9_contentType, V_ASN1_OBJECT, idc) == 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to add signed attribute to pkcs7 signer info: %s",
-                                       sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                return log_openssl_errors(LOG_ERR, "Failed to add signed attribute to pkcs7 signer info");
 
         *ret_p7 = TAKE_PTR(p7);
         *ret_si = TAKE_PTR(si);
@@ -365,8 +322,7 @@ static int pkcs7_populate_data_bio(PKCS7* p7, const void *data, size_t size, BIO
 
         _cleanup_(BIO_free_allp) BIO *bio = sym_PKCS7_dataInit(p7, NULL);
         if (!bio)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to create PKCS7 data bio: %s",
-                                       sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                return log_openssl_errors(LOG_ERR, "Failed to create PKCS7 data bio");
 
         int tag, class;
         long psz;
@@ -374,12 +330,10 @@ static int pkcs7_populate_data_bio(PKCS7* p7, const void *data, size_t size, BIO
 
         /* This function weirdly enough reports errors by setting the 0x80 bit in its return value. */
         if (sym_ASN1_get_object(&p, &psz, &tag, &class, size) & 0x80)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to parse ASN.1 object: %s",
-                                       sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                return log_openssl_errors(LOG_ERR, "Failed to parse ASN.1 object");
 
         if (sym_BIO_write(bio, p, psz) < 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to write to PKCS7 data bio: %s",
-                                       sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                return log_openssl_errors(LOG_ERR, "Failed to write to PKCS7 data bio");
 
         *ret = TAKE_PTR(bio);
 
@@ -393,29 +347,25 @@ static int pkcs7_add_digest_attribute(PKCS7 *p7, BIO *data, PKCS7_SIGNER_INFO *s
 
         BIO *mdbio = sym_BIO_find_type(data, BIO_TYPE_MD);
         if (!mdbio)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to find digest bio: %s",
-                                       sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                return log_openssl_errors(LOG_ERR, "Failed to find digest bio");
 
         EVP_MD_CTX *mdc;
         if (sym_BIO_get_md_ctx(mdbio, &mdc) <= 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to get digest context from bio: %s",
-                                       sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                return log_openssl_errors(LOG_ERR, "Failed to get digest context from bio");
 
         unsigned char digest[EVP_MAX_MD_SIZE];
         unsigned digestsz;
 
         if (sym_EVP_DigestFinal_ex(mdc, digest, &digestsz) == 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to get digest: %s",
-                                       sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                return log_openssl_errors(LOG_ERR, "Failed to get digest");
 
         if (sym_PKCS7_add1_attrib_digest(si, digest, digestsz) == 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to add PKCS9 message digest signed attribute to signer info: %s",
-                                       sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                return log_openssl_errors(LOG_ERR, "Failed to add PKCS9 message digest signed attribute to signer info");
 
         return 0;
 }
 
-VERB(verb_sign, "sign", "EXEFILE", 2, 2, 0,
+VERB(verb_sign, "sign", "EXEFILE\0", 2, 2, 0,
      "Sign the given binary for EFI Secure Boot");
 static int verb_sign(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(openssl_ask_password_ui_freep) OpenSSLAskPasswordUI *ui = NULL;
@@ -461,7 +411,7 @@ static int verb_sign(int argc, char *argv[], uintptr_t _data, void *userdata) {
                 if (arg_private_key_source_type == OPENSSL_KEY_SOURCE_FILE) {
                         r = parse_path_argument(arg_private_key, /* suppress_root= */ false, &arg_private_key);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to parse private key path %s: %m", arg_private_key);
+                                return r;
                 }
 
                 r = openssl_load_private_key(
@@ -492,8 +442,7 @@ static int verb_sign(int argc, char *argv[], uintptr_t _data, void *userdata) {
 
                 const uint8_t *p = content;
                 if (!sym_ASN1_item_d2i((ASN1_VALUE **) &signed_attributes, &p, contentsz, sym_PKCS7_ATTR_SIGN_it()))
-                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to parse signed attributes: %s",
-                                               sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                        return log_openssl_errors(LOG_ERR, "Failed to parse signed attributes");
         }
 
         if (arg_signed_data_signature) {
@@ -561,8 +510,7 @@ static int verb_sign(int argc, char *argv[], uintptr_t _data, void *userdata) {
                 _cleanup_free_ unsigned char *abuf = NULL;
                 int alen = sym_ASN1_item_i2d((ASN1_VALUE *)si->auth_attr, &abuf, sym_PKCS7_ATTR_SIGN_it());
                 if (alen < 0 || !abuf)
-                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to convert signed attributes ASN.1 to DER: %s",
-                                               sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                        return log_openssl_errors(LOG_ERR, "Failed to convert signed attributes ASN.1 to DER");
 
                 r = loop_write(dstfd, abuf, alen);
                 if (r < 0)
@@ -585,8 +533,7 @@ static int verb_sign(int argc, char *argv[], uintptr_t _data, void *userdata) {
                         return r;
 
                 if (sym_PKCS7_dataFinal(p7, bio) == 0)
-                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to sign data: %s",
-                                               sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                        return log_openssl_errors(LOG_ERR, "Failed to sign data");
         }
 
         _cleanup_(PKCS7_freep) PKCS7 *p7c = sym_PKCS7_new();
@@ -595,8 +542,7 @@ static int verb_sign(int argc, char *argv[], uintptr_t _data, void *userdata) {
 
         p7c->type = sym_OBJ_txt2obj(SPC_INDIRECT_DATA_OBJID, /* no_name= */ true);
         if (!p7c->type)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to get SpcIndirectDataContent object: %s",
-                                       sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                return log_openssl_errors(LOG_ERR, "Failed to get SpcIndirectDataContent object");
 
         p7c->d.other = sym_ASN1_TYPE_new();
         if (!p7c->d.other)
@@ -608,20 +554,17 @@ static int verb_sign(int argc, char *argv[], uintptr_t _data, void *userdata) {
                 return log_oom();
 
         if (sym_ASN1_STRING_set(p7c->d.other->value.sequence, idcraw, idcrawsz) == 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to set ASN1 string: %s",
-                                       sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                return log_openssl_errors(LOG_ERR, "Failed to set ASN1 string");
 
         if (sym_PKCS7_set_content(p7, p7c) == 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to set PKCS7 data: %s",
-                                       sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                return log_openssl_errors(LOG_ERR, "Failed to set PKCS7 data");
 
         TAKE_PTR(p7c);
 
         _cleanup_free_ uint8_t *sig = NULL;
         int sigsz = sym_i2d_PKCS7(p7, &sig);
         if (sigsz < 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to convert PKCS7 signature to DER: %s",
-                                       sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                return log_openssl_errors(LOG_ERR, "Failed to convert PKCS7 signature to DER");
 
         _cleanup_free_ IMAGE_DOS_HEADER *dos_header = NULL;
         _cleanup_free_ PeHeader *pe_header = NULL;
@@ -634,7 +577,7 @@ static int verb_sign(int argc, char *argv[], uintptr_t _data, void *userdata) {
         if (!certificate_table)
                 return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "File lacks certificate table.");
 
-        r = copy_bytes(srcfd, dstfd, UINT64_MAX, COPY_REFLINK);
+        r = copy_bytes(srcfd, dstfd, UINT64_MAX, /* copy_flags= */ 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to copy %s to %s: %m", argv[1], tmp);
 
@@ -659,7 +602,7 @@ static int verb_sign(int argc, char *argv[], uintptr_t _data, void *userdata) {
                    &(WIN_CERTIFICATE_HEADER) {
                            .wRevision = htole16(0x200),
                            .wCertificateType = htole16(0x0002), /* PKCS7 signedData */
-                           .dwLength = htole32(ROUND_UP(certsz, 8)),
+                           .dwLength = htole32(certsz),
                    },
                    sizeof(WIN_CERTIFICATE_HEADER),
                    end);
@@ -723,6 +666,8 @@ static int verb_sign(int argc, char *argv[], uintptr_t _data, void *userdata) {
 static int run(int argc, char *argv[]) {
         int r;
 
+        LIBCRYPTO_NOTE(required);
+
         log_setup();
 
         char **args = NULL;
@@ -730,7 +675,7 @@ static int run(int argc, char *argv[]) {
         if (r <= 0)
                 return r;
 
-        return dispatch_verb_with_args(args, NULL);
+        return dispatch_verb(args, NULL);
 }
 
 DEFINE_MAIN_FUNCTION(run);

@@ -1,121 +1,85 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
-#include <stdio.h>
+#include "sd-json.h"
 
-#include "alloc-util.h"
 #include "build.h"
 #include "bus-object.h"
 #include "log.h"
-#include "pretty-print.h"
+#include "nulstr-util.h"
+#include "options.h"
 #include "runtime-scope.h"
 #include "service-util.h"
+#include "string-util.h"
 
-typedef enum HelpFlags {
-        HELP_WITH_BUS_INTROSPECT = 1 << 0,
-        HELP_WITH_RUNTIME_SCOPE  = 1 << 1,
-} HelpFlags;
-
-static int help(const char *program_path,
-                const char *service,
-                const char *description,
-                HelpFlags flags) {
-
-        _cleanup_free_ char *link = NULL;
-        int r;
-
-        r = terminal_urlify_man(service, "8", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%1$s [OPTIONS...]\n"
-               "\n%5$s%7$s%6$s\n"
-               "\nThis program takes no positional arguments.\n"
-               "\n%3$sOptions:%4$s\n"
-               "  -h --help                 Show this help\n"
-               "     --version              Show package version\n"
-               "%8$s"
-               "%9$s"
-               "\nSee the %2$s for details.\n",
-               program_path,
-               link,
-               ansi_underline(),
-               ansi_normal(),
-               ansi_highlight(),
-               ansi_normal(),
-               description,
-               FLAGS_SET(flags, HELP_WITH_BUS_INTROSPECT) ? "     --bus-introspect=PATH  Write D-Bus XML introspection data\n" : "",
-               FLAGS_SET(flags, HELP_WITH_RUNTIME_SCOPE)  ? "     --system               Start service in system mode\n"
-                                                            "     --user                 Start service in user mode\n" : "");
-
-        return 0; /* No further action */
-}
-
-int service_parse_argv(
-                const char *service,
-                const char *description,
+int _service_parse_argv(
+                const Verb *verbs,
+                const Verb *verbs_end,
+                const Option *options,
+                const Option *options_end,
                 const BusObjectImplementation* const* bus_objects,
                 RuntimeScope *runtime_scope,
                 int argc, char *argv[]) {
 
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_BUS_INTROSPECT,
-                ARG_SYSTEM,
-                ARG_USER,
-        };
-
-        static const struct option options[] = {
-                { "help",           no_argument,       NULL, 'h'                },
-                { "version",        no_argument,       NULL, ARG_VERSION        },
-                { "bus-introspect", required_argument, NULL, ARG_BUS_INTROSPECT },
-                { "system",         no_argument,       NULL, ARG_SYSTEM         },
-                { "user",           no_argument,       NULL, ARG_USER           },
-                {}
-        };
-
-        int c;
-
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
+        const CommandDescription *cmd = NULL;
+        assert_se(_verbs_find_command(verbs, verbs_end, "service", &cmd));
+
+        /* The COMMAND description must reference the option namespace defined below, and list
+         * exactly the option groups matching the features the service supports. Options outside of
+         * the listed groups are treated as unknown. */
+        assert(streq_ptr(cmd->option_namespace, "service"));
+        assert(nulstr_contains(cmd->option_groups, "Options"));
+        assert(!!bus_objects == nulstr_contains(cmd->option_groups, "Bus introspection"));
+        assert(!!runtime_scope == nulstr_contains(cmd->option_groups, "Runtime scope"));
+
+        OptionParser opts = {
+                argc, argv,
+                .namespace = "service",
+                .option_groups = cmd->option_groups,
+        };
+
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
-                        return help(argv[0],
-                                    service,
-                                    description,
-                                    (bus_objects ? HELP_WITH_BUS_INTROSPECT : 0) |
-                                    (runtime_scope ? HELP_WITH_RUNTIME_SCOPE : 0));
+                OPTION_NAMESPACE("service"): {}
 
-                case ARG_VERSION:
+                OPTION_GROUP("Options"): {}
+
+                OPTION_COMMON_HELP:
+                        return _command_print_help_full(
+                                        verbs, verbs_end,
+                                        options, options_end,
+                                        cmd->names,
+                                        /* footer_ansi_seq= */ NULL);
+
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case ARG_BUS_INTROSPECT:
-                        return bus_introspect_implementations(
-                                        stdout,
-                                        optarg,
-                                        bus_objects);
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return _introspect_cli(
+                                        verbs, verbs_end,
+                                        options, options_end,
+                                        SD_JSON_FORMAT_OFF);
 
-                case ARG_SYSTEM:
-                case ARG_USER:
-                        if (!runtime_scope)
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "This service cannot be run in --system or --user mode, refusing.");
+                OPTION_GROUP("Bus introspection"): {}
 
-                        *runtime_scope = c == ARG_SYSTEM ? RUNTIME_SCOPE_SYSTEM : RUNTIME_SCOPE_USER;
+                OPTION_LONG("bus-introspect", "PATH", "Write D-Bus XML introspection data"):
+                        return bus_introspect_implementations(stdout, opts.arg, ASSERT_PTR(bus_objects));
+
+                OPTION_GROUP("Runtime scope"): {}
+
+                OPTION_LONG_DATA("system", NULL, /* data= */ RUNTIME_SCOPE_SYSTEM,
+                                 "Start service in system mode"): {}
+                OPTION_LONG_DATA("user", NULL, /* data= */ RUNTIME_SCOPE_USER,
+                                 "Start service in user mode"):
+                        *ASSERT_PTR(runtime_scope) = opts.opt->data;
                         break;
-
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
                 }
 
-        if (optind < argc)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "This program takes no arguments.");
+        if (option_parser_get_n_args(&opts) > 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "This program takes no arguments.");
 
         return 1; /* Further action */
 }

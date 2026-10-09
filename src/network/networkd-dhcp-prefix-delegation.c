@@ -14,6 +14,7 @@
 #include "in-addr-prefix-util.h"
 #include "networkd-address.h"
 #include "networkd-address-generation.h"
+#include "networkd-dhcp-common.h"
 #include "networkd-dhcp-prefix-delegation.h"
 #include "networkd-dhcp6.h"
 #include "networkd-link.h"
@@ -269,6 +270,10 @@ int dhcp_pd_remove(Link *link, bool only_marked) {
                         RET_GATHER(ret, address_remove_and_cancel(address, link));
                 }
         }
+
+        if (!only_marked)
+                /* Also drop pending requests when the lease is lost or the client is stopped. */
+                RET_GATHER(ret, link_drop_requests(link, NETWORK_CONFIG_SOURCE_DHCP_PD));
 
         return ret;
 }
@@ -851,6 +856,8 @@ static int dhcp_request_unreachable_route(
         route->protocol = RTPROT_DHCP;
         route->priority = IP6_RT_PRIO_USER;
         route->lifetime_usec = lifetime_usec;
+        if (source == NETWORK_CONFIG_SOURCE_DHCP6 && !route->table_set)
+                route->table = link_get_dhcp6_route_table(link);
 
         r = route_adjust_nexthops(route, link);
         if (r < 0)

@@ -6,6 +6,7 @@
 
 #include "sd-varlink.h"
 
+#include "cgroup-setup.h"
 #include "cgroup-util.h"
 #include "common-signal.h"
 #include "daemon-util.h"
@@ -21,6 +22,7 @@
 #include "io-util.h"
 #include "list.h"
 #include "notify-recv.h"
+#include "path-util.h"
 #include "pidref.h"
 #include "prioq.h"
 #include "process-util.h"
@@ -33,10 +35,8 @@
 #include "time-util.h"
 #include "udev-builtin.h"
 #include "udev-config.h"
-#include "udev-ctrl.h"
 #include "udev-error.h"
 #include "udev-manager.h"
-#include "udev-manager-ctrl.h"
 #include "udev-rules.h"
 #include "udev-spawn.h"
 #include "udev-trace.h"
@@ -47,63 +47,6 @@
 
 #define EVENT_REQUEUE_INTERVAL_USEC (200 * USEC_PER_MSEC)
 #define EVENT_REQUEUE_TIMEOUT_USEC  (3 * USEC_PER_MINUTE)
-
-typedef enum EventState {
-        EVENT_UNDEF,
-        EVENT_QUEUED,
-        EVENT_RUNNING,
-        EVENT_LOCKED,
-        EVENT_PROCESSED,
-} EventState;
-
-typedef struct Event {
-        /* All events that have not been processed (state != EVENT_PROCESSED) are referenced by the Manager.
-         * Additionally, an event may be referenced by events blocked by this event. See event_find_blocker(). */
-        unsigned n_ref;
-
-        Manager *manager;
-        Worker *worker;
-        EventState state;
-
-        sd_device *dev;
-
-        sd_device_action_t action;
-        uint64_t seqnum;
-        const char *id;
-        const char *devpath;
-        const char *devpath_old;
-        const char *devnode;
-
-        /* Used when the device is locked by another program. */
-        usec_t requeue_next_usec;
-        usec_t requeue_timeout_usec;
-        unsigned locked_event_prioq_index;
-        char *whole_disk;
-        LIST_FIELDS(Event, same_disk);
-
-        /* The last blocker for this event. This event must not be processed before the blocker is processed. */
-        Event *blocker;
-
-        LIST_FIELDS(Event, event);
-} Event;
-
-typedef enum WorkerState {
-        WORKER_UNDEF,
-        WORKER_RUNNING,
-        WORKER_IDLE,
-        WORKER_KILLED,
-} WorkerState;
-
-typedef struct Worker {
-        Manager *manager;
-        PidRef pidref;
-        sd_event_source *child_event_source;
-        sd_event_source *timeout_warning_event_source;
-        sd_event_source *timeout_kill_event_source;
-        union sockaddr_union address;
-        WorkerState state;
-        Event *event;
-} Worker;
 
 static void event_unset_whole_disk(Event *event) {
         Manager *manager = ASSERT_PTR(ASSERT_PTR(event)->manager);
@@ -169,12 +112,17 @@ static Event* event_enter_processed(Event *event) {
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(Event*, event_enter_processed);
 
-static Worker* worker_free(Worker *worker) {
+Worker* worker_free(Worker *worker) {
         if (!worker)
                 return NULL;
 
         if (worker->manager)
                 hashmap_remove(worker->manager->workers, &worker->pidref);
+
+        /* If an event is still attached, clear its back-pointer so it doesn't dangle (mirrors event_free(),
+         * which clears the worker's pointer). */
+        if (worker->event)
+                worker->event->worker = NULL;
 
         sd_event_source_disable_unref(worker->child_event_source);
         sd_event_source_unref(worker->timeout_warning_event_source);
@@ -216,7 +164,6 @@ Manager* manager_free(Manager *manager) {
 
         sd_device_monitor_unref(manager->monitor);
 
-        udev_ctrl_unref(manager->ctrl);
         sd_varlink_server_unref(manager->varlink_server);
 
         sd_event_source_unref(manager->inotify_event);
@@ -226,14 +173,20 @@ Manager* manager_free(Manager *manager) {
         sd_event_source_unref(manager->kill_workers_event);
         sd_event_unref(manager->event);
 
-        free(manager->cgroup);
+        free(manager->workers_cgroup);
+        strv_free(manager->device_trigger_args);
         return mfree(manager);
 }
 
 Manager* manager_new(void) {
-        Manager *manager;
+        int r;
 
-        manager = new(Manager, 1);
+        _cleanup_strv_free_ char **args = NULL;
+        r = device_build_default_trigger_args(/* with_timestamp= */ false, &args);
+        if (r < 0)
+                return NULL;
+
+        Manager *manager = new(Manager, 1);
         if (!manager)
                 return NULL;
 
@@ -244,6 +197,7 @@ Manager* manager_new(void) {
                 .config_by_kernel = UDEV_CONFIG_INIT,
                 .config_by_control = UDEV_CONFIG_INIT,
                 .config = UDEV_CONFIG_INIT,
+                .device_trigger_args = TAKE_PTR(args),
         };
 
         return manager;
@@ -300,12 +254,14 @@ int manager_reset_kill_workers_timer(Manager *manager) {
 void manager_exit(Manager *manager) {
         assert(manager);
 
+        if (manager->exit)
+                return;
+
         manager->exit = true;
 
         (void) sd_notify(/* unset_environment= */ false, NOTIFY_STOPPING_MESSAGE);
 
         /* close sources of new events and discard buffered events */
-        manager->ctrl = udev_ctrl_unref(manager->ctrl);
         manager->varlink_server = sd_varlink_server_unref(manager->varlink_server);
         (void) manager_serialize_config(manager);
 
@@ -331,6 +287,9 @@ void notify_ready(Manager *manager) {
 
         assert(manager);
 
+        if (manager->exit)
+                return;
+
         r = sd_notifyf(/* unset_environment= */ false,
                        "READY=1\n"
                        "STATUS=Processing with %u children at max", manager->config.children_max);
@@ -345,6 +304,9 @@ void manager_reload(Manager *manager, bool force) {
         int r;
 
         assert(manager);
+
+        if (manager->exit)
+                return;
 
         assert_se(sd_event_now(manager->event, CLOCK_MONOTONIC, &now_usec) >= 0);
         if (!force && now_usec < usec_add(manager->last_usec, 3 * USEC_PER_SEC))
@@ -586,6 +548,14 @@ static int worker_spawn(Manager *manager, Event *event) {
                         .manager_pid = manager_pid,
                 };
 
+                if (manager->workers_cgroup) {
+                        r = cg_attach(manager->workers_cgroup, /* pid= */ 0);
+                        if (r < 0) {
+                                log_error_errno(r, "Failed to move worker into cgroup '%s': %m", manager->workers_cgroup);
+                                _exit(EXIT_FAILURE);
+                        }
+                }
+
                 if (setenv("NOTIFY_SOCKET", manager->worker_notify_socket_path, /* overwrite= */ true) < 0) {
                         log_error_errno(errno, "Failed to set $NOTIFY_SOCKET: %m");
                         _exit(EXIT_FAILURE);
@@ -683,7 +653,7 @@ static void event_find_blocker(Event *event) {
                 log_device_debug(event->dev, "SEQNUM=%" PRIu64 " blocked by SEQNUM=%" PRIu64,
                                  event->seqnum, e->seqnum);
 
-                unref_and_replace_full(event->blocker, e, event_ref, event_unref);
+                unref_and_replace_new_ref(event->blocker, e, event_ref, event_unref);
                 return;
         }
 
@@ -1344,15 +1314,25 @@ static int on_post(sd_event_source *s, void *userdata) {
                 return 0;
         }
 
+        /* Check whether there are uevents not received yet. If so, we will soon receive them. Do not remove
+         * the queue file and do not kill workers. */
+        if (sd_event_source_get_pending(sd_device_monitor_get_event_source(manager->monitor)) != 0)
+                return 0;
+
+        /* We are currently synthesizing change uevents, hence new uevents may come soon. */
+        if (!set_isempty(manager->synthesize_change_child_event_sources))
+                return 0;
+
         (void) manager_unlink_queue_file(manager);
         (void) manager_reset_kill_workers_timer(manager);
 
         if (!hashmap_isempty(manager->workers))
                 return 0; /* There still exist idle workers. */
 
-        if (manager->cgroup && set_isempty(manager->synthesize_change_child_event_sources))
-                /* cleanup possible left-over processes in our cgroup */
-                (void) cg_kill(manager->cgroup, SIGKILL, CGROUP_IGNORE_SELF, /* killed_pids= */ NULL, /* log_kill= */ NULL, /* userdata= */ NULL);
+        if (manager->workers_cgroup)
+                /* cleanup possible left-over processes in the workers cgroup */
+                if (cg_kill_kernel_sigkill(manager->workers_cgroup, /* ret_n_pids_killed= */ NULL) == -EOPNOTSUPP)
+                        (void) cg_kill(manager->workers_cgroup, SIGKILL, CGROUP_IGNORE_SELF, /* killed_pids= */ NULL, /* log_kill= */ NULL, /* userdata= */ NULL);
 
         return 0;
 }
@@ -1410,9 +1390,20 @@ static int manager_setup_event(Manager *manager) {
         if (r < 0)
                 return log_error_errno(r, "Failed to create SIGHUP event source: %m");
 
-        r = sd_event_add_post(e, /* ret= */ NULL, on_post, manager);
+        _cleanup_(sd_event_source_unrefp) sd_event_source *s = NULL;
+        r = sd_event_add_post(e, &s, on_post, manager);
         if (r < 0)
                 return log_error_errno(r, "Failed to create post event source: %m");
+
+        r = sd_event_source_set_priority(s, EVENT_PRIORITY_POST);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set priority to post event source: %m");
+
+        (void) sd_event_source_set_description(s, "post-event-source");
+
+        r = sd_event_source_set_floating(s, true);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set floating to post event source: %m");
 
         /* Eventually, we probably want to do more here on memory pressure, for example, kill idle workers immediately */
         r = sd_event_add_memory_pressure(e, /* ret= */ NULL, /* callback= */ NULL, /* userdata= */ NULL);
@@ -1451,9 +1442,7 @@ static int manager_listen_fds(Manager *manager, int *ret_varlink_fd) {
                 if (streq(names[i], "varlink")) {
                         varlink_fd = fd;
                         r = 0;
-                } else if (streq(names[i], "systemd-udevd-control.socket"))
-                        r = manager_init_ctrl(manager, fd);
-                else if (streq(names[i], "systemd-udevd-kernel.socket"))
+                } else if (streq(names[i], "systemd-udevd-kernel.socket"))
                         r = manager_init_device_monitor(manager, fd);
                 else if (streq(names[i], "inotify"))
                         r = manager_init_inotify(manager, fd);
@@ -1480,12 +1469,30 @@ int manager_main(Manager *manager) {
         assert(manager);
 
         _cleanup_free_ char *cgroup = NULL;
-        r = cg_pid_get_path(0, &cgroup);
+        r = cg_pid_get_path(/* pid= */ 0, &cgroup);
         if (r < 0)
                 log_debug_errno(r, "Failed to get cgroup, ignoring: %m");
         else if (endswith(cgroup, "/udev")) { /* If we are in a subcgroup /udev/ we assume it was delegated to us */
                 log_debug("Running in delegated subcgroup '%s'.", cgroup);
-                manager->cgroup = TAKE_PTR(cgroup);
+
+                /* Try to create a sibling 'workers' cgroup and spawn all workers inside it, so that we can
+                 * use cgroup.kill to atomically clear all workers. */
+                _cleanup_free_ char *workers_cgroup = NULL;
+                r = path_extract_directory(cgroup, &workers_cgroup);
+                if (r < 0)
+                        return log_warning_errno(r, "Failed to extract parent of cgroup '%s': %m", cgroup);
+
+                if (!path_extend(&workers_cgroup, "workers"))
+                        return log_oom();
+
+                r = cg_create(workers_cgroup);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to create workers cgroup '%s', ignoring: %m", workers_cgroup);
+                else {
+                        log_debug("Running workers in delegated subcgroup '%s'.", workers_cgroup);
+                        manager->workers_cgroup = TAKE_PTR(workers_cgroup);
+                }
+
         }
 
         r = manager_setup_event(manager);
@@ -1493,10 +1500,6 @@ int manager_main(Manager *manager) {
                 return r;
 
         r = manager_listen_fds(manager, &varlink_fd);
-        if (r < 0)
-                return r;
-
-        r = manager_start_ctrl(manager);
         if (r < 0)
                 return r;
 

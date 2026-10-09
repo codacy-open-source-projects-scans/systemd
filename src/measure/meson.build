@@ -3,12 +3,11 @@
 executables += [
         libexec_template + {
                 'name' : 'systemd-measure',
-                'conditions' : [
-                        'HAVE_BLKID',
-                        'HAVE_OPENSSL',
-                        'HAVE_TPM2',
-                ],
+                'conditions' : ['ENABLE_MEASURE'],
                 'sources' : files('measure-tool.c'),
-                'dependencies' : libopenssl_cflags,
+                'dependencies' : [
+                        libopenssl_cflags,
+                        tpm2_cflags,
+                ],
         },
 ]

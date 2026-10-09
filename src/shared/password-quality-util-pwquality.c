@@ -1,25 +1,23 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "password-quality-util-pwquality.h"
-
 #include "errno-util.h"
 #include "log.h"
+#include "password-quality-util-pwquality.h"
 
 #if HAVE_PWQUALITY
+#ifndef SYSTEMD_CFLAGS_MARKER_LIBPWQUALITY
+#  error "missing libpwquality_cflags in meson dependency."
+#endif
 
 #include <pwquality.h>
 #include <stdio.h>
 #include <unistd.h>
-
-#include "sd-dlopen.h"
 
 #include "alloc-util.h"
 #include "dlfcn-util.h"
 #include "password-quality-util.h"
 #include "string-util.h"
 #include "strv.h"
-
-static void *pwquality_dl = NULL;
 
 static DLSYM_PROTOTYPE(pwquality_check) = NULL;
 static DLSYM_PROTOTYPE(pwquality_default_settings) = NULL;
@@ -156,11 +154,9 @@ int check_password_quality(const char *password, const char *old, const char *us
 
 int dlopen_pwquality(int log_level) {
 #if HAVE_PWQUALITY
-        SD_ELF_NOTE_DLOPEN(
-                        "pwquality",
-                        "Support for password quality checks",
-                        SD_ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED,
-                        "libpwquality.so.1");
+        static void *pwquality_dl = NULL;
+
+        LIBPWQUALITY_NOTE(suggested);
 
         return dlopen_many_sym_or_warn(
                         &pwquality_dl, "libpwquality.so.1", log_level,

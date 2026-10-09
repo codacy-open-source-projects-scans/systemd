@@ -34,6 +34,7 @@
 #include "rm-rf.h"
 #include "selinux-util.h"
 #include "smack-util.h"
+#include "stdio-util.h"
 #include "string-util.h"
 #include "strv.h"
 #include "tests.h"
@@ -42,6 +43,78 @@
 #include "uid-classification.h"
 #include "user-util.h"
 #include "virt.h"
+
+TEST(condition_test_list) {
+        Condition *condition, *sibling;
+        Architecture arch, other_arch;
+
+        ASSERT_OK(arch = uname_architecture());
+
+        ASSERT_OK_POSITIVE(condition_test_list(NULL, environ, NULL, NULL, NULL));
+
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_FIRMWARE, "smbios-field(malformed)", false, false)));
+        ASSERT_ERROR(condition_test_list(condition, environ, NULL, NULL, NULL), EINVAL);
+        condition_free(condition);
+
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_FIRMWARE, "smbios-field(malformed)", true, false)));
+        ASSERT_NOT_NULL((sibling = condition_new(CONDITION_ARCHITECTURE, architecture_to_string(arch), true, false)));
+        LIST_APPEND(conditions, condition, sibling);
+        ASSERT_OK_POSITIVE(condition_test_list(condition, environ, NULL, NULL, NULL));
+        condition_free_list(condition);
+
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_ARCHITECTURE, architecture_to_string(arch), true, false)));
+        ASSERT_NOT_NULL((sibling = condition_new(CONDITION_FIRMWARE, "smbios-field(malformed)", true, false)));
+        LIST_APPEND(conditions, condition, sibling);
+        ASSERT_OK_POSITIVE(condition_test_list(condition, environ, NULL, NULL, NULL));
+        condition_free_list(condition);
+
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_FIRMWARE, "smbios-field(malformed)", true, false)));
+        ASSERT_ERROR(condition_test_list(condition, environ, NULL, NULL, NULL), EINVAL);
+        condition_free(condition);
+
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_FIRMWARE, "smbios-field(malformed)", true, false)));
+        ASSERT_NOT_NULL((sibling = condition_new(CONDITION_PATH_EXISTS, "/thiscertainlywontexist", false, false)));
+        LIST_APPEND(conditions, condition, sibling);
+        ASSERT_OK_ZERO(condition_test_list(condition, environ, NULL, NULL, NULL));
+        condition_free_list(condition);
+
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_FIRMWARE, "smbios-field(malformed)", true, false)));
+        ASSERT_NOT_NULL((sibling = condition_new(CONDITION_PATH_EXISTS, "/bin/sh", false, false)));
+        LIST_APPEND(conditions, condition, sibling);
+        ASSERT_ERROR(condition_test_list(condition, environ, NULL, NULL, NULL), EINVAL);
+        condition_free_list(condition);
+
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_PATH_EXISTS, "/thiscertainlywontexist", false, false)));
+        ASSERT_NOT_NULL((sibling = condition_new(CONDITION_FIRMWARE, "smbios-field(malformed)", false, false)));
+        LIST_APPEND(conditions, condition, sibling);
+        ASSERT_OK_ZERO(condition_test_list(condition, environ, NULL, NULL, NULL));
+        condition_free_list(condition);
+
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_FIRMWARE, "smbios-field(malformed)", false, false)));
+        ASSERT_NOT_NULL((sibling = condition_new(CONDITION_PATH_EXISTS, "/thiscertainlywontexist", false, false)));
+        LIST_APPEND(conditions, condition, sibling);
+        ASSERT_OK_ZERO(condition_test_list(condition, environ, NULL, NULL, NULL));
+        condition_free_list(condition);
+
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_PATH_EXISTS, "/bin/sh", false, false)));
+        ASSERT_NOT_NULL((sibling = condition_new(CONDITION_ARCHITECTURE, architecture_to_string(arch), false, false)));
+        LIST_APPEND(conditions, condition, sibling);
+        ASSERT_OK_POSITIVE(condition_test_list(condition, environ, NULL, NULL, NULL));
+        condition_free_list(condition);
+
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_FIRMWARE, "smbios-field(malformed)", false, false)));
+        ASSERT_NOT_NULL((sibling = condition_new(CONDITION_ARCHITECTURE, architecture_to_string(arch), true, false)));
+        LIST_APPEND(conditions, condition, sibling);
+        ASSERT_ERROR(condition_test_list(condition, environ, NULL, NULL, NULL), EINVAL);
+        condition_free_list(condition);
+
+        other_arch = arch == ARCHITECTURE_X86_64 ? ARCHITECTURE_X86 : ARCHITECTURE_X86_64;
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_FIRMWARE, "smbios-field(malformed)", false, false)));
+        ASSERT_NOT_NULL((sibling = condition_new(CONDITION_ARCHITECTURE, architecture_to_string(other_arch), true, false)));
+        LIST_APPEND(conditions, condition, sibling);
+        ASSERT_OK_ZERO(condition_test_list(condition, environ, NULL, NULL, NULL));
+        condition_free_list(condition);
+}
 
 TEST(condition_test_path) {
         Condition *condition;
@@ -241,6 +314,85 @@ TEST(condition_test_host) {
         ASSERT_NOT_NULL((condition = condition_new(CONDITION_HOST, hostname, false, false)));
         ASSERT_OK_POSITIVE(condition_test(condition, environ));
         condition_free(condition);
+}
+
+TEST(condition_test_fraction) {
+        Condition *condition;
+        int r;
+
+        /* The 0%/100% boundaries are deterministic and short-circuit before the machine ID is even
+         * read, so these run everywhere. */
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_FRACTION, "0%", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_ZERO(condition_test(condition, environ));
+        condition_free(condition);
+
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_FRACTION, "100%", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_POSITIVE(condition_test(condition, environ));
+        condition_free(condition);
+
+        /* A tag does not change the boundary behaviour. */
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_FRACTION, "sometag 0%", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_ZERO(condition_test(condition, environ));
+        condition_free(condition);
+
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_FRACTION, "sometag 100%", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_POSITIVE(condition_test(condition, environ));
+        condition_free(condition);
+
+        /* Negation flips the boundaries. */
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_FRACTION, "100%", /* trigger= */ false, /* negate= */ true)));
+        ASSERT_OK_ZERO(condition_test(condition, environ));
+        condition_free(condition);
+
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_FRACTION, "0%", /* trigger= */ false, /* negate= */ true)));
+        ASSERT_OK_POSITIVE(condition_test(condition, environ));
+        condition_free(condition);
+
+        /* Malformed values must propagate an error rather than silently passing or failing. */
+        FOREACH_STRING(bad,
+                       "",                  /* empty */
+                       "abc",               /* not a number */
+                       "30",                /* missing percent sign */
+                       "30 %",              /* percent token is just '%' */
+                       "150%",              /* out of range */
+                       "tag 30% extra",     /* trailing garbage */
+                       "a b 30%") {         /* unquoted multi-word tag → trailing garbage */
+                ASSERT_NOT_NULL((condition = condition_new(CONDITION_FRACTION, bad, /* trigger= */ false, /* negate= */ false)));
+                ASSERT_FAIL(condition_test(condition, environ));
+                condition_free(condition);
+        }
+
+        sd_id128_t id;
+        r = sd_id128_get_machine(&id);
+        if (ERRNO_IS_NEG_MACHINE_ID_UNSET(r))
+                return (void) log_tests_skipped("/etc/machine-id missing");
+        ASSERT_OK(r);
+
+        /* Distribution check: for a fixed machine ID, varying the tag spreads results uniformly, so
+         * about PERCENT of the tags match. This is the statistical dual of the production scenario,
+         * where the tag is fixed and the machine ID varies across a fleet, and it also pins down the
+         * direction of the comparison (a higher percentage matches more, not fewer). The result is
+         * deterministic for a given machine ID, and the slack is many standard deviations wide, so
+         * this does not flake. */
+        static const unsigned percentages[] = { 1, 20, 50, 80 };
+        FOREACH_ELEMENT(pct, percentages) {
+                const unsigned n = 10000, slack = 3 * n / 100;  /* ±3 percentage points */
+                unsigned match = 0;
+
+                for (unsigned i = 0; i < n; i++) {
+                        char param[64];
+                        xsprintf(param, "tag-%u %u%%", i, *pct);
+
+                        ASSERT_NOT_NULL((condition = condition_new(CONDITION_FRACTION, param, /* trigger= */ false, /* negate= */ false)));
+                        r = ASSERT_OK(condition_test(condition, environ));
+                        match += r > 0;
+                        condition_free(condition);
+                }
+
+                unsigned expected = *pct * n / 100;
+                ASSERT_TRUE(match + slack >= expected);
+                ASSERT_TRUE(expected + slack >= match);
+        }
 }
 
 TEST(condition_test_architecture) {
@@ -766,12 +918,62 @@ TEST(condition_test_credential) {
         ASSERT_OK(set_unset_env("ENCRYPTED_CREDENTIALS_DIRECTORY", d2, /* overwrite= */ true));
 }
 
-#if defined(__i386__) || defined(__x86_64__)
 TEST(condition_test_cpufeature) {
         Condition *condition;
 
-        ASSERT_NOT_NULL((condition = condition_new(CONDITION_CPU_FEATURE, "fpu", false, false)));
-        ASSERT_OK_POSITIVE(condition_test(condition, environ));
+        switch (uname_architecture()) {
+        case ARCHITECTURE_X86:
+                ASSERT_NOT_NULL((condition = condition_new(CONDITION_CPU_FEATURE, "fpu", false, false)));
+                ASSERT_OK_POSITIVE(condition_test(condition, environ));
+                condition_free(condition);
+
+                ASSERT_NOT_NULL((condition = condition_new(CONDITION_CPU_FEATURE, "x86.fpu", false, false)));
+                ASSERT_OK_POSITIVE(condition_test(condition, environ));
+                condition_free(condition);
+
+                ASSERT_NOT_NULL((condition = condition_new(CONDITION_CPU_FEATURE, "bogus.fpu", false, false)));
+                ASSERT_OK_ZERO(condition_test(condition, environ));
+                condition_free(condition);
+                break;
+        case ARCHITECTURE_X86_64:
+                ASSERT_NOT_NULL((condition = condition_new(CONDITION_CPU_FEATURE, "fpu", false, false)));
+                ASSERT_OK_POSITIVE(condition_test(condition, environ));
+                condition_free(condition);
+
+                ASSERT_NOT_NULL((condition = condition_new(CONDITION_CPU_FEATURE, "x86-64.fpu", false, false)));
+                ASSERT_OK_POSITIVE(condition_test(condition, environ));
+                condition_free(condition);
+
+                ASSERT_NOT_NULL((condition = condition_new(CONDITION_CPU_FEATURE, "bogus.fpu", false, false)));
+                ASSERT_OK_ZERO(condition_test(condition, environ));
+                condition_free(condition);
+                break;
+        case ARCHITECTURE_ARM64: {
+                int expected = native_architecture() == ARCHITECTURE_ARM64;
+
+                ASSERT_NOT_NULL((condition = condition_new(CONDITION_CPU_FEATURE, "fp", false, false)));
+                ASSERT_OK_EQ(condition_test(condition, environ), expected);
+                condition_free(condition);
+
+                ASSERT_NOT_NULL((condition = condition_new(CONDITION_CPU_FEATURE, "asimd", false, false)));
+                ASSERT_OK_EQ(condition_test(condition, environ), expected);
+                condition_free(condition);
+
+                ASSERT_NOT_NULL((condition = condition_new(CONDITION_CPU_FEATURE, "arm64.asimd", false, false)));
+                ASSERT_OK_EQ(condition_test(condition, environ), expected);
+                condition_free(condition);
+
+                ASSERT_NOT_NULL((condition = condition_new(CONDITION_CPU_FEATURE, "bogus.asimd", false, false)));
+                ASSERT_OK_ZERO(condition_test(condition, environ));
+                condition_free(condition);
+                break;
+        }
+        default:
+                ;
+        }
+
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_CPU_FEATURE, "bogus.featurethatshouldnotexist", false, false)));
+        ASSERT_OK_ZERO(condition_test(condition, environ));
         condition_free(condition);
 
         ASSERT_NOT_NULL((condition = condition_new(CONDITION_CPU_FEATURE, "somecpufeaturethatreallydoesntmakesense", false, false)));
@@ -782,7 +984,6 @@ TEST(condition_test_cpufeature) {
         ASSERT_OK_ZERO(condition_test(condition, environ));
         condition_free(condition);
 }
-#endif
 
 TEST(condition_test_security) {
         Condition *condition;
@@ -957,7 +1158,8 @@ TEST(condition_test_group) {
         Condition *condition;
         char gid[DECIMAL_STR_MAX(uint32_t)];
         gid_t *gids, max_gid;
-        int ngroups_max, ngroups, r, i;
+        int ngroups, r, i;
+        int ngroups_max;
 
         xsprintf(gid, "%u", UINT32_C(0xFFFF));
         ASSERT_NOT_NULL((condition = condition_new(CONDITION_GROUP, gid, false, false)));
@@ -973,7 +1175,7 @@ TEST(condition_test_group) {
         ASSERT_OK_POSITIVE(r);
         condition_free(condition);
 
-        ngroups_max = ASSERT_OK_ERRNO(sysconf(_SC_NGROUPS_MAX));
+        ngroups_max = ASSERT_OK(sysconf_ngroups_max());
         ASSERT_GT(ngroups_max, 0);
 
         gids = newa(gid_t, ngroups_max);
@@ -1332,6 +1534,132 @@ TEST(condition_test_os_release) {
         ASSERT_NOT_NULL((condition = condition_new(CONDITION_OS_RELEASE, key_value_pair, false, false)));
         ASSERT_OK_POSITIVE(condition_test(condition, environ));
         condition_free(condition);
+}
+
+TEST(condition_test_machine_tag) {
+        Condition *condition;
+
+        /* etc_machine_info() caches the path on first use, so redirect it before anything reads it and
+         * rewrite the same file (truncating) for each scenario rather than switching paths. */
+        _cleanup_free_ char *saved = NULL;
+        ASSERT_OK(free_and_strdup(&saved, getenv("SYSTEMD_ETC_MACHINE_INFO")));
+
+        _cleanup_(rm_rf_physical_and_freep) char *d = NULL;
+        ASSERT_OK(mkdtemp_malloc(NULL, &d));
+
+        _cleanup_free_ char *f = path_join(d, "machine-info");
+        ASSERT_NOT_NULL(f);
+        ASSERT_OK_ERRNO(setenv("SYSTEMD_ETC_MACHINE_INFO", f, /* overwrite= */ true));
+
+        ASSERT_OK(write_string_file(f, "TAGS=\"webserver:frontend:berlin\"\n",
+                                    WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_TRUNCATE));
+
+        /* Exact match */
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "webserver", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_POSITIVE(condition_test(condition, environ));
+        condition_free(condition);
+
+        /* Glob match */
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "front*", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_POSITIVE(condition_test(condition, environ));
+        condition_free(condition);
+
+        /* No match */
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "database", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_ZERO(condition_test(condition, environ));
+        condition_free(condition);
+
+        /* Negation matches when the tag is absent, ... */
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "database", /* trigger= */ false, /* negate= */ true)));
+        ASSERT_OK_POSITIVE(condition_test(condition, environ));
+        condition_free(condition);
+
+        /* ... and does not match when the tag is present */
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "webserver", /* trigger= */ false, /* negate= */ true)));
+        ASSERT_OK_ZERO(condition_test(condition, environ));
+        condition_free(condition);
+
+        /* Invalid tags in the file are ignored (matching the Tags D-Bus property) */
+        ASSERT_OK(write_string_file(f, "TAGS=\"in valid:good\"\n",
+                                    WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_TRUNCATE));
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "in valid", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_ZERO(condition_test(condition, environ));
+        condition_free(condition);
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "good", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_POSITIVE(condition_test(condition, environ));
+        condition_free(condition);
+
+        /* No tags configured at all → never matches */
+        ASSERT_OK(write_string_file(f, "PRETTY_HOSTNAME=\"x\"\n",
+                                    WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_TRUNCATE));
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "webserver", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_ZERO(condition_test(condition, environ));
+        condition_free(condition);
+
+        /* Key/value (parameterized) tags */
+        ASSERT_OK(write_string_file(f, "TAGS=\"role=webserver:env=prod:berlin\"\n",
+                                    WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_TRUNCATE));
+
+        /* Exact match of a key/value tag */
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "role=webserver", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_POSITIVE(condition_test(condition, environ));
+        condition_free(condition);
+
+        /* Glob on the value */
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "role=web*", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_POSITIVE(condition_test(condition, environ));
+        condition_free(condition);
+
+        /* Glob on the key */
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "*=prod", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_POSITIVE(condition_test(condition, environ));
+        condition_free(condition);
+
+        /* A bare key does not match an assignment (the "=" is part of the tag) */
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "role", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_ZERO(condition_test(condition, environ));
+        condition_free(condition);
+
+        /* Right key, wrong value → no match */
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "role=database", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_ZERO(condition_test(condition, environ));
+        condition_free(condition);
+
+        /* A plain (non-parameterized) tag still matches alongside key/value tags */
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "berlin", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_POSITIVE(condition_test(condition, environ));
+        condition_free(condition);
+
+        /* Negation against a key/value tag */
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "role=database", /* trigger= */ false, /* negate= */ true)));
+        ASSERT_OK_POSITIVE(condition_test(condition, environ));
+        condition_free(condition);
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "role=webserver", /* trigger= */ false, /* negate= */ true)));
+        ASSERT_OK_ZERO(condition_test(condition, environ));
+        condition_free(condition);
+
+        /* Conflicting values for the same key: graceful parsing keeps the first (lexicographically smallest)
+         * value and drops the rest, so only "env=prod" remains visible. */
+        ASSERT_OK(write_string_file(f, "TAGS=\"env=staging:env=prod\"\n",
+                                    WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_TRUNCATE));
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "env=prod", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_POSITIVE(condition_test(condition, environ));
+        condition_free(condition);
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "env=staging", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_ZERO(condition_test(condition, environ));
+        condition_free(condition);
+
+        /* Invalid key/value tags in the file are ignored, valid ones still match */
+        ASSERT_OK(write_string_file(f, "TAGS=\"bad-=x:role=good\"\n",
+                                    WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_TRUNCATE));
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "bad-=x", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_ZERO(condition_test(condition, environ));
+        condition_free(condition);
+        ASSERT_NOT_NULL((condition = condition_new(CONDITION_MACHINE_TAG, "role=good", /* trigger= */ false, /* negate= */ false)));
+        ASSERT_OK_POSITIVE(condition_test(condition, environ));
+        condition_free(condition);
+
+        ASSERT_OK(set_unset_env("SYSTEMD_ETC_MACHINE_INFO", saved, /* overwrite= */ true));
 }
 
 TEST(condition_test_psi) {

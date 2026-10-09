@@ -5,22 +5,21 @@
 #include "sd-json.h"
 
 #include "alloc-util.h"
+#include "ansi-color.h"
 #include "ask-password-api.h"
 #include "build.h"
 #include "crypto-util.h"
+#include "dlopen-note.h"
 #include "efi-loader.h"
 #include "efivars.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "format-table.h"
 #include "hexdecoct.h"
 #include "log.h"
 #include "main-func.h"
-#include "options.h"
 #include "pager.h"
 #include "parse-argument.h"
 #include "parse-util.h"
-#include "pretty-print.h"
 #include "string-util.h"
 #include "strv.h"
 #include "tpm2-pcr.h"
@@ -34,6 +33,7 @@
 static char *arg_sections[_UNIFIED_SECTION_MAX] = {};
 static char **arg_banks = NULL;
 static char *arg_tpm2_device = NULL;
+static char *arg_policyref = NULL;
 static char *arg_private_key = NULL;
 static KeySourceType arg_private_key_source_type = OPENSSL_KEY_SOURCE_FILE;
 static char *arg_private_key_source = NULL;
@@ -49,6 +49,7 @@ static char *arg_append = NULL;
 
 STATIC_DESTRUCTOR_REGISTER(arg_banks, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_tpm2_device, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_policyref, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_private_key, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_private_key_source, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_public_key, freep);
@@ -64,57 +65,15 @@ static void free_sections(char*(*sections)[_UNIFIED_SECTION_MAX]) {
 
 STATIC_DESTRUCTOR_REGISTER(arg_sections, free_sections);
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        _cleanup_(table_unrefp) Table *verbs = NULL, *options = NULL, *options2 = NULL;
-        int r;
+COMMAND(
+        "systemd-measure\0",
+        "Pre-calculate and sign PCR hash for a unified kernel image (UKI).",
+        .man_pages = "systemd-measure(1)\0",
+        .pager_flags = &arg_pager_flags,
+        .flags = COMMAND_EXPERIMENTAL,
+);
 
-        r = terminal_urlify_man("systemd-measure", "1", &link);
-        if (r < 0)
-                return log_oom();
-
-        r = verbs_get_help_table(&verbs);
-        if (r < 0)
-                return r;
-
-        r = option_parser_get_help_table(&options);
-        if (r < 0)
-                return r;
-
-        r = option_parser_get_help_table_group("UKI PE Section Options", &options2);
-        if (r < 0)
-                return r;
-
-        (void) table_sync_column_widths(0, verbs, options, options2);
-
-        printf("%s [OPTIONS...] COMMAND ...\n"
-               "\n%sPre-calculate and sign PCR hash for a unified kernel image (UKI).%s\n"
-               "\n%sCommands:%s\n",
-               program_invocation_short_name,
-               ansi_highlight(), ansi_normal(),
-               ansi_underline(), ansi_normal());
-
-        r = table_print_or_warn(verbs);
-        if (r < 0)
-                return r;
-
-        printf("\n%sOptions:%s\n", ansi_underline(), ansi_normal());
-
-        r = table_print_or_warn(options);
-        if (r < 0)
-                return r;
-
-        printf("\n%sUKI PE Section Options:%s\n", ansi_underline(), ansi_normal());
-
-        r = table_print_or_warn(options2);
-        if (r < 0)
-                return r;
-
-        printf("\nSee the %s for details.\n", link);
-        return 0;
-}
-
-VERB_COMMON_HELP_HIDDEN(help);
+VERB_COMMON_HELP_AUTO_HIDDEN();
 
 static char *normalize_phase(const char *s) {
         _cleanup_strv_free_ char **l = NULL;
@@ -139,11 +98,11 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
         OptionParser opts = { argc, argv };
         int r;
 
-        FOREACH_OPTION(c, &opts, /* on_error= */ return c)
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return help();
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();
@@ -206,6 +165,13 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                         free_and_replace(arg_tpm2_device, device);
                         break;
                 }
+
+                OPTION_LONG("policyref", "STRING",
+                            "Set a policyref and include this in the signatures"):
+                        r = free_and_strdup_warn(&arg_policyref, opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
 
                 OPTION_COMMON_PRIVATE_KEY("Private key (PEM) to sign with"):
                         r = free_and_strdup_warn(&arg_private_key, opts.arg);
@@ -305,6 +271,9 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                         if (r < 0)
                                 return r;
                         break;
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(arg_json_format_flags);
                 }
 
         if (arg_public_key && arg_certificate)
@@ -416,8 +385,7 @@ static int validate_stub(void) {
         return 0;
 }
 
-VERB(verb_status, "status", NULL, VERB_ANY, 1, VERB_DEFAULT,
-     "Show current PCR values");
+VERB_DEFAULT_NOARG(verb_status, "status", "Show current PCR values");
 static int verb_status(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
         int r;
@@ -960,7 +928,7 @@ static int build_policy_digest(bool sign) {
                 if (arg_private_key_source_type == OPENSSL_KEY_SOURCE_FILE) {
                         r = parse_path_argument(arg_private_key, /* suppress_root= */ false, &arg_private_key);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to parse private key path %s: %m", arg_private_key);
+                                return r;
                 }
 
                 r = openssl_load_private_key(
@@ -1042,13 +1010,18 @@ static int build_policy_digest(bool sign) {
                         if (r < 0)
                                 return log_error_errno(r, "Could not calculate PolicyPCR digest: %m");
 
+                        _cleanup_(iovec_done) struct iovec tbs_data = {};
+                        r = tpm2_make_policy_authorize_tbs_data(&pcr_policy_digest, arg_policyref, &tbs_data);
+                        if (r < 0)
+                                return r;
+
                         _cleanup_free_ void *sig = NULL;
                         size_t ss = 0;
                         if (privkey) {
                                 /* We always use SHA256 for signing currently. Regardless of the bank. */
                                 const EVP_MD *sha256 = ASSERT_PTR(sym_EVP_get_digestbyname("sha256"));
 
-                                r = digest_and_sign(sha256, privkey, pcr_policy_digest.buffer, pcr_policy_digest.size, &sig, &ss);
+                                r = digest_and_sign(sha256, privkey, tbs_data.iov_base, tbs_data.iov_len, &sig, &ss);
                                 if (r == -EADDRNOTAVAIL)
                                         return log_error_errno(r, "Hash algorithm '%s' not available while signing. (Maybe OS security policy disables this algorithm?)", sym_EVP_MD_get0_name(p->md));
                                 if (r < 0)
@@ -1070,10 +1043,12 @@ static int build_policy_digest(bool sign) {
 
                         _cleanup_(sd_json_variant_unrefp) sd_json_variant *bv = NULL;
                         r = sd_json_buildo(&bv,
-                                           SD_JSON_BUILD_PAIR_VARIANT("pcrs", a),                                                   /* PCR mask */
-                                           SD_JSON_BUILD_PAIR_CONDITION(pubkey_fp_size > 0, "pkfp", SD_JSON_BUILD_HEX(pubkey_fp, pubkey_fp_size)), /* SHA256 fingerprint of public key (DER) used for the signature */
-                                           SD_JSON_BUILD_PAIR_HEX("pol", pcr_policy_digest.buffer, pcr_policy_digest.size),         /* TPM2 policy hash that is signed */
-                                           SD_JSON_BUILD_PAIR_CONDITION(ss > 0, "sig", SD_JSON_BUILD_BASE64(sig, ss)));                            /* signature data */
+                                           SD_JSON_BUILD_PAIR_VARIANT("pcrs", a),                                                                   /* PCR mask */
+                                           SD_JSON_BUILD_PAIR_CONDITION(pubkey_fp_size > 0, "pkfp", SD_JSON_BUILD_HEX(pubkey_fp, pubkey_fp_size)),  /* SHA256 fingerprint of public key (DER) used for the signature */
+                                           SD_JSON_BUILD_PAIR_CONDITION(!isempty(arg_policyref), "ref", SD_JSON_BUILD_STRING(arg_policyref)),       /* TPM2 policy reference */
+                                           SD_JSON_BUILD_PAIR_HEX("pol", pcr_policy_digest.buffer, pcr_policy_digest.size),                         /* TPM2 PolicyPCR digest */
+                                           SD_JSON_BUILD_PAIR_CONDITION(!sign, "tbs", SD_JSON_BUILD_HEX(tbs_data.iov_base, tbs_data.iov_len)),      /* data to sign offline */
+                                           SD_JSON_BUILD_PAIR_CONDITION(ss > 0, "sig", SD_JSON_BUILD_BASE64(sig, ss)));                             /* signature data */
                         if (r < 0)
                                 return log_error_errno(r, "Failed to build JSON object: %m");
 
@@ -1116,6 +1091,9 @@ static int verb_policy_digest(int argc, char *argv[], uintptr_t _data, void *use
 static int run(int argc, char *argv[]) {
         int r;
 
+        LIBCRYPTO_NOTE(required);
+        TPM2_NOTE(suggested);
+
         log_setup();
 
         char **args = NULL;
@@ -1127,7 +1105,7 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return r;
 
-        return dispatch_verb_with_args(args, NULL);
+        return dispatch_verb(args, NULL);
 }
 
 DEFINE_MAIN_FUNCTION(run);

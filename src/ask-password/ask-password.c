@@ -9,20 +9,18 @@
 #include "build.h"
 #include "bus-polkit.h"
 #include "constants.h"
-#include "format-table.h"
 #include "hashmap.h"
 #include "json-util.h"
 #include "log.h"
 #include "main-func.h"
-#include "options.h"
 #include "parse-argument.h"
-#include "pretty-print.h"
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
 #include "time-util.h"
 #include "varlink-io.systemd.AskPassword.h"
 #include "varlink-util.h"
+#include "verbs.h"
 
 static const char *arg_icon = NULL;
 static const char *arg_id = NULL;               /* identifier for 'ask-password' protocol */
@@ -38,35 +36,14 @@ static bool arg_varlink = false;
 
 STATIC_DESTRUCTOR_REGISTER(arg_message, freep);
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        _cleanup_(table_unrefp) Table *options = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-ask-password", "1", &link);
-        if (r < 0)
-                return log_oom();
-
-        r = option_parser_get_help_table(&options);
-        if (r < 0)
-                return r;
-
-        printf("%s [OPTIONS...] MESSAGE\n"
-               "\n%sQuery the user for a passphrase, via the TTY or a UI agent.%s\n"
-               "\nOptions:\n",
-               program_invocation_short_name,
-               ansi_highlight(),
-               ansi_normal());
-        r = table_print_or_warn(options);
-        if (r < 0)
-                return r;
-
-        printf("\nSee the %s for details.\n", link);
-        return 0;
-}
+COMMAND(
+        "systemd-ask-password\0",
+        "Query the user for a passphrase, via the TTY or a UI agent.",
+        .argspec = "MESSAGE\0",
+        .man_pages = "systemd-ask-password(1)\0",
+);
 
 static int parse_argv(int argc, char *argv[]) {
-
         const char *emoji = NULL;
         int r;
 
@@ -75,10 +52,10 @@ static int parse_argv(int argc, char *argv[]) {
 
         OptionParser opts = { argc, argv };
 
-        FOREACH_OPTION(c, &opts, /* on_error= */ return c)
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
                 OPTION_COMMON_HELP:
-                        return help();
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();
@@ -159,6 +136,9 @@ static int parse_argv(int argc, char *argv[]) {
                 OPTION_SHORT('n', NULL, "Do not suffix password written to standard output with newline"):
                         arg_newline = false;
                         break;
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
         if (isempty(emoji) || streq(emoji, "auto"))
@@ -250,6 +230,8 @@ static int vl_method_ask(sd_varlink *link, sd_json_variant *parameters, sd_varli
                 .push_cache = -1,
                 .echo_mode = _ECHO_MODE_INVALID,
         };
+        /* Local copy so that parameters passed are per-invocation */
+        AskPasswordFlags ask_flags = arg_flags;
         int r;
 
         assert(link);
@@ -265,7 +247,8 @@ static int vl_method_ask(sd_varlink *link, sd_json_variant *parameters, sd_varli
                         /* details= */ NULL,
                         /* good_user= */ FLAGS_SET(arg_flags, ASK_PASSWORD_USER) ? getuid() : UID_INVALID,
                         /* flags= */ 0,
-                        polkit_registry);
+                        polkit_registry,
+                        /* ret_admin= */ NULL);
         if (r <= 0)
                 return r;
 
@@ -285,21 +268,21 @@ static int vl_method_ask(sd_varlink *link, sd_json_variant *parameters, sd_varli
                 req.until = MIN(usec_add(now(CLOCK_MONOTONIC), p.timeout_usec), p.until_usec);
 
         /* If the timeout is set to zero, don't ask agents, just stick to cache */
-        SET_FLAG(arg_flags, ASK_PASSWORD_NO_AGENT, req.until == 0);
+        SET_FLAG(ask_flags, ASK_PASSWORD_NO_AGENT, req.until == 0);
 
         if (p.accept_cached >= 0)
-                SET_FLAG(arg_flags, ASK_PASSWORD_ACCEPT_CACHED, p.accept_cached);
+                SET_FLAG(ask_flags, ASK_PASSWORD_ACCEPT_CACHED, p.accept_cached);
 
         if (p.push_cache >= 0)
-                SET_FLAG(arg_flags, ASK_PASSWORD_PUSH_CACHE, p.push_cache);
+                SET_FLAG(ask_flags, ASK_PASSWORD_PUSH_CACHE, p.push_cache);
 
         if (p.echo_mode >= 0) {
-                SET_FLAG(arg_flags, ASK_PASSWORD_ECHO, p.echo_mode == ECHO_ON);
-                SET_FLAG(arg_flags, ASK_PASSWORD_SILENT, p.echo_mode == ECHO_OFF);
+                SET_FLAG(ask_flags, ASK_PASSWORD_ECHO, p.echo_mode == ECHO_ON);
+                SET_FLAG(ask_flags, ASK_PASSWORD_SILENT, p.echo_mode == ECHO_OFF);
         }
 
         _cleanup_strv_free_erase_ char **l = NULL;
-        r = ask_password_auto(&req, arg_flags, &l);
+        r = ask_password_auto(&req, ask_flags, &l);
         if (r == -EUNATCH)
                 return sd_varlink_error(link, "io.systemd.AskPassword.NoPasswordAvailable", NULL);
         if (r == -ETIME)

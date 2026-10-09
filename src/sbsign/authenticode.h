@@ -1,9 +1,13 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+#ifndef SYSTEMD_CFLAGS_MARKER_LIBOPENSSL
+#  error "missing libopenssl_cflags in meson dependency."
+#endif
+
 #include <openssl/asn1.h>
 
-#include "shared-forward.h"
+#include "forward.h"
 
 #define SPC_INDIRECT_DATA_OBJID "1.3.6.1.4.1.311.2.1.4"
 #define SPC_PE_IMAGE_DATA_OBJID "1.3.6.1.4.1.311.2.1.15"

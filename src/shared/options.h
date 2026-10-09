@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "memory-util.h"
-#include "shared-forward.h"
+#include "forward.h"
 
 /* Option namespace/group explanation:
  * the list of options is split into namespaces, and a namespace is split into groups.
@@ -28,9 +27,16 @@ typedef enum OptionFlags {
         OPTION_GROUP_MARKER        = 1U << 4,  /* Fake option entry to separate groups */
         OPTION_HELP_ENTRY          = 1U << 5,  /* Fake option entry to insert an additional help line */
         OPTION_HELP_ENTRY_VERBATIM = 1U << 6,  /* Same, but use the long_code in the first column as written */
+        OPTION_EXPERIMENTAL        = 1U << 7,  /* Experimental option that requires opt-in; marked as such in
+                                                * --help and --introspect-cli output */
 } OptionFlags;
 
-typedef struct Option {
+/* Note: the alignment attribute must match the one applied to each variable via _alignptr_ in
+ * _OPTION() below. Otherwise the struct's sizeof and the actual stride between consecutive entries
+ * placed in the SYSTEMD_OPTIONS section would not match on architectures where the natural
+ * alignment of the struct is smaller than sizeof(void*) (e.g. m68k). That would cause the
+ * pointer-arithmetic-based iteration over the section to read from padding bytes. */
+typedef struct _alignptr_ Option {
         int id;
         OptionFlags flags;
         char short_code;
@@ -39,6 +45,7 @@ typedef struct Option {
         uintptr_t data;
         const char *help;
 } Option;
+assert_cc(sizeof(Option) % sizeof(void*) == 0);
 
 #define _OPTION(counter, fl, sc, lc, mv, d, h)                          \
         _section_("SYSTEMD_OPTIONS")                                    \
@@ -80,11 +87,23 @@ typedef struct Option {
 #define OPTION_POSITIONAL OPTION_FULL(OPTION_POSITIONAL_ENTRY, /* sc= */ 0, "(positional)", /* mv= */ NULL, /* h= */ NULL)
 #define OPTION_HELP_VERBATIM(lc, h) OPTION_FULL(OPTION_HELP_ENTRY_VERBATIM, /* sc= */ 0, lc, /* mv= */ NULL, h)
 
+/* This can be used when custom error handling is needed. */
+#define OPTION_ERROR                                                    \
+        case INT_MIN ... -1
+
 #define OPTION_COMMON_HELP                                              \
         OPTION('h', "help", NULL, "Show this help")
 
 #define OPTION_COMMON_VERSION                                           \
         OPTION_LONG("version", NULL, "Show package version")
+
+/* A form used in udev, udevadm, and run0. */
+#define OPTION_COMMON_VERSION_WITH_V                                    \
+        OPTION('V', "version", NULL, "Show package version")
+
+#define OPTION_COMMON_INTROSPECT_CLI                                    \
+        /* This option is internal-only for now and not shown in --help */ \
+        OPTION_LONG("introspect-cli", NULL, /* help= */ NULL)
 
 #define OPTION_COMMON_NO_PAGER                                          \
         OPTION_LONG("no-pager", NULL, "Do not start a pager")
@@ -124,12 +143,27 @@ typedef struct Option {
 #define OPTION_COMMON_MACHINE                                           \
         OPTION('M', "machine", "CONTAINER", "Operate on local container")
 
+#define OPTION_COMMON_SYSTEM                                            \
+        OPTION_LONG("system", NULL, "Operate in system mode")
+
+#define OPTION_COMMON_USER                                              \
+        OPTION_LONG("user", NULL, "Operate in per-user mode")
+
 #define OPTION_COMMON_JSON                                              \
         OPTION_LONG("json", "FORMAT", "Generate JSON output (pretty, short, or off)")
 
 #define OPTION_COMMON_LOWERCASE_J                                       \
         OPTION_SHORT('j', NULL,                                         \
                      "Equivalent to --json=pretty (on TTY) or --json=short (otherwise)")
+
+#define OPTION_COMMON_ENTRY_TOKEN                                       \
+        OPTION_LONG("entry-token", "TOKEN",                             \
+                    "Entry token to use for this installation "         \
+                    "(machine-id, os-id, os-image-id, auto, literal:…)")
+
+#define OPTION_COMMON_MAKE_ENTRY_DIRECTORY                              \
+        OPTION_LONG("make-entry-directory",                             \
+                    "BOOL|auto", "Create $BOOT/ENTRY-TOKEN/ directory")
 
 #define OPTION_COMMON_PRIVATE_KEY(purpose)                              \
         OPTION_LONG("private-key", "PATH|URI", purpose)
@@ -149,11 +183,9 @@ typedef struct Option {
                     "Allows the certificate to be loaded from an OpenSSL provider " \
                     "(file, provider:PROVIDER)")
 
-/* A form used in udev code for compatibility. -V is accepted but not documented. */
-#define OPTION_COMMON_VERSION_WITH_HIDDEN_V                                      \
-        OPTION_COMMON_VERSION: {}                                                \
-        OPTION_SHORT('V', NULL, /* help= */ NULL)
-
+#define OPTION_COMMON_RESOLVE_NAMES                                     \
+        OPTION('N', "resolve-names", "MODE",                            \
+               "When to resolve users and groups (early, late, or never)")
 
 /* This is magically mapped to the beginning and end of the section */
 extern const Option __start_SYSTEMD_OPTIONS[];
@@ -191,6 +223,11 @@ typedef struct OptionParser {
         char **argv;                  /* The argv array, possibly reordered. */
         OptionParserMode mode;
         const char *namespace;        /* The namespace, may be NULL. */
+        const char *option_groups;    /* Optional nulstr with option groups to look at. When specified,
+                                       * only named option groups found in this list are used. */
+        int log_level_shift;          /* The log level difference from the default of LOG_ERR.
+                                       * Allowed values are -3..4.
+                                       * Use 4 == LOG_DEBUG - LOG_ERR to log at debug level. */
 
         const Option *namespace_start, *namespace_end; /* The range of options that are part of our namespace. */
 
@@ -213,30 +250,48 @@ int option_parse(
                 const Option options_end[],
                 OptionParser *state);
 
-/* Iterate over options. */
-#define FOREACH_OPTION(c, state, on_error)                              \
-        for (int c; (c = option_parse(ALIGN_PTR(__start_SYSTEMD_OPTIONS), __stop_SYSTEMD_OPTIONS, state)) != 0; ) \
-                if (c < 0) {                                            \
-                        on_error;                                       \
-                        break;                                          \
-                } else
+/* Iterate over options. Don't forget to handle errors (negative c)! */
+#define FOREACH_OPTION(c, state)                                        \
+        for (int c; (c = option_parse(__start_SYSTEMD_OPTIONS, __stop_SYSTEMD_OPTIONS, state)) != 0; )
 
-char* option_parser_next_arg(const OptionParser *state);
+#define FOREACH_OPTION_OR_RETURN(c, state)                              \
+        for (int c; (c = option_parse(__start_SYSTEMD_OPTIONS, __stop_SYSTEMD_OPTIONS, state)) != 0; ) \
+                if (c < 0)                                              \
+                        return c;                                       \
+                else
+
+/* Those helpers are used *during* option parsing and allow looking at or taking the next item in
+ * the argv array, either an option or a positional parameter. */
+char* option_parser_peek_next_arg(const OptionParser *state);
 char* option_parser_consume_next_arg(OptionParser *state);
 
+/* Those helpers are used *after* option parsing and return the positional arguments (and unparsed
+ * options in case option parsing was stopped early, e.g. via "--"). */
 char** option_parser_get_args(const OptionParser *state);
 size_t option_parser_get_n_args(const OptionParser *state);
+char* option_parser_get_arg(const OptionParser *state, size_t i);
+
 char* option_get_synopsis(const Option *opt, const char *joiner, bool show_metavar);
 
-int _option_parser_get_help_table_full(
+bool options_find_namespace(
                 const Option options[],
                 const Option options_end[],
                 const char *namespace,
-                const char *group,
-                Table **ret);
-#define option_parser_get_help_table_full(namespace, group, ret)        \
-        _option_parser_get_help_table_full(ALIGN_PTR(__start_SYSTEMD_OPTIONS), __stop_SYSTEMD_OPTIONS, namespace, group, ret)
-#define option_parser_get_help_table_group(group, ret)                  \
-        option_parser_get_help_table_full(/* namespace= */ NULL, group, ret)
-#define option_parser_get_help_table(ret)                               \
-        option_parser_get_help_table_group(/* group= */ NULL, ret)
+                const Option **ret_start,
+                const Option **ret_end);
+
+int options_get_help_table_group(
+                const Option options[],
+                const Option options_end[],
+                const char *option_groups,
+                Table **ret,
+                const char **ret_group);
+
+/* Build a JSON array of CLI-introspection option objects for the options in the given namespace.
+ * Returns NULL in *ret if the namespace defines no options. */
+int options_build_json(
+                const Option options[],
+                const Option options_end[],
+                const char *namespace,
+                const char *option_groups,
+                sd_json_variant **ret);

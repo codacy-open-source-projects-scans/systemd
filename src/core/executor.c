@@ -2,59 +2,40 @@
 
 #include <stdlib.h>
 
+#include "sd-json.h"
 #include "sd-messages.h"
 
-#include "alloc-util.h"
 #include "argv-util.h"
 #include "build.h"
 #include "capability-util.h"
 #include "cgroup.h"
+#include "dlopen-note.h"
 #include "dynamic-user.h"
 #include "exec-invoke.h"
 #include "execute.h"
 #include "execute-serialize.h"
+#include "executor.h"
 #include "exit-status.h"
 #include "fd-util.h"
 #include "fdset.h"
-#include "format-table.h"
 #include "label-util.h"
 #include "log.h"
 #include "options.h"
 #include "parse-util.h"
-#include "pretty-print.h"
 #include "selinux-util.h"
 #include "static-destruct.h"
+#include "verbs.h"
 
 static FILE *arg_serialization = NULL;
 
 STATIC_DESTRUCTOR_REGISTER(arg_serialization, fclosep);
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        _cleanup_(table_unrefp) Table *options = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd", "1", &link);
-        if (r < 0)
-                return log_oom();
-
-        r = option_parser_get_help_table(&options);
-        if (r < 0)
-                return r;
-
-        printf("%s [OPTIONS...]\n\n"
-               "%sSandbox and execute processes.%s\n\n",
-               program_invocation_short_name,
-               ansi_highlight(),
-               ansi_normal());
-
-        r = table_print_or_warn(options);
-        if (r < 0)
-                return r;
-
-        printf("\nSee the %s for details.\n", link);
-        return 0;
-}
+COMMAND(
+        "systemd-executor\0",
+        "Sandbox and execute processes.",
+        .man_pages = "systemd(1)\0",
+        .option_namespace = "systemd-executor",
+);
 
 static int parse_argv(int argc, char *argv[]) {
         int r;
@@ -62,13 +43,15 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        OptionParser opts = { argc, argv };
+        OptionParser opts = { argc, argv, .namespace = "systemd-executor" };
 
-        FOREACH_OPTION(c, &opts, /* on_error= */ return c)
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
+                OPTION_NAMESPACE("systemd-executor"): {}
+
                 OPTION_COMMON_HELP:
-                        return help();
+                        return command_print_help_name("systemd-executor");
 
                 OPTION_COMMON_VERSION:
                         return version();
@@ -124,6 +107,9 @@ static int parse_argv(int argc, char *argv[]) {
                         arg_serialization = f;
                         break;
                 }
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
         if (!arg_serialization)
@@ -226,8 +212,20 @@ static int run(int argc, char *argv[]) {
         return exit_status;
 }
 
-int main(int argc, char *argv[]) {
+int run_executor(int argc, char *argv[]) {
         int r;
+
+        LIBACL_NOTE(recommended);
+        LIBAPPARMOR_NOTE(recommended);
+        LIBBLKID_NOTE(recommended);
+        LIBBPF_NOTE(recommended);
+        LIBCRYPTO_NOTE(recommended);
+        LIBCRYPTSETUP_NOTE(recommended);
+        LIBMOUNT_NOTE(recommended);
+        LIBPAM_NOTE(recommended);
+        LIBSECCOMP_NOTE(recommended);
+        LIBSELINUX_NOTE(recommended);
+        TPM2_NOTE(suggested);
 
         /* We use safe_fork() for spawning sd-pam helper process, which internally calls rename_process().
          * As the last step of renaming, all saved argvs are memzero()-ed. Hence, we need to save the argv
@@ -241,3 +239,7 @@ int main(int argc, char *argv[]) {
 
         return r < 0 ? EXIT_FAILURE : r;
 }
+
+#if !SYSTEMD_MULTICALL_BINARY
+_alias_(run_executor) main;
+#endif

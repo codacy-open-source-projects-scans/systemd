@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # shellcheck shell=sh
 
 #  This file is part of systemd.
@@ -11,6 +12,15 @@
 # show the shell welcome string. These can be provisioned as system or service
 # credentials shell.prompt.prefix, shell.prompt.suffix and shell.welcome, and
 # are propagated into these environment variables by pam_systemd(8).
+
+# This file is "activated" through systemd-tmpfiles which links it into
+# /etc/profile.d/. To disable this, remove the
+# /etc/profile.d/70-systemd-shell-extra.sh symlink and mask the
+# 20-systemd-shell-extra.conf snippet (as root):
+#
+#   test -h /etc/profile.d/70-systemd-shell-extra.sh && \
+#     rm -v /etc/profile.d/70-systemd-shell-extra.sh && \
+#     ln -s /dev/null /etc/tmpfiles.d/20-systemd-shell-extra.conf
 
 if [ -n "${SHELL_PROMPT_PREFIX-}" ]; then
     if [ -n "${BASH_VERSION-}" ] && [ "$PS1" = "\\s-\\v\\\$ " ]; then

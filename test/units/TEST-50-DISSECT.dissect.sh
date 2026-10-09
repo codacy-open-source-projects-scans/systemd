@@ -11,7 +11,7 @@ set -o pipefail
 
 . /etc/os-release
 if [[ "${ID_LIKE:-}" == alpine ]]; then
-    # Alpine/postmarketOS builds libdevmapper and so on without systemd support, and seems to not wait for
+    # Alpine/Nura builds libdevmapper and so on without systemd support, and seems to not wait for
     # uevents for dm-X devices being processed by systemd-udevd. That causes a significant issue in
     # dissect-image.c especially when multiple dm-X devices are activated/deactivated in parallel.
     exit 0
@@ -19,6 +19,7 @@ fi
 
 systemd-dissect --json=short "$MINIMAL_IMAGE.raw" | \
     grep -F '{"rw":"ro","designator":"root","partition_uuid":null,"partition_label":null,"fstype":"squashfs","architecture":null,"verity":"external"' >/dev/null
+systemd-dissect --json=short "$MINIMAL_IMAGE.raw" | grep -F '"size":' >/dev/null
 systemd-dissect "$MINIMAL_IMAGE.raw" | grep -F "MARKER=1" >/dev/null
 # shellcheck disable=SC2153
 systemd-dissect "$MINIMAL_IMAGE.raw" | grep -F -f <(sed 's/"//g' "$OS_RELEASE") >/dev/null
@@ -411,7 +412,7 @@ ExecStart=bash -c ' \\
         sleep 0.1; \\
     done; \\
     mount; \\
-    mount | grep -F "on /tmp/img type squashfs" | grep -q -F "nosuid"; \\
+    mount | grep -F "on /tmp/img type squashfs" | grep -F "nosuid" >/dev/null; \\
 '
 EOF
 systemctl start testservice-50d.service
@@ -1065,6 +1066,18 @@ test ! -e "/dev/disk/by-loop-ref/$name"
 systemd-dissect --detach "$MINIMAL_IMAGE.raw"
 (! systemd-dissect --detach "$MINIMAL_IMAGE.raw")
 
+# --attach --relax also works on images that do not qualify as DDI, e.g. an entirely blank one
+BLANK_IMAGE="$(mktemp /var/tmp/blankXXX.raw)"
+truncate -s 16M "$BLANK_IMAGE"
+(! systemd-dissect --attach "$BLANK_IMAGE")
+LOOP="$(systemd-dissect --attach --relax "$BLANK_IMAGE")"
+test -b "$LOOP"
+systemd-dissect --detach "$LOOP"
+rm -f "$BLANK_IMAGE"
+
+# --relax makes no sense for the other verbs
+(! systemd-dissect --relax "$MINIMAL_IMAGE.raw")
+
 # check for confext functionality
 mkdir -p /run/confexts/test/etc/extension-release.d
 echo "ID=_any" >/run/confexts/test/etc/extension-release.d/extension-release.test
@@ -1079,8 +1092,129 @@ systemd-confext merge
 grep -q -F "MARKER_CONFEXT_123" /etc/testfile
 (! /etc/testscript)
 systemd-confext status
+systemd-confext status --json=pretty | jq -e 'any(.[]; .hierarchy == "/etc" and .extensions == ["test"] and .since != null)' >/dev/null
 systemd-confext unmerge
+systemd-confext status --json=pretty | jq -e 'any(.[]; .hierarchy == "/etc" and .extensions == [] and .since == null)' >/dev/null
 rm -rf /run/confexts/
+
+cleanup_sysupdate_notify_confext_mutable() {
+    local mutable_marker="$1"
+    local notify_socket_was_active="$2"
+
+    if [[ "$notify_socket_was_active" == "yes" ]]; then
+        systemctl restart systemd-sysupdate-notify-sysext.socket || :
+    else
+        systemctl stop systemd-sysupdate-notify-sysext.socket || :
+    fi
+
+    rm -f "$mutable_marker"
+    rm -f "/var/lib/extensions.mutable/etc/${mutable_marker#/etc/}"
+    systemd-confext unmerge || :
+    rm -f /run/systemd/confext.conf.d/50-test-mutable.conf
+    rm -rf /run/confexts/
+    rmdir /var/lib/extensions.mutable/etc /var/lib/extensions.mutable 2>/dev/null || :
+}
+
+test_sysupdate_notify_confext_mutable() {
+    local mutable_marker="/etc/test-confext-mutable-$RANDOM"
+    local notify_socket_was_active=no
+
+    if systemctl is-active --quiet systemd-sysupdate-notify-sysext.socket; then
+        notify_socket_was_active=yes
+    fi
+
+    trap 'cleanup_sysupdate_notify_confext_mutable "$mutable_marker" "$notify_socket_was_active"' RETURN ERR
+
+    # Check that the sysupdate notification refresh honors confext-specific configuration.
+    mkdir -p /run/systemd/confext.conf.d
+    cat >/run/systemd/confext.conf.d/50-test-mutable.conf <<EOF
+[ConfExt]
+Mutable=yes
+EOF
+    mkdir -p /run/confexts/test/etc/extension-release.d
+    echo "ID=_any" >/run/confexts/test/etc/extension-release.d/extension-release.test
+    echo "ARCHITECTURE=_any" >>/run/confexts/test/etc/extension-release.d/extension-release.test
+    echo "MARKER_CONFEXT_123" >/run/confexts/test/etc/testfile
+    systemd-confext merge
+    echo "MARKER_CONFEXT_MUTABLE" >"$mutable_marker"
+    systemctl start systemd-sysupdate-notify-sysext.socket
+    varlinkctl call /run/systemd/sysupdate/notify/io.systemd.sysext io.systemd.SysUpdate.Notify.OnCompletedUpdate '{}'
+    grep -F "MARKER_CONFEXT_MUTABLE" "$mutable_marker" >/dev/null
+    trap - RETURN ERR
+    cleanup_sysupdate_notify_confext_mutable "$mutable_marker" "$notify_socket_was_active"
+}
+
+test_sysupdate_notify_confext_mutable
+
+cleanup_sysupdate_notify_confext_before_sysext() {
+    local notify_socket_was_active="$1"
+
+    if [[ "$notify_socket_was_active" == "yes" ]]; then
+        systemctl restart systemd-sysupdate-notify-sysext.socket || :
+    else
+        systemctl stop systemd-sysupdate-notify-sysext.socket || :
+    fi
+
+    systemctl stop test-order-foo.service || :
+    systemd-sysext unmerge || :
+    systemd-confext unmerge || :
+    rm -rf /run/extensions/test-order /run/confexts/test-order
+    rm -f /run/test-order-marker
+}
+
+test_sysupdate_notify_confext_before_sysext() {
+    local notify_socket_was_active=no
+
+    if systemctl is-active --quiet systemd-sysupdate-notify-sysext.socket; then
+        notify_socket_was_active=yes
+    fi
+
+    trap 'cleanup_sysupdate_notify_confext_before_sysext "$notify_socket_was_active"' RETURN ERR
+
+    # Check that the sysupdate notification refresh merges confexts before sysexts, same order as for unit
+    # startup at boot. The confext ships a drop-in for a whole prefix of units, meaning it can't know what
+    # units to restart through EXTENSION_RESTART_UNITS= if it would be merged after the sysext that defines
+    # the unit affected by the drop-in. Only if the confext is merged first the unit picks up the drop-in.
+    # This is just one example the general scenario when a confext has to create state before a sysext's
+    # service is started and the confext does not know what sysext's services would be affected.
+    mkdir -p /run/confexts/test-order/etc/extension-release.d /run/confexts/test-order/etc/systemd/system/test-order-.service.d
+    cat >/run/confexts/test-order/etc/extension-release.d/extension-release.test-order <<EOF
+ID=_any
+ARCHITECTURE=_any
+EXTENSION_RELOAD_MANAGER=1
+EOF
+    cat >/run/confexts/test-order/etc/systemd/system/test-order-.service.d/10-marker.conf <<EOF
+[Service]
+Environment=MARKER=from-confext
+EOF
+
+    mkdir -p /run/extensions/test-order/usr/lib/extension-release.d /run/extensions/test-order/usr/lib/systemd/system
+    cat >/run/extensions/test-order/usr/lib/extension-release.d/extension-release.test-order <<EOF
+ID=_any
+ARCHITECTURE=_any
+EXTENSION_RELOAD_MANAGER=1
+EXTENSION_RESTART_UNITS=test-order-foo.service
+EOF
+    cat >/run/extensions/test-order/usr/lib/systemd/system/test-order-foo.service <<'EOF'
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=sh -c 'echo "${MARKER:-unset}" >/run/test-order-marker'
+EOF
+
+    systemctl start systemd-sysupdate-notify-sysext.socket
+    varlinkctl call /run/systemd/sysupdate/notify/io.systemd.sysext io.systemd.SysUpdate.Notify.OnCompletedUpdate '{}'
+
+    test -f /etc/systemd/system/test-order-.service.d/10-marker.conf
+    test -f /usr/lib/systemd/system/test-order-foo.service
+    systemctl --quiet is-active test-order-foo.service
+    grep -F "from-confext" /run/test-order-marker >/dev/null
+
+    trap - RETURN ERR
+    cleanup_sysupdate_notify_confext_before_sysext "$notify_socket_was_active"
+}
+
+test_sysupdate_notify_confext_before_sysext
 
 unsquashfs -force -no-xattrs -d /tmp/img "$MINIMAL_IMAGE.raw"
 systemd-run --unit=test-root-ephemeral \
@@ -1250,3 +1384,66 @@ rm -rf "$defs" "$imgs"
 (! systemd-run -P -p ExtensionImages="/this/should/definitely/not/exist.img" false)
 (! systemd-run -P -p RootImage="/this/should/definitely/not/exist.img" false)
 (! systemd-run -P -p ExtensionDirectories="/foo/bar /foo/baz" false)
+
+# Ensure a multi-device btrfs doesn't fail to mount due to loopdev
+# https://github.com/systemd/systemd/issues/42520:
+if [[ -f "${BTRFS_MEMBER1:-}" ]]; then
+    img="" mnt="" loop=""
+
+    # This block runs under 'set -e'; register cleanup up front so a failure in between can't leak the
+    # attached loop device or the image and perturb later device enumeration / udevadm settle.
+    # shellcheck disable=SC2317
+    cleanup_btrfs_mountimages() {
+        if [[ -n "$mnt" ]]; then
+            umount -R "$mnt" || true
+        fi
+        if [[ -n "$loop" ]]; then
+            # Drop the members from the kernel's global, boot-wide btrfs device cache before detaching;
+            # otherwise the cached entries dangle at recycled loop minors and trip multi-device detection in
+            # later tests reusing the same /dev/loopN.
+            btrfs device scan --forget "${loop}p1" "${loop}p2" || true
+            losetup -d "$loop" || true
+            # Pair the detach with a settle, like every other losetup -d in this test, so teardown isn't
+            # still in flight when control returns to the broader TEST-50 run.
+            udevadm settle --timeout=60 || true
+        fi
+        rm -f "$img"
+        # Only remove the mountpoint once it is confirmed unmounted, so a failed unmount above doesn't make
+        # rm -rf recurse through the mountpoint into the still-mounted filesystem.
+        if [[ -n "$mnt" ]] && ! mountpoint -q "$mnt"; then
+            rm -rf "$mnt"
+        fi
+    }
+    trap cleanup_btrfs_mountimages EXIT
+
+    img="$(mktemp /var/tmp/test-50-mountimages-btrfs.img.XXXXXXXXXX)"
+    mnt="$(mktemp -d "$IMAGE_DIR/test-50-mountimages-btrfs.mnt.XXXXXXXXXX")"
+    truncate -s 600M "$img"
+    echo -e 'label: gpt\nsize=280MiB, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, name=data1\ntype=0FC63DAF-8483-4772-8E79-3D69D8477DE4, name=data2' | sfdisk "$img"
+    loop="$(losetup --show -P -f "$img")"
+    udevadm wait --timeout=60 --settle --initialized=no "${loop}p1" "${loop}p2"
+    udevadm lock --timeout=60 --device="$loop" dd if="$BTRFS_MEMBER1" of="${loop}p1" bs=4M
+    udevadm lock --timeout=60 --device="$loop" dd if="$BTRFS_MEMBER2" of="${loop}p2" bs=4M
+    udevadm settle --timeout=60
+    btrfs device scan "${loop}p1" "${loop}p2"
+
+    mount -t btrfs "${loop}p1" "$mnt"
+    btrfs subvolume create "$mnt/@demo"
+    echo "MARKER=1" >"$mnt/@demo/os-release"
+    btrfs subvolume create "$mnt/@"
+    btrfs subvolume set-default "$mnt/@"
+    umount "$mnt"
+    mount -t btrfs "${loop}p1" "$mnt"
+
+    systemd-run -P \
+                -p MountImages="${loop}p1:/run/img-btrfs:subvol=@demo" \
+                cat /run/img-btrfs/os-release | grep -F "MARKER=1" >/dev/null
+    # Double check that there's no loopdev
+    src="$(systemd-run -P \
+                    -p MountImages="${loop}p1:/run/img-btrfs:subvol=@demo" \
+                    findmnt -n -o SOURCE /run/img-btrfs)"
+    assert_eq "${src%%\[*}" "${loop}p1"
+
+    trap - EXIT
+    cleanup_btrfs_mountimages
+fi

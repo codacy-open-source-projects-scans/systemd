@@ -3,7 +3,6 @@
  * Copyright © 2003-2004 Greg Kroah-Hartman <greg@kroah.com>
  */
 
-#include <getopt.h>
 #include <signal.h>
 #include <stdio.h>
 
@@ -11,8 +10,10 @@
 #include "sd-json.h"
 
 #include "alloc-util.h"
+#include "build.h"
 #include "device-private.h"
 #include "log.h"
+#include "options.h"
 #include "parse-argument.h"
 #include "static-destruct.h"
 #include "strv.h"
@@ -22,6 +23,7 @@
 #include "udev-rules.h"
 #include "udevadm.h"
 #include "udevadm-util.h"
+#include "verbs.h"
 
 static sd_device_action_t arg_action = SD_DEVICE_ADD;
 static ResolveNameTiming arg_resolve_name_timing = RESOLVE_NAME_EARLY;
@@ -32,56 +34,41 @@ static sd_json_format_flags_t arg_json_format_flags = SD_JSON_FORMAT_OFF;
 
 STATIC_DESTRUCTOR_REGISTER(arg_extra_rules_dir, strv_freep);
 
-static int help(void) {
-
-        printf("%s test [OPTIONS] DEVPATH\n\n"
-               "Test an event run.\n\n"
-               "  -h --help                            Show this help\n"
-               "  -V --version                         Show package version\n"
-               "  -a --action=ACTION|help              Set action string\n"
-               "  -N --resolve-names=early|late|never  When to resolve names\n"
-               "  -D --extra-rules-dir=DIR             Also load rules from the directory\n"
-               "  -v --verbose                         Show verbose logs\n"
-               "     --json=pretty|short|off           Generate JSON output\n",
-               program_invocation_short_name);
-
-        return 0;
-}
-
 static int parse_argv(int argc, char *argv[]) {
-        enum {
-                ARG_JSON = 0x100,
-        };
+        int r;
 
-        static const struct option options[] = {
-                { "action",          required_argument, NULL, 'a'      },
-                { "resolve-names",   required_argument, NULL, 'N'      },
-                { "extra-rules-dir", required_argument, NULL, 'D'      },
-                { "verbose",         no_argument,       NULL, 'v'      },
-                { "json",            required_argument, NULL, ARG_JSON },
-                { "version",         no_argument,       NULL, 'V'      },
-                { "help",            no_argument,       NULL, 'h'      },
-                {}
-        };
+        assert(argc >= 0);
+        assert(argv);
 
-        int r, c;
+        OptionParser opts = { argc, argv, .namespace = "udevadm-test" };
 
-        while ((c = getopt_long(argc, argv, "a:N:D:vVh", options, NULL)) >= 0)
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
-                case 'a':
-                        r = parse_device_action(optarg, &arg_action);
+
+                OPTION_NAMESPACE("udevadm-test"): {}
+
+                OPTION_COMMON_HELP:
+                        return command_print_verb_help("test");
+
+                OPTION_COMMON_VERSION_WITH_V:
+                        return version_only();
+
+                OPTION('a', "action", "ACTION|help", "Set action string"):
+                        r = parse_device_action(opts.arg, &arg_action);
                         if (r <= 0)
                                 return r;
                         break;
-                case 'N':
-                        r = parse_resolve_name_timing(optarg, &arg_resolve_name_timing);
+
+                OPTION_COMMON_RESOLVE_NAMES:
+                        r = parse_resolve_name_timing(opts.arg, &arg_resolve_name_timing);
                         if (r <= 0)
                                 return r;
                         break;
-                case 'D': {
+
+                OPTION('D', "extra-rules-dir", "DIR", "Also load rules from the directory"): {
                         _cleanup_free_ char *p = NULL;
 
-                        r = parse_path_argument(optarg, /* suppress_root= */ false, &p);
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &p);
                         if (r < 0)
                                 return r;
 
@@ -90,25 +77,23 @@ static int parse_argv(int argc, char *argv[]) {
                                 return log_oom();
                         break;
                 }
-                case 'v':
+
+                OPTION('v', "verbose", NULL, "Show verbose logs"):
                         arg_verbose = true;
                         break;
-                case ARG_JSON:
-                        r = parse_json_argument(optarg, &arg_json_format_flags);
+
+                OPTION_COMMON_JSON:
+                        r = parse_json_argument(opts.arg, &arg_json_format_flags);
                         if (r <= 0)
                                 return r;
                         break;
-                case 'V':
-                        return print_version();
-                case 'h':
-                        return help();
-                case '?':
-                        return -EINVAL;
-                default:
-                        assert_not_reached();
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(arg_json_format_flags);
                 }
 
-        arg_syspath = argv[optind];
+        char **args = option_parser_get_args(&opts);
+        arg_syspath = args[0];
         if (!arg_syspath)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "syspath parameter missing.");
 

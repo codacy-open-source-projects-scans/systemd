@@ -289,27 +289,47 @@ if conf.get('BPF_FRAMEWORK') == 1
         endif
 endif
 
-vmlinux_h_dependency = []
+vmlinux_h_depend_files = []
 if use_provided_vmlinux_h
         if not fs.exists(provided_vmlinux_h_path)
                 error('Path to provided vmlinux.h does not exist.')
         endif
         bpf_o_unstripped_cmd += ['-I' + fs.parent(provided_vmlinux_h_path)]
+        vmlinux_h_depend_files = [provided_vmlinux_h_path]
         message(f'Using provided @provided_vmlinux_h_path@')
 elif use_generated_vmlinux_h
-        vmlinux_h_dependency = custom_target(
-                output: 'vmlinux.h',
-                command : [ bpftool, 'btf', 'dump', 'file', '/sys/kernel/btf/vmlinux', 'format', 'c' ],
-                capture : true)
+        vmlinux_h_path = meson.current_build_dir() / 'vmlinux.h'
+        vmlinux_h_depend_files = [
+                configure_file(
+                        output : 'vmlinux.h',
+                        command : [ bpftool, 'btf', 'dump', 'file', '/sys/kernel/btf/vmlinux', 'format', 'c' ],
+                        capture : true)
+        ]
 
-        bpf_o_unstripped_cmd += ['-I' + fs.parent(vmlinux_h_dependency.full_path())]
-        generated_sources += vmlinux_h_dependency
-        message('Using generated @0@'.format(vmlinux_h_dependency.full_path()))
+        bpf_o_unstripped_cmd += ['-I' + fs.parent(vmlinux_h_path)]
+        message('Using generated @0@'.format(vmlinux_h_path))
 else
         message('Using neither provided nor generated vmlinux.h, some features will not be available.')
 endif
 
 conf.set10('HAVE_VMLINUX_H', use_provided_vmlinux_h or use_generated_vmlinux_h)
+
+# 'enum lsm_integrity_type' was added together with the bdev_setintegrity LSM
+# hook in kernel commit 2deeb6c333e5 (v6.5). The generated vmlinux.h reflects
+# the running kernel's BTF, which may lack the type if the relevant LSM support
+# is disabled in the kernel config; a provided vmlinux.h can be older, so probe.
+have_lsm_integrity_type = false
+if use_generated_vmlinux_h or use_provided_vmlinux_h
+        lsm_integrity_vmlinux_h_path = use_generated_vmlinux_h ? vmlinux_h_path : provided_vmlinux_h_path
+        have_lsm_integrity_type = cc.compiles(
+                '#include "@0@"\nenum lsm_integrity_type _t = LSM_INT_DMVERITY_SIG_VALID;\n'.format(lsm_integrity_vmlinux_h_path),
+                name : 'bdev_setintegrity LSM types in vmlinux.h')
+
+        if not have_lsm_integrity_type
+                message('vmlinux.h lacks bdev_setintegrity LSM types, disabling RestrictFileSystemAccess=.')
+        endif
+endif
+conf.set10('HAVE_LSM_INTEGRITY_TYPE', have_lsm_integrity_type)
 
 conf.set10('ENABLE_SYSCTL_BPF', conf.get('HAVE_VMLINUX_H') == 1 and libbpf.version().version_compare('>= 0.7'))
 
@@ -317,6 +337,11 @@ bpf_programs = [
         {
                 'source' : files('bind-iface.bpf.c'),
                 'condition' : 'BPF_FRAMEWORK',
+        },
+        {
+                'source' : files('restrict-fsaccess.bpf.c'),
+                'condition' : 'HAVE_LSM_INTEGRITY_TYPE',
+                'depend_files' : vmlinux_h_depend_files,
         },
         {
                 'source' : files('restrict-fs.bpf.c'),
@@ -333,12 +358,12 @@ bpf_programs = [
         {
                 'source' : files('sysctl-monitor.bpf.c'),
                 'condition' : 'ENABLE_SYSCTL_BPF',
-                'depends' : vmlinux_h_dependency,
+                'depend_files' : vmlinux_h_depend_files,
         },
         {
                 'source' : files('userns-restrict.bpf.c'),
                 'condition' : 'HAVE_VMLINUX_H',
-                'depends' : vmlinux_h_dependency,
+                'depend_files' : vmlinux_h_depend_files,
         },
 ]
 
@@ -358,7 +383,7 @@ foreach program : bpf_programs
                 input : source,
                 output : name + '.bpf.unstripped.o',
                 command : bpf_o_unstripped_cmd,
-                depends : program.get('depends', []))
+                depend_files : program.get('depend_files', []))
 
         bpf_o = custom_target(
                 input : bpf_o_unstripped,
@@ -376,7 +401,7 @@ foreach program : bpf_programs
         # Keeping it out of bpf_programs_by_name also keeps it out of the
         # clang-tidy per-source test loop, which would otherwise fall back
         # to a BPF compile_commands.json entry (no -Isrc/shared) and fail
-        # to resolve bpf-dlopen.h.
+        # to resolve bpf-util.h.
         configure_file(
                 input : 'bpf-skel-wrapper.h.in',
                 output : name + '-skel.h',

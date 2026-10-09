@@ -1,9 +1,13 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "shared-forward.h"
+#include "dlopen-note.h"
+#include "forward.h"
 
 #if HAVE_BLKID
+#  ifndef SYSTEMD_CFLAGS_MARKER_LIBBLKID
+#    error "missing libblkid_cflags in meson dependency."
+#  endif
 
 #include <blkid.h>
 
@@ -65,4 +69,4 @@ int blkid_probe_lookup_value_id128(blkid_probe b, const char *field, sd_id128_t 
 int blkid_probe_lookup_value_u64(blkid_probe b, const char *field, uint64_t *ret);
 #endif
 
-int dlopen_libblkid(int log_level);
+int dlopen_libblkid(int log_level) _dlopen_loader_;

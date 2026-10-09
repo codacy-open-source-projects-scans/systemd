@@ -6,26 +6,28 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "sd-json.h"
+
 #include "alloc-util.h"
 #include "assert.h"
 #include "build.h"
 #include "conf-files.h"
 #include "constants.h"
+#include "cpu-set-util.h"
+#include "dlopen-note.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "format-table.h"
 #include "log.h"
 #include "macro.h"
 #include "main-func.h"
 #include "module-util.h"
-#include "options.h"
 #include "ordered-set.h"
 #include "parse-util.h"
-#include "pretty-print.h"
 #include "proc-cmdline.h"
 #include "string-util.h"
 #include "strv.h"
+#include "verbs.h"
 
 #define MODULE_NAME_MAX_LEN (4096UL)
 
@@ -33,6 +35,13 @@ static char **arg_proc_cmdline_modules = NULL;
 static const char conf_file_dirs[] = CONF_PATHS_NULSTR("modules-load.d");
 
 STATIC_DESTRUCTOR_REGISTER(arg_proc_cmdline_modules, strv_freep);
+
+COMMAND(
+        "systemd-modules-load\0",
+        "Load statically configured kernel modules.",
+        .argspec = "[CONFIGURATION FILE…]\0",
+        .man_pages = "systemd-modules-load.service(8)\0",
+);
 
 static int modules_list_append_suffix(OrderedSet **module_set, char *modp) {
         /* take possession of string no matter what */
@@ -314,13 +323,13 @@ static unsigned determine_num_worker_threads(unsigned n_modules) {
         if (n_threads == UINT_MAX) {
                 /* By default, use a number of worker threads equal the number of online CPUs,
                  * but clamp it to avoid a probing storm on machines with many CPUs. */
-                long ncpus = sysconf(_SC_NPROCESSORS_ONLN);
-                if (ncpus < 0) {
-                        log_warning_errno(errno, "Failed to get number of online CPUs, ignoring: %m");
-                        ncpus = 1;
-                }
-
-                n_threads = CLAMP((unsigned)ncpus, 1U, 16U);
+                unsigned n_cpus;
+                r = cpus_online(&n_cpus);
+                if (r < 0) {
+                        log_warning_errno(r, "Failed to get number of online CPUs, ignoring: %m");
+                        n_threads = 1;
+                } else
+                        n_threads = CLAMP(n_cpus, 1U, 16U);
         }
 
         /* There's no reason to spawn more threads than the modules that need to be loaded */
@@ -330,30 +339,6 @@ static unsigned determine_num_worker_threads(unsigned n_modules) {
         return n_threads - 1U;
 }
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        _cleanup_(table_unrefp) Table *options = NULL;
-        int r;
-
-        if (terminal_urlify_man("systemd-modules-load.service", "8", &link) < 0)
-                return log_oom();
-
-        r = option_parser_get_help_table(&options);
-        if (r < 0)
-                return r;
-
-        printf("%s [OPTIONS...] [CONFIGURATION FILE...]\n\n"
-               "Loads statically configured kernel modules.\n\n",
-               program_invocation_short_name);
-
-        r = table_print_or_warn(options);
-        if (r < 0)
-                return r;
-
-        printf("\nSee the %s for details.\n", link);
-        return 0;
-}
-
 static int parse_argv(int argc, char *argv[], char ***ret_args) {
         assert(argc >= 0);
         assert(argv);
@@ -361,14 +346,17 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
 
         OptionParser opts = { argc, argv };
 
-        FOREACH_OPTION(c, &opts, /* on_error= */ return c)
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return help();
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
         *ret_args = option_parser_get_args(&opts);
@@ -388,6 +376,8 @@ static int run(int argc, char *argv[]) {
         size_t n_threads = 0;
         char *module;
         int ret = 0, r;
+
+        LIBKMOD_NOTE(required);
 
         char **args = NULL;
         r = parse_argv(argc, argv, &args);

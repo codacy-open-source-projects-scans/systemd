@@ -6,7 +6,7 @@
 #include "proto/block-io.h"
 #include "proto/device-path.h"
 #include "proto/disk-io.h"
-#include "string-util-fundamental.h"
+#include "string-util.h"
 #include "util.h"
 
 typedef struct {
@@ -60,7 +60,8 @@ static bool verify_gpt(/* const */ GptHeader *h, EFI_LBA lba_expected) {
         if (h->MyLBA != lba_expected)
                 return false;
 
-        if ((h->SizeOfPartitionEntry % sizeof(EFI_PARTITION_ENTRY)) != 0)
+        if (h->SizeOfPartitionEntry < sizeof(EFI_PARTITION_ENTRY) ||
+            (h->SizeOfPartitionEntry % sizeof(EFI_PARTITION_ENTRY)) != 0)
                 return false;
 
         if (h->NumberOfPartitionEntries <= 0 || h->NumberOfPartitionEntries > 1024)

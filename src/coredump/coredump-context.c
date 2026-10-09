@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <sched.h>
+
 #include "sd-login.h"
 #include "sd-messages.h"
 
@@ -8,14 +10,18 @@
 #include "dirent-util.h"
 #include "fd-util.h"
 #include "fs-util.h"
+#include "hostname-setup.h"
 #include "hostname-util.h"
 #include "iovec-wrapper.h"
 #include "log.h"
 #include "memstream-util.h"
 #include "namespace-util.h"
 #include "parse-util.h"
+#include "pidfd-util.h"
 #include "process-util.h"
+#include "rlimit-util.h"
 #include "signal-util.h"
+#include "socket-util.h"
 #include "special.h"
 #include "string-table.h"
 #include "string-util.h"
@@ -38,6 +44,7 @@ static const char * const metadata_field_table[_META_MAX] = {
         [META_UNIT]           = "COREDUMP_UNIT=",
         [META_PROC_AUXV]      = "COREDUMP_PROC_AUXV=",
         [META_THREAD_NAME]    = "COREDUMP_THREAD_NAME=",
+        [META_CODE]           = "COREDUMP_CODE=",
 };
 
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(metadata_field, MetadataField);
@@ -46,6 +53,7 @@ void coredump_context_done(CoredumpContext *context) {
         assert(context);
 
         pidref_done(&context->pidref);
+        pidref_done(&context->tidref);
         free(context->hostname);
         free(context->comm);
         free(context->exe);
@@ -176,6 +184,38 @@ static int get_process_container_parent_cmdline(PidRef *pid, char** ret_cmdline)
         return 1;
 }
 
+/* The kernel passes si_signo through core_pattern (%s). Starting with v7.1,
+ * si_code is reported as well via pidfd. */
+static int coredump_context_read_code(CoredumpContext *context) {
+        struct pidfd_info info = {
+                .mask = PIDFD_INFO_COREDUMP,
+        };
+        int r;
+
+        assert(context);
+        assert(pidref_is_set(&context->pidref));
+
+        if (!context->got_pidfd || context->pidref.fd < 0 || context->got_code >= 0)
+                return 0;
+
+        r = pidfd_get_info(context->pidref.fd, &info);
+        if (r < 0) {
+                context->got_code = false;
+
+                if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
+                        return log_debug_errno(r, "PIDFD_INFO_COREDUMP not supported, ignoring: %m");
+                return log_debug_errno(r, "Failed to get pidfd coredump info, ignoring: %m");
+        }
+
+        if (FLAGS_SET(info.mask, PIDFD_INFO_COREDUMP_CODE)) {
+                context->code = (int) info.coredump_code;
+                context->got_code = true;
+        } else
+                context->got_code = false;
+
+        return 0;
+}
+
 int coredump_context_build_iovw(CoredumpContext *context) {
         char *t;
         int r;
@@ -213,6 +253,10 @@ int coredump_context_build_iovw(CoredumpContext *context) {
                         return log_error_errno(r, "Failed to add COREDUMP_SIGNAL= field: %m");
 
                 (void) iovw_put_string_field(&context->iovw, "COREDUMP_SIGNAL_NAME=SIG", signal_to_string(context->signo));
+
+                /* Emit si_code if we learned it from pidfd_info */
+                if (context->got_code > 0)
+                        (void) iovw_put_string_fieldf(&context->iovw, "COREDUMP_CODE=", "%i", context->code);
         }
 
         r = iovw_put_string_fieldf(&context->iovw, "COREDUMP_TIMESTAMP=", USEC_FMT, context->timestamp);
@@ -232,8 +276,8 @@ int coredump_context_build_iovw(CoredumpContext *context) {
         if (r < 0)
                 return log_error_errno(r, "Failed to add COREDUMP_COMM= field: %m");
 
-        if (context->tid > 0)
-                (void) iovw_put_string_fieldf(&context->iovw, "COREDUMP_TID=", PID_FMT, context->tid);
+        if (pidref_is_set(&context->tidref))
+                (void) iovw_put_string_fieldf(&context->iovw, "COREDUMP_TID=", PID_FMT, context->tidref.pid);
 
         if (context->thread_name)
                 (void) iovw_put_string_field(&context->iovw, "COREDUMP_THREAD_NAME=", context->thread_name);
@@ -349,10 +393,10 @@ static int coredump_context_parse_from_procfs(CoredumpContext *context) {
         if (r < 0)
                 return log_error_errno(r, "Failed to get COMM: %m");
 
-        if (context->tid > 0) {
-                r = pid_get_comm(context->tid, &context->thread_name);
+        if (pidref_is_set(&context->tidref)) {
+                r = pidref_get_comm(&context->tidref, &context->thread_name);
                 if (r < 0)
-                        log_warning_errno(r, "Failed to get comm for thread "PID_FMT", ignoring: %m", context->tid);
+                        log_warning_errno(r, "Failed to get comm for thread "PID_FMT", ignoring: %m", context->tidref.pid);
         }
 
         r = get_process_exe(pid, &context->exe);
@@ -366,6 +410,8 @@ static int coredump_context_parse_from_procfs(CoredumpContext *context) {
         r = read_full_file(procfs_file_alloca(pid, "auxv"), &context->auxv, &context->auxv_size);
         if (r < 0)
                 log_warning_errno(r, "Failed to get auxv, ignoring: %m");
+
+        (void) coredump_context_read_code(context);
 
         r = pidref_verify(&context->pidref);
         if (r < 0)
@@ -482,7 +528,7 @@ static int context_parse_one(CoredumpContext *context, MetadataField meta, bool 
                 return 0;
         }
         case META_ARGV_TID:
-                r = parse_pid(s, &context->tid);
+                r = pidref_set_pidstr_full(&context->tidref, s, PIDFD_THREAD);
                 if (r < 0)
                         log_warning_errno(r, "Failed to parse TID \"%s\", ignoring: %m", s);
                 return 0;
@@ -498,6 +544,17 @@ static int context_parse_one(CoredumpContext *context, MetadataField meta, bool 
 
         case META_THREAD_NAME:
                 return free_and_strdup_warn(&context->thread_name, s);
+
+        case META_CODE:
+                /* We must accept both positive and negative values. The former
+                 * are reserved for kernel-generated signals, the latter for signals requested
+                 * from userspace. See /usr/include/bits/siginfo-consts.h. */
+                r = safe_atoi(s, &context->code);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to parse code \"%s\", ignoring: %m", s);
+                else
+                        context->got_code = true;
+                return 0;
 
         case META_PROC_AUXV: {
                 char *t = memdup_suffix0(s, size);
@@ -593,6 +650,116 @@ int coredump_context_parse_from_argv(CoredumpContext *context, int argc, char **
                 if (r < 0)
                         return r;
         }
+
+        coredump_context_check_pidns(context);
+        return coredump_context_parse_from_procfs(context);
+}
+
+static int get_crashing_tid(pid_t pid, PidRef *ret) {
+        int r;
+
+        assert(pid > 0);
+        assert(ret);
+
+        /* Read /proc/[PID]/task/[TID]/stat then find a thread that has the PF_DUMPCORE flag. */
+
+        const char *p = procfs_file_alloca(pid, "task");
+        _cleanup_closedir_ DIR *d = opendir(p);
+        if (!d)
+                return errno == ENOENT ? -ESRCH : -errno;
+
+        FOREACH_DIRENT_ALL(de, d, return -errno) {
+                if (!in_charset(de->d_name, DIGITS))
+                        continue;
+
+                _cleanup_free_ char *q = path_join(p, de->d_name, "stat");
+                if (!q)
+                        return -ENOMEM;
+
+                unsigned long long flags;
+                r = procfs_get_stat_flags(q, &flags);
+                if (r == -ENOMEM)
+                        return r;
+                if (r < 0) {
+                        log_debug_errno(r, "Failed to read '%s', ignoring: %m", q);
+                        continue;
+                }
+
+                if (!FLAGS_SET(flags, PF_DUMPCORE))
+                        continue;
+
+                return pidref_set_pidstr_full(ret, de->d_name, PIDFD_THREAD);
+        }
+
+        return -ESRCH;
+}
+
+int coredump_context_parse_from_peer(CoredumpContext *context) {
+        int r;
+
+        assert(context);
+        assert(context->input_fd >= 0);
+
+        r = getpeerpidref(context->input_fd, &context->pidref);
+        if (r < 0)
+                return log_error_errno(r, "Failed to get peer pidref: %m");
+
+        if (context->pidref.fd < 0)
+                return log_error_errno(SYNTHETIC_ERRNO(ENOMEDIUM), "We do not have pidfd of the crashed process.");
+
+        context->got_pidfd = true;
+
+        struct pidfd_info info = {
+                .mask = PIDFD_INFO_COREDUMP,
+        };
+
+        r = pidfd_get_info(context->pidref.fd, &info);
+        if (r < 0)
+                return log_error_errno(r, "ioctl(PIDFD_GET_INFO) failed: %m");
+
+        if (!FLAGS_SET(info.mask, PIDFD_INFO_COREDUMP | PIDFD_INFO_COREDUMP_SIGNAL))
+                return log_error_errno(SYNTHETIC_ERRNO(ENODATA),
+                                       "Failed to get coredump information by ioctl(PIDFD_GET_INFO).");
+
+        if (!FLAGS_SET(info.coredump_mask, PIDFD_COREDUMPED))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "The process ["PID_FMT"] did not crash.", context->pidref.pid);
+
+        if (FLAGS_SET(info.coredump_mask, PIDFD_COREDUMP_SKIP))
+                return log_error_errno(SYNTHETIC_ERRNO(ENODATA),
+                                       "Coredump generation for process ["PID_FMT"] is skipped.", context->pidref.pid);
+
+        context->uid = info.ruid;
+        context->gid = info.rgid;
+        context->dumpable = FLAGS_SET(info.coredump_mask, PIDFD_COREDUMP_USER) ? SUID_DUMP_USER : SUID_DUMP_SAFE;
+        context->signo = info.coredump_signal;
+
+        /* This is relatively new (since kernel v7.1), thus optional. */
+        if (FLAGS_SET(info.mask, PIDFD_INFO_COREDUMP_CODE)) {
+                context->code = (int) info.coredump_code;
+                context->got_code = true;
+        } else
+                context->got_code = false;
+
+        r = get_crashing_tid(context->pidref.pid, &context->tidref);
+        if (r < 0)
+                log_warning_errno(r, "Failed to get crashing TID of process ["PID_FMT"], ignoring: %m", context->pidref.pid);
+
+        struct rlimit rl;
+        r = pid_getrlimit(context->pidref.pid, RLIMIT_CORE, &rl);
+        if (r < 0)
+                log_warning_errno(r, "Failed to get coredump size limit of process ["PID_FMT"], ignoring: %m", context->pidref.pid);
+        else
+                context->rlimit = rl.rlim_cur;
+
+        _cleanup_free_ char *h = NULL;
+        r = pidref_gethostname_full(&context->pidref, GET_HOSTNAME_ALLOW_LOCALHOST | GET_HOSTNAME_FALLBACK_DEFAULT, &h);
+        if (r < 0)
+                log_warning_errno(r, "Failed to get hostname, ignoring: %m");
+        else if (!hostname_is_valid(h, /* flags= */ 0))
+                log_warning("Obtained an invalid hostname, ignoring: %s", h);
+        else
+                context->hostname = TAKE_PTR(h);
 
         coredump_context_check_pidns(context);
         return coredump_context_parse_from_procfs(context);

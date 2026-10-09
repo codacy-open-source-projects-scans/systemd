@@ -13,6 +13,10 @@ units = [
         { 'file' : 'breakpoint-pre-udev.service.in' },
         { 'file' : 'capsule@.service.in' },
         { 'file' : 'capsule.slice' },
+        {
+          'file' : 'clonesetup.target',
+          'symlinks' : ['sysinit.target.wants/'],
+        },
         { 'file' : 'console-getty.service.in' },
         { 'file' : 'container-getty@.service.in' },
         {
@@ -150,7 +154,10 @@ units = [
           'symlinks' : ['sockets.target.wants/']
         },
         { 'file' : 'systemd-mute-console@.service' },
-        { 'file' : 'system-systemd\\x2dmute\\x2dconsole.slice' },
+        {
+          'file' : 'system-systemd-mute-console.slice',
+          'name' : 'system-systemd\\x2dmute\\x2dconsole.slice',
+        },
         { 'file' : 'network-online.target' },
         { 'file' : 'network-pre.target' },
         { 'file' : 'network.target' },
@@ -240,12 +247,15 @@ units = [
         },
         { 'file' : 'sysinit.target' },
         { 'file' : 'syslog.socket' },
+        { 'file' : 'system-install.target' },
         {
-          'file' : 'system-systemd\\x2dcryptsetup.slice',
+          'file' : 'system-systemd-cryptsetup.slice',
+          'name' : 'system-systemd\\x2dcryptsetup.slice',
           'conditions' : ['HAVE_LIBCRYPTSETUP'],
         },
         {
-          'file' : 'system-systemd\\x2dveritysetup.slice',
+          'file' : 'system-systemd-veritysetup.slice',
+          'name' : 'system-systemd\\x2dveritysetup.slice',
           'conditions' : ['HAVE_LIBCRYPTSETUP'],
         },
         { 'file' : 'system-update-cleanup.service' },
@@ -303,6 +313,14 @@ units = [
           'symlinks' : ['sockets.target.wants/'],
         },
         {
+          'file' : 'systemd-sysupdate-notify-bootctl@.service',
+          'conditions' : ['ENABLE_BOOTLOADER'],
+        },
+        {
+          'file' : 'systemd-sysupdate-notify-bootctl.socket',
+          'conditions' : ['ENABLE_BOOTLOADER'],
+        },
+        {
           'file' : 'systemd-confext.service',
           'conditions' : ['ENABLE_SYSEXT'],
         },
@@ -325,10 +343,32 @@ units = [
           'conditions' : ['ENABLE_COREDUMP'],
         },
         {
+          'file' : 'systemd-coredump-register.service.in',
+          'conditions' : ['ENABLE_COREDUMP'],
+        },
+        {
+          'file' : 'systemd-coredumpd.service.in',
+          'conditions' : ['ENABLE_COREDUMP'],
+        },
+        {
           'file' : 'systemd-creds.socket',
           'symlinks' : ['sockets.target.wants/'],
         },
         { 'file' : 'systemd-creds@.service' },
+        {
+          'file' : 'systemd-cryptenroll.socket',
+          'conditions' : ['HAVE_LIBCRYPTSETUP'],
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        {
+          'file' : 'systemd-cryptenroll@.service',
+          'conditions' : ['HAVE_LIBCRYPTSETUP'],
+        },
+        {
+          'file' : 'systemd-cryptenroll-firstboot.service',
+          'conditions' : ['HAVE_LIBCRYPTSETUP', 'ENABLE_INITRD'],
+          'symlinks' : ['initrd.target.wants/'],
+        },
         { 'file' : 'systemd-exit.service' },
         { 'file' : 'systemd-factory-reset@.service.in' },
         {
@@ -413,6 +453,14 @@ units = [
           'conditions' : ['ENABLE_IMDS'],
         },
         {
+          'file' : 'systemd-imds-metrics.socket',
+          'conditions' : ['ENABLE_IMDS'],
+        },
+        {
+          'file' : 'systemd-imds-metrics@.service.in',
+          'conditions' : ['ENABLE_IMDS'],
+        },
+        {
           'file' : 'systemd-importd.service.in',
           'conditions' : ['ENABLE_IMPORTD'],
           'symlinks' : ['dbus-org.freedesktop.import1.service'],
@@ -464,6 +512,8 @@ units = [
           'file' : 'systemd-journalctl.socket',
           'symlinks' : ['sockets.target.wants/'],
         },
+        { 'file' : 'systemd-journalctl-metrics@.service' },
+        { 'file' : 'systemd-journalctl-metrics.socket' },
         { 'file' : 'systemd-journald-audit.socket' },
         {
           'file' : 'systemd-journald-dev-log.socket',
@@ -501,6 +551,10 @@ units = [
         {
           'file' : 'systemd-machine-id-commit.service',
           'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-machine-tag@.service',
+          'conditions' : ['ENABLE_HOSTNAMED'],
         },
         {
           'file' : 'systemd-machined.service.in',
@@ -604,6 +658,10 @@ units = [
           'symlinks' : ['sysinit.target.wants/'],
         },
         {
+          'file' : 'systemd-pcrlogin@.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
           'file' : 'systemd-pcrphase-initrd.service.in',
           'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2', 'ENABLE_INITRD'],
           'symlinks' : ['initrd.target.wants/'],
@@ -628,8 +686,22 @@ units = [
           'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
           'symlinks' : ['sysinit.target.wants/'],
         },
-        { 'file' : 'systemd-report-basic.socket' },
-        { 'file' : 'systemd-report-basic@.service.in' },
+        {
+          'file' : 'systemd-report.socket',
+          'conditions' : ['ENABLE_REPORT'],
+        },
+        {
+          'file' : 'systemd-report@.service.in',
+          'conditions' : ['ENABLE_REPORT'],
+        },
+        {
+          'file' : 'systemd-report-basic.socket',
+          'conditions' : ['ENABLE_REPORT'],
+        },
+        {
+          'file' : 'systemd-report-basic@.service.in',
+          'conditions' : ['ENABLE_REPORT'],
+        },
         {
           'file' : 'systemd-tpm2-clear.service.in',
           'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
@@ -686,6 +758,14 @@ units = [
           'symlinks' : ['sockets.target.wants/'],
         },
         {
+          'file' : 'systemd-sysupdate-notify-pcrlock@.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-sysupdate-notify-pcrlock.socket',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
           'file' : 'systemd-portabled.service.in',
           'conditions' : ['ENABLE_PORTABLED'],
           'symlinks' : ['dbus-org.freedesktop.portable1.service'],
@@ -724,8 +804,70 @@ units = [
           'file' : 'systemd-repart@.service',
           'conditions' : ['ENABLE_REPART'],
         },
-        { 'file' : 'systemd-report-cgroup.socket' },
-        { 'file' : 'systemd-report-cgroup@.service.in' },
+        {
+          'file' : 'systemd-report-cgroup.socket',
+          'conditions' : ['ENABLE_REPORT'],
+        },
+        {
+          'file' : 'systemd-report-cgroup@.service.in',
+          'conditions' : ['ENABLE_REPORT'],
+        },
+        {
+          'file' : 'systemd-report-diskspace.socket',
+          'conditions' : ['ENABLE_REPORT', 'HAVE_LIBMOUNT'],
+        },
+        {
+          'file' : 'systemd-report-diskspace@.service.in',
+          'conditions' : ['ENABLE_REPORT', 'HAVE_LIBMOUNT'],
+        },
+        {
+          'file' : 'systemd-report-files.socket',
+          'conditions' : ['ENABLE_REPORT'],
+        },
+        {
+          'file' : 'systemd-report-files@.service.in',
+          'conditions' : ['ENABLE_REPORT'],
+        },
+        {
+          'file' : 'systemd-report-hwmon.socket',
+          'conditions' : ['ENABLE_REPORT'],
+        },
+        {
+          'file' : 'systemd-report-hwmon@.service.in',
+          'conditions' : ['ENABLE_REPORT'],
+        },
+        {
+          'file' : 'systemd-report-netstat.socket',
+          'conditions' : ['ENABLE_REPORT'],
+        },
+        {
+          'file' : 'systemd-report-netstat@.service.in',
+          'conditions' : ['ENABLE_REPORT'],
+        },
+        {
+          'file' : 'systemd-report-sign-plain.socket',
+          'conditions' : ['ENABLE_REPORT', 'HAVE_OPENSSL'],
+        },
+        {
+          'file' : 'systemd-report-sign-plain@.service.in',
+          'conditions' : ['ENABLE_REPORT', 'HAVE_OPENSSL'],
+        },
+        {
+          'file' : 'systemd-report-sign-tpm2.socket',
+          'conditions' : ['ENABLE_REPORT', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-report-sign-tpm2@.service.in',
+          'conditions' : ['ENABLE_REPORT', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-report-sign-tsm.socket',
+          'conditions' : ['ENABLE_REPORT'],
+        },
+        {
+          'file' : 'systemd-report-sign-tsm@.service.in',
+          'conditions' : ['ENABLE_REPORT'],
+        },
         {
           'file' : 'systemd-resolved.service.in',
           'conditions' : ['ENABLE_RESOLVE'],
@@ -775,8 +917,34 @@ units = [
           'symlinks' : ['sockets.target.wants/'],
         },
         {
+          'file' : 'systemd-sysupdate-notify-sysext@.service',
+          'conditions' : ['ENABLE_SYSEXT'],
+        },
+        {
+          'file' : 'systemd-sysupdate-notify-sysext.socket',
+          'conditions' : ['ENABLE_SYSEXT'],
+        },
+        {
           'file' : 'systemd-sysext@.service',
           'conditions' : ['ENABLE_SYSEXT'],
+        },
+        {
+          'file' : 'systemd-sysinstall.service',
+          'conditions' : ['ENABLE_SYSINSTALL'],
+          'symlinks' : ['system-install.target.wants/'],
+        },
+        {
+          'file' : 'systemd-sysinstall.socket',
+          'conditions' : ['ENABLE_SYSINSTALL'],
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        {
+          'file' : 'systemd-sysinstall@.service',
+          'conditions' : ['ENABLE_SYSINSTALL'],
+        },
+        {
+          'file' : 'systemd-sysupdate-auto-enable.service.in',
+          'conditions' : ['ENABLE_SYSUPDATE'],
         },
         {
           'file' : 'systemd-sysupdate-reboot.service.in',
@@ -787,12 +955,23 @@ units = [
           'conditions' : ['ENABLE_SYSUPDATE'],
         },
         {
-          'file' : 'systemd-sysupdate.service.in',
+          'file' : 'systemd-sysupdate-update.service.in',
+          'conditions' : ['ENABLE_SYSUPDATE'],
+          'symlinks' : ['systemd-sysupdate.service'],  # compatibility after rename
+        },
+        {
+          'file' : 'systemd-sysupdate@.service.in',
           'conditions' : ['ENABLE_SYSUPDATE'],
         },
         {
-          'file' : 'systemd-sysupdate.timer',
+          'file' : 'systemd-sysupdate.socket',
           'conditions' : ['ENABLE_SYSUPDATE'],
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        {
+          'file' : 'systemd-sysupdate-update.timer',
+          'conditions' : ['ENABLE_SYSUPDATE'],
+          'symlinks' : ['systemd-sysupdate.timer'],  # compatibility after rename
         },
         {
           'file' : 'systemd-sysupdated.service.in',
@@ -803,6 +982,20 @@ units = [
           'file' : 'systemd-sysusers.service',
           'conditions' : ['ENABLE_SYSUSERS'],
           'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-storage-block.socket',
+          'symlinks' : ['sockets.target.wants/']
+        },
+        {
+          'file' : 'systemd-storage-block@.service.in',
+        },
+        {
+          'file' : 'systemd-storage-fs.socket',
+          'symlinks' : ['sockets.target.wants/']
+        },
+        {
+          'file' : 'systemd-storage-fs@.service.in',
         },
         {
           'file' : 'systemd-storagetm.service.in',
@@ -863,18 +1056,13 @@ units = [
           'install_tag' : 'udev',
         },
         {
-          'file' : 'systemd-udevd-control.socket',
-          'symlinks' : ['sockets.target.wants/'],
-          'install_tag' : 'udev',
-        },
-        {
           'file' : 'systemd-udevd-kernel.socket',
           'symlinks' : ['sockets.target.wants/'],
           'install_tag' : 'udev',
         },
         {
           'file' : 'systemd-udevd-varlink.socket',
-          'symlinks' : ['sockets.target.wants/'],
+          'symlinks' : ['sockets.target.wants/', 'systemd-udevd-control.socket'],
           'install_tag' : 'udev',
         },
         {
@@ -921,7 +1109,7 @@ units = [
           'conditions' : ['ENABLE_NSRESOURCED'],
         },
         {
-          'file' : 'systemd-nsresourced.socket',
+          'file' : 'systemd-nsresourced.socket.in',
           'conditions' : ['ENABLE_NSRESOURCED'],
         },
         {
@@ -969,6 +1157,33 @@ units = [
 udev_units = []
 hwdb_units = []
 
+# Unit files whose contents are embedded into the manager binary, so that it can
+# fall back to a built-in copy when the file is not present on disk. Referenced
+# from src/core/meson.build.
+embedded_unit_names = [
+        'basic.target',
+        'exit.target',
+        'final.target',
+        'graphical.target',
+        'halt.target',
+        'kexec.target',
+        'multi-user.target',
+        'poweroff.target',
+        'reboot.target',
+        'shutdown.target',
+        'sigpwr.target',
+        'soft-reboot.target',
+        'sysinit.target',
+        'systemd-exit.service',
+        'systemd-halt.service',
+        'systemd-kexec.service',
+        'systemd-poweroff.service',
+        'systemd-reboot.service',
+        'systemd-soft-reboot.service',
+        'umount.target',
+]
+embedded_units = []
+
 foreach unit : units
         source = unit.get('file')
 
@@ -980,6 +1195,9 @@ foreach unit : units
                 needs_jinja = false
                 name = source
         endif
+        # Unit names that contain characters which are awkward in source file names (e.g. the
+        # backslash in \x2d escapes) are stored under a sanitized file name and renamed on install.
+        name = unit.get('name', name)
         source = files(source)
 
         install = true
@@ -991,7 +1209,7 @@ foreach unit : units
         endforeach
 
         if needs_jinja
-                t = custom_target(
+                processed = custom_target(
                         input : source,
                         output : name,
                         command : [jinja2_cmdline, '@INPUT@', '@OUTPUT@'],
@@ -999,14 +1217,20 @@ foreach unit : units
                         install_dir : systemunitdir,
                         install_tag : unit.get('install_tag', ''))
                 if unit.get('install_tag', '') == 'udev'
-                        udev_units += t
+                        udev_units += processed
                 elif unit.get('install_tag', '') == 'hwdb'
-                        hwdb_units += t
+                        hwdb_units += processed
                 endif
         elif install
                 install_data(source,
+                             rename : name,
                              install_dir : systemunitdir,
                              install_tag : unit.get('install_tag', ''))
+        endif
+
+        if name in embedded_unit_names
+                # Embed either the processed output or the original file.
+                embedded_units += needs_jinja ? processed : source
         endif
 
         if install

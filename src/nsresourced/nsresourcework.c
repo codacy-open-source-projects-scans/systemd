@@ -374,7 +374,119 @@ static int vl_method_get_memberships(sd_varlink *link, sd_json_variant *paramete
         return sd_varlink_error(link, "io.systemd.UserDatabase.NoRecordFound", NULL);
 }
 
-static int uid_is_available(int registry_dir_fd, uid_t candidate, int parent_userns_fd) {
+static int registry_range_is_available(
+                struct userns_restrict_bpf *bpf,
+                int registry_dir_fd,
+                uid_t candidate,
+                bool gid) {
+
+        _cleanup_(userns_info_freep) UserNamespaceInfo *owner = NULL;
+        int r;
+
+        assert(registry_dir_fd >= 0);
+
+        /* Checks whether the (UID or GID) range starting at candidate is free to allocate as a fresh
+         * transient range. If an existing registry entry claims it but its owning namespace has since
+         * died — without a BPF death event reaping it yet — we reclaim it on the spot and treat the range
+         * as available. Unlike delegations, transient registrations have no ancestor chain, so a single
+         * reap suffices. */
+
+        r = gid ? userns_registry_gid_exists(registry_dir_fd, (gid_t) candidate)
+                : userns_registry_uid_exists(registry_dir_fd, candidate);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return true; /* No registry entry for this range → available. */
+
+        r = gid ? userns_registry_load_by_start_gid(registry_dir_fd, (gid_t) candidate, &owner)
+                : userns_registry_load_by_start_uid(registry_dir_fd, candidate, &owner);
+        if (r == -ENOENT)
+                return true; /* Raced away between the existence check and the load → available. */
+        if (r < 0)
+                return r;
+
+        r = userns_registry_reap_if_dead(bpf, registry_dir_fd, owner->userns_inode, /* ret_info= */ NULL);
+        if (r < 0)
+                return r;
+        if (r == USERNS_REAP_RELEASED)
+                return true; /* Owner was dead and reaped → range is now free. */
+
+        /* Owner is alive or its liveness couldn't be determined → we can't reclaim it, so the range
+         * is taken. */
+        log_debug("%s" UID_FMT " unavailable: already registered in userns registry.",
+                  gid ? "GID " : "UID ", candidate);
+        return false;
+}
+
+static int delegation_range_is_available(
+                struct userns_restrict_bpf *bpf,
+                int registry_dir_fd,
+                uid_t candidate,
+                uint64_t parent_userns_inode,
+                bool gid) {
+
+        int r;
+
+        assert(registry_dir_fd >= 0);
+
+        /* Checks whether the (UID or GID) range starting at candidate is free to allocate as far as
+         * the delegation registry is concerned. A delegated range is available only if it's owned by
+         * the requesting parent user namespace (which may then sub-allocate within it). If it's owned
+         * by another namespace that has since died — without a BPF death event reaping it yet — we reclaim
+         * it on the spot, which restores the range to its ancestor (possibly the parent), and
+         * re-evaluate. This walks a chain of dead ancestors until it reaches a live owner, the
+         * requesting parent, or a fully freed range. */
+
+        r = gid ? userns_registry_delegation_gid_exists(registry_dir_fd, (gid_t) candidate)
+                : userns_registry_delegation_uid_exists(registry_dir_fd, candidate);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return true; /* No delegation for this range → available. */
+
+        for (;;) {
+                _cleanup_(delegated_userns_info_done) DelegatedUserNamespaceInfo delegation = DELEGATED_USER_NAMESPACE_INFO_NULL;
+
+                r = gid ? userns_registry_load_delegation_by_gid(registry_dir_fd, (gid_t) candidate, &delegation)
+                        : userns_registry_load_delegation_by_uid(registry_dir_fd, candidate, &delegation);
+                if (r == -ENOENT)
+                        return true; /* Delegation removed while reaping (no ancestor left) → fully free. */
+                if (r < 0)
+                        return r;
+
+                if (delegation.userns_inode == parent_userns_inode) {
+                        /* The parent userns owns this delegation, so the range is available for nested
+                         * allocation. */
+                        log_debug("%s" UID_FMT " is delegated by parent userns inode %" PRIu64 ", available for nested allocation.",
+                                  gid ? "GID " : "UID ", candidate, parent_userns_inode);
+                        return true;
+                }
+
+                /* Owned by some other namespace. If that namespace is dead, reclaim it (restoring the
+                 * range to its ancestor) and loop to re-evaluate; otherwise the range is genuinely
+                 * taken. */
+                r = userns_registry_reap_if_dead(bpf, registry_dir_fd, delegation.userns_inode, /* ret_info= */ NULL);
+                if (r < 0)
+                        return r;
+                if (r == USERNS_REAP_RELEASED)
+                        continue; /* Reaped a dead owner; re-evaluate the now-restored delegation. */
+
+                /* Owner is alive, or its liveness couldn't be determined (no recorded id, or a dead
+                 * ancestor that an earlier reap popped into ownership but left no registry entry to
+                 * drive a further restore). We can't reclaim the range here — and mustn't loop, since
+                 * re-reaping would not make progress — so treat it as taken. */
+                log_debug("%s" UID_FMT " unavailable: delegated to userns inode %" PRIu64 " that can't be reclaimed (parent is %" PRIu64 ").",
+                          gid ? "GID " : "UID ", candidate, delegation.userns_inode, parent_userns_inode);
+                return false;
+        }
+}
+
+static int uid_is_available(
+                struct userns_restrict_bpf *bpf,
+                int registry_dir_fd,
+                uid_t candidate,
+                int parent_userns_fd) {
+
         int r;
 
         assert(registry_dir_fd >= 0);
@@ -387,53 +499,35 @@ static int uid_is_available(int registry_dir_fd, uid_t candidate, int parent_use
                 return log_debug_errno(errno, "Failed to fstat parent user namespace: %m");
         parent_userns_inode = parent_st.st_ino;
 
-        r = userns_registry_uid_exists(registry_dir_fd, candidate);
+        /* Check whether an existing transient registration claims this range; a dead owner is reclaimed
+         * inline so its range doesn't stay blocked. The UID and GID are checked separately as either
+         * can exist independently. */
+        r = registry_range_is_available(bpf, registry_dir_fd, candidate, /* gid= */ false);
         if (r < 0)
                 return r;
-        if (r > 0)
+        if (r == 0)
                 return false;
 
-        r = userns_registry_gid_exists(registry_dir_fd, (gid_t) candidate);
+        r = registry_range_is_available(bpf, registry_dir_fd, candidate, /* gid= */ true);
         if (r < 0)
                 return r;
-        if (r > 0)
+        if (r == 0)
                 return false;
 
-        /* Also check delegation files. If parent_userns_inode is set and matches the delegation's userns
-         * inode, the UID is available because the parent owns that delegation. */
-        r = userns_registry_delegation_uid_exists(registry_dir_fd, candidate);
+        /* Also check delegation files. A delegated range is only available for nested allocation when
+         * the requesting parent owns it; dead owners are reclaimed inline so their ranges don't stay
+         * blocked. We check the UID and GID delegations separately as either can exist independently. */
+        r = delegation_range_is_available(bpf, registry_dir_fd, candidate, parent_userns_inode, /* gid= */ false);
         if (r < 0)
                 return r;
-        if (r > 0) {
-                _cleanup_(delegated_userns_info_done) DelegatedUserNamespaceInfo delegation = DELEGATED_USER_NAMESPACE_INFO_NULL;
-                r = userns_registry_load_delegation_by_uid(registry_dir_fd, candidate, &delegation);
-                if (r < 0)
-                        return r;
+        if (r == 0)
+                return false;
 
-                if (delegation.userns_inode != parent_userns_inode)
-                        return false;
-
-                /* The parent userns owns this delegation, so the UID is available for nested allocation */
-                log_debug("UID " UID_FMT " is delegated by parent userns inode %" PRIu64 ", available for nested allocation.",
-                          candidate, parent_userns_inode);
-        }
-
-        r = userns_registry_delegation_gid_exists(registry_dir_fd, (gid_t) candidate);
+        r = delegation_range_is_available(bpf, registry_dir_fd, candidate, parent_userns_inode, /* gid= */ true);
         if (r < 0)
                 return r;
-        if (r > 0) {
-                _cleanup_(delegated_userns_info_done) DelegatedUserNamespaceInfo delegation = DELEGATED_USER_NAMESPACE_INFO_NULL;
-                r = userns_registry_load_delegation_by_gid(registry_dir_fd, candidate, &delegation);
-                if (r < 0)
-                        return r;
-
-                if (delegation.userns_inode != parent_userns_inode)
-                        return false;
-
-                /* The parent userns owns this delegation, so the UID is available for nested allocation */
-                log_debug("UID " UID_FMT " is delegated by parent userns inode %" PRIu64 ", available for nested allocation.",
-                          candidate, parent_userns_inode);
-        }
+        if (r == 0)
+                return false;
 
         r = is_our_namespace(parent_userns_fd, NAMESPACE_USER);
         if (r < 0)
@@ -447,14 +541,18 @@ static int uid_is_available(int registry_dir_fd, uid_t candidate, int parent_use
                  * nsresourced user namespace, but not in the nspawn user namespace). */
 
                 r = userdb_by_uid(candidate, /* match= */ NULL, USERDB_AVOID_MULTIPLEXER, /* ret= */ NULL);
-                if (r >= 0)
+                if (r >= 0) {
+                        log_debug("UID " UID_FMT " unavailable: known to userdb.", candidate);
                         return false;
+                }
                 if (r != -ESRCH)
                         return r;
 
                 r = groupdb_by_gid(candidate, /* match= */ NULL, USERDB_AVOID_MULTIPLEXER, /* ret= */ NULL);
-                if (r >= 0)
+                if (r >= 0) {
+                        log_debug("UID " UID_FMT " unavailable: GID known to groupdb.", candidate);
                         return false;
+                }
                 if (r != -ESRCH)
                         return r;
         }
@@ -501,7 +599,43 @@ static int name_is_available(
         return true;
 }
 
+static int inode_slot_is_available(
+                int registry_dir_fd,
+                int userns_fd,
+                struct userns_restrict_bpf *bpf,
+                uint64_t inode) {
+
+        _cleanup_(userns_info_freep) UserNamespaceInfo *existing = NULL;
+        int r;
+
+        assert(registry_dir_fd >= 0);
+        assert(userns_fd >= 0);
+        assert(inode != 0);
+
+        /* Returns true if the registry has no entry for this inode (after cleaning up any stale
+         * leftover from a previously-registered namespace whose inode was recycled by the kernel),
+         * false if a live registration already occupies the slot, negative on error. */
+
+        r = userns_registry_load_by_userns_inode(registry_dir_fd, inode, &existing);
+        if (r == -ENOENT)
+                return true;
+        if (r < 0)
+                return log_debug_errno(r, "Failed to load existing registry entry: %m");
+
+        r = userns_info_verify_fd(userns_fd, existing);
+        if (r >= 0)
+                return false;
+        if (r != -ESTALE)
+                return log_debug_errno(r, "Failed to verify user namespace identity: %m");
+
+        log_debug("Inode %" PRIu64 " was reused by the kernel; cleaning up stale registry entry for namespace id %" PRIu64 ".",
+                  inode, existing->userns_id);
+        userns_registry_release_by_info(bpf, registry_dir_fd, existing);
+        return true;
+}
+
 static int allocate_one(
+                struct userns_restrict_bpf *bpf,
                 int registry_dir_fd,
                 const char *name,
                 uint32_t size,
@@ -574,7 +708,7 @@ static int allocate_one(
 
                 /* We only check the base UID for each range. Pass the parent userns inode so that
                  * allocating from a delegated range owned by the parent is allowed. */
-                r = uid_is_available(registry_dir_fd, candidate, parent_userns_fd);
+                r = uid_is_available(bpf, registry_dir_fd, candidate, parent_userns_fd);
                 if (r < 0)
                         return log_debug_errno(r, "Can't determine if UID range " UID_FMT " is available: %m", candidate);
                 if (r > 0)
@@ -604,6 +738,7 @@ static int allocate_now(
                 int registry_dir_fd,
                 int userns_fd,
                 int parent_userns_fd,
+                struct userns_restrict_bpf *bpf,
                 UserNamespaceInfo *info,
                 int *ret_lock_fd) {
 
@@ -626,6 +761,12 @@ static int allocate_now(
         if (r < 0)
                 return log_debug_errno(r, "Failed to read userns UID range: %m");
 
+        log_debug("Parent user namespace exposes %zu UID range(s) inside:", uid_range_entries(candidates));
+        if (DEBUG_LOGGING)
+                FOREACH_ARRAY(e, candidates->entries, candidates->n_entries)
+                        log_debug("  " UID_FMT "…" UID_FMT " (size " UID_FMT ")",
+                                  e->start, e->start + e->nr - 1, e->nr);
+
         _cleanup_close_ int lock_fd = -EBADF;
         lock_fd = userns_registry_lock(registry_dir_fd);
         if (lock_fd < 0)
@@ -638,10 +779,10 @@ static int allocate_now(
         if (r >= USERNS_PER_UID)
                 return log_debug_errno(SYNTHETIC_ERRNO(EUSERS), "User already registered %i user namespaces, refusing.", r);
 
-        r = userns_registry_inode_exists(registry_dir_fd, info->userns_inode);
+        r = inode_slot_is_available(registry_dir_fd, userns_fd, bpf, info->userns_inode);
         if (r < 0)
                 return r;
-        if (r > 0)
+        if (r == 0)
                 return -EDEADLK;
 
         r = name_is_available(registry_dir_fd, info->name);
@@ -654,6 +795,7 @@ static int allocate_now(
          * allocate a transient range. */
         if (!uid_is_valid(info->start_uid) && !gid_is_valid(info->start_gid)) {
                 r = allocate_one(
+                                bpf,
                                 registry_dir_fd,
                                 info->name, info->size,
                                 parent_userns_fd,
@@ -672,6 +814,7 @@ static int allocate_now(
 
                 FOREACH_ARRAY(delegate, info->delegates, info->n_delegates) {
                         r = allocate_one(
+                                        bpf,
                                         registry_dir_fd,
                                         /* name= */ NULL,
                                         delegate->size,
@@ -1251,6 +1394,10 @@ static int vl_method_allocate_user_range(sd_varlink *link, sd_json_variant *para
         if (parent_userns_fd < 0)
                 return log_debug_errno(errno, "Failed to get parent user namespace: %m");
 
+        struct stat parent_st = {};
+        if (DEBUG_LOGGING && fstat(parent_userns_fd, &parent_st) < 0)
+                return log_debug_errno(errno, "Failed to fstat() parent user namespace fd: %m");
+
         r = sd_varlink_get_peer_uid(link, &peer_uid);
         if (r < 0)
                 return r;
@@ -1258,6 +1405,15 @@ static int vl_method_allocate_user_range(sd_varlink *link, sd_json_variant *para
         r = sd_varlink_get_peer_gid(link, &peer_gid);
         if (r < 0)
                 return r;
+
+        log_debug("Processing AllocateUserRange request: name='%s' type=%s peer=" UID_FMT ":" GID_FMT
+                  " userns=" INO_FMT " parent_userns=" INO_FMT
+                  " size=%" PRIu32 " delegates=%" PRIu32 " mapForeign=%s",
+                  userns_name,
+                  p.type == ALLOCATE_USER_RANGE_SELF ? "self" : "managed",
+                  peer_uid, peer_gid,
+                  userns_st.st_ino, parent_st.st_ino,
+                  p.size, p.delegate_container_ranges, yes_no(p.map_foreign));
 
         const char *polkit_details[] = {
                 "name", userns_name,
@@ -1271,7 +1427,8 @@ static int vl_method_allocate_user_range(sd_varlink *link, sd_json_variant *para
                         polkit_details,
                         /* good_user= */ UID_INVALID,
                         POLKIT_DEFAULT_ALLOW, /* If no polkit is installed, allow unpriv userns namespace allocation */
-                        &c->polkit_registry);
+                        &c->polkit_registry,
+                        /* ret_admin= */ NULL);
         if (r <= 0)
                 return r;
 
@@ -1295,9 +1452,14 @@ static int vl_method_allocate_user_range(sd_varlink *link, sd_json_variant *para
 
         userns_info->owner = peer_uid;
         userns_info->userns_inode = userns_st.st_ino;
+        if (ioctl(userns_fd, NS_GET_ID, &userns_info->userns_id) < 0)
+                log_debug_errno(errno, "Failed to query userns ID, ignoring: %m");
         userns_info->size = p.size;
         userns_info->target_uid = p.target;
         userns_info->target_gid = (gid_t) p.target;
+        /* For "self" allocations we deny setgroups() via the BPF-LSM (see below). Record it so the manager
+         * can re-establish the denial after a restart that reset the BPF maps. */
+        userns_info->setgroups_deny = p.type == ALLOCATE_USER_RANGE_SELF;
 
         if (p.type == ALLOCATE_USER_RANGE_SELF) {
                 /* The start UID/GID will be mapped to the parent userns in write_userns(). If a self
@@ -1340,7 +1502,7 @@ static int vl_method_allocate_user_range(sd_varlink *link, sd_json_variant *para
                 userns_info->n_delegates = p.delegate_container_ranges;
         }
 
-        r = allocate_now(registry_dir_fd, userns_fd, parent_userns_fd, userns_info, &lock_fd);
+        r = allocate_now(registry_dir_fd, userns_fd, parent_userns_fd, c->bpf, userns_info, &lock_fd);
         if (r == -EHOSTDOWN) /* The needed UID range is not delegated to us */
                 return sd_varlink_error(link, "io.systemd.NamespaceResource.DynamicRangeUnavailable", NULL);
         if (r == -EBUSY)     /* All used up */
@@ -1356,17 +1518,12 @@ static int vl_method_allocate_user_range(sd_varlink *link, sd_json_variant *para
         if (r < 0)
                 return r;
 
-        /* Register the userns in the BPF map with an empty allowlist */
-        r = userns_restrict_put_by_fd(
-                        c->bpf,
-                        userns_fd,
-                        /* replace= */ true,
-                        /* mount_fds= */ NULL,
-                        /* n_mount_fds= */ 0);
+        /* Subject the userns to the BPF-LSM policy that keeps its transient range off persistent file systems */
+        r = userns_restrict_register_by_fd(c->bpf, userns_fd);
         if (r < 0)
                 goto fail;
 
-        if (p.type == ALLOCATE_USER_RANGE_SELF) {
+        if (userns_info->setgroups_deny > 0) {
                 /* For "self" allocations we deny setgroups() via the BPF LSM. We can't use
                  * /proc/self/setgroups for this as that is transitive and also applies to child user
                  * namespaces. The BPF LSM hook only applies to the specific user namespace. */
@@ -1394,7 +1551,7 @@ static int vl_method_allocate_user_range(sd_varlink *link, sd_json_variant *para
         /* Note, we'll not return UID values from the host, since the child might not run in the same
          * user namespace as us. If they want to know the ranges they should read them off the userns fd, so
          * that they are translated into their PoV */
-        return sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_STRING("name", userns_name));
+        return sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_STRING("name", userns_info->name));
 
 fail:
         /* Note: we don't have to clean-up the BPF maps in the error path: the bpf map type used will
@@ -1534,7 +1691,8 @@ static int vl_method_register_user_namespace(sd_varlink *link, sd_json_variant *
                         polkit_details,
                         /* good_user= */ UID_INVALID,
                         POLKIT_DEFAULT_ALLOW, /* If no polkit is installed, allow unpriv userns namespace registration */
-                        &c->polkit_registry);
+                        &c->polkit_registry,
+                        /* ret_admin= */ NULL);
         if (r <= 0)
                 return r;
 
@@ -1553,10 +1711,10 @@ static int vl_method_register_user_namespace(sd_varlink *link, sd_json_variant *
         if (lock_fd < 0)
                 return log_debug_errno(lock_fd, "Failed to open nsresource registry lock file: %m");
 
-        r = userns_registry_inode_exists(registry_dir_fd, userns_st.st_ino);
+        r = inode_slot_is_available(registry_dir_fd, userns_fd, c->bpf, userns_st.st_ino);
         if (r < 0)
                 return r;
-        if (r > 0)
+        if (r == 0)
                 return sd_varlink_error(link, "io.systemd.NamespaceResource.UserNamespaceExists", NULL);
 
         r = name_is_available(registry_dir_fd, userns_name);
@@ -1575,18 +1733,15 @@ static int vl_method_register_user_namespace(sd_varlink *link, sd_json_variant *
 
         userns_info->owner = peer_uid;
         userns_info->userns_inode = userns_st.st_ino;
+        if (ioctl(userns_fd, NS_GET_ID, &userns_info->userns_id) < 0)
+                log_debug_errno(errno, "Failed to query userns ID, ignoring: %m");
 
         r = userns_registry_store(registry_dir_fd, userns_info);
         if (r < 0)
                 return log_debug_errno(r, "Failed to update userns registry: %m");
 
-        /* Register the userns in the BPF map with an empty allowlist */
-        r = userns_restrict_put_by_fd(
-                        c->bpf,
-                        userns_fd,
-                        /* replace= */ true,
-                        /* mount_fds= */ NULL,
-                        /* n_mount_fds= */ 0);
+        /* Subject the userns to the BPF-LSM policy that keeps its transient range off persistent file systems */
+        r = userns_restrict_register_by_fd(c->bpf, userns_fd);
         if (r < 0)
                 goto fail;
 
@@ -1600,7 +1755,7 @@ static int vl_method_register_user_namespace(sd_varlink *link, sd_json_variant *
         if (r < 0)
                 goto fail;
 
-        return sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_STRING("name", userns_name));
+        return sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_STRING("name", userns_info->name));
 
 fail:
         userns_registry_remove(registry_dir_fd, userns_info);
@@ -1679,7 +1834,8 @@ static int vl_method_add_mount_to_user_namespace(sd_varlink *link, sd_json_varia
                         /* details= */ NULL,
                         /* good_user= */ UID_INVALID,
                         POLKIT_DEFAULT_ALLOW, /* If no polkit is installed, allow delegation of mounts to registered userns */
-                        &c->polkit_registry);
+                        &c->polkit_registry,
+                        /* ret_admin= */ NULL);
         if (r <= 0)
                 return r;
 
@@ -1702,6 +1858,12 @@ static int vl_method_add_mount_to_user_namespace(sd_varlink *link, sd_json_varia
         if (r < 0)
                 return r;
 
+        r = userns_info_verify_fd(userns_fd, userns_info);
+        if (r == -ESTALE)
+                return sd_varlink_error(link, "io.systemd.NamespaceResource.UserNamespaceNotRegistered", NULL);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to verify user namespace identity: %m");
+
         if (!c->bpf) {
                 r = userns_restrict_install(/* pin= */ true, &c->bpf);
                 if (r < 0)
@@ -1718,22 +1880,17 @@ static int vl_method_add_mount_to_user_namespace(sd_varlink *link, sd_json_varia
         if (r < 0)
                 return r;
 
-        /* Add this mount to the user namespace's BPF map allowlist entry. */
-        r = userns_restrict_put_by_fd(
-                        c->bpf,
-                        userns_fd,
-                        /* replace= */ false,
-                        &mount_fd,
-                        1);
-        if (r < 0)
-                return r;
+        /* There's no mount allowlist anymore: the BPF-LSM policy decides per operation whether the ID that
+         * would be recorded on disk is a transient one, which needs no per-mount knowledge. We keep
+         * accepting and validating the call for the sake of older clients, and keep the mount pinned as
+         * before, but there is nothing left to allowlist. */
 
         if (DEBUG_LOGGING) {
                 if (userns_info->size > 0)
-                        log_debug("Granting access to mount %i to user namespace " INO_FMT " ('%s' @ UID " UID_FMT ")",
+                        log_debug("Delegated mount %i to user namespace " INO_FMT " ('%s' @ UID " UID_FMT ")",
                                   mnt_id, userns_st.st_ino, userns_info->name, userns_info->start_uid);
                 else
-                        log_debug("Granting access to mount %i to user namespace " INO_FMT " ('%s')",
+                        log_debug("Delegated mount %i to user namespace " INO_FMT " ('%s')",
                                   mnt_id, userns_st.st_ino, userns_info->name);
         }
 
@@ -1832,7 +1989,8 @@ static int vl_method_add_cgroup_to_user_namespace(sd_varlink *link, sd_json_vari
                         /* details= */ NULL,
                         /* good_user= */ UID_INVALID,
                         POLKIT_DEFAULT_ALLOW, /* If no polkit is installed, allow delegation of cgroups to registered userns */
-                        &c->polkit_registry);
+                        &c->polkit_registry,
+                        /* ret_admin= */ NULL);
         if (r <= 0)
                 return r;
 
@@ -1853,6 +2011,12 @@ static int vl_method_add_cgroup_to_user_namespace(sd_varlink *link, sd_json_vari
                 return sd_varlink_error(link, "io.systemd.NamespaceResource.UserNamespaceNotRegistered", NULL);
         if (r < 0)
                 return r;
+
+        r = userns_info_verify_fd(userns_fd, userns_info);
+        if (r == -ESTALE)
+                return sd_varlink_error(link, "io.systemd.NamespaceResource.UserNamespaceNotRegistered", NULL);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to verify user namespace identity: %m");
 
         /* The user namespace must have a user assigned */
         if (userns_info->size == 0)
@@ -1925,7 +2089,7 @@ static void hash_ether_addr(UserNamespaceInfo *userns_info, const char *ifname, 
         siphash24_compress_byte(0, &state); /* separator */
         siphash24_compress_string(strempty(ifname), &state);
         siphash24_compress_byte(0, &state); /* separator */
-        n = htole64(n); /* add the 'index' to the mix in an endianess-independent fashion */
+        n = htole64(n); /* add the 'index' to the mix in an endianness-independent fashion */
         siphash24_compress_typesafe(n, &state);
 
         h = htole64(siphash24_finalize(&state));
@@ -2225,7 +2389,8 @@ static int vl_method_add_netif_to_user_namespace(sd_varlink *link, sd_json_varia
                         polkit_details,
                         /* good_user= */ UID_INVALID,
                         POLKIT_DEFAULT_ALLOW, /* If no polkit is installed, allow delegation of network interfaces to registered userns */
-                        &c->polkit_registry);
+                        &c->polkit_registry,
+                        /* ret_admin= */ NULL);
         if (r <= 0)
                 return r;
 
@@ -2246,6 +2411,12 @@ static int vl_method_add_netif_to_user_namespace(sd_varlink *link, sd_json_varia
                 return sd_varlink_error(link, "io.systemd.NamespaceResource.UserNamespaceNotRegistered", NULL);
         if (r < 0)
                 return r;
+
+        r = userns_info_verify_fd(userns_fd, userns_info);
+        if (r == -ESTALE)
+                return sd_varlink_error(link, "io.systemd.NamespaceResource.UserNamespaceNotRegistered", NULL);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to verify user namespace identity: %m");
 
         if (strv_length(userns_info->netifs) > USER_NAMESPACE_NETIFS_DELEGATE_MAX)
                 return sd_varlink_error(link, "io.systemd.NamespaceResource.TooManyNetworkInterfaces", NULL);

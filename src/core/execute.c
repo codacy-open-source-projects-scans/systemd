@@ -4,7 +4,7 @@
 #include <poll.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
-#include <sys/prctl.h>
+#include <sys/prctl.h> /* IWYU pragma: keep */
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -18,11 +18,13 @@
 #include "cgroup-setup.h"
 #include "coredump-util.h"
 #include "cpu-set-util.h"
+#include "creds-util.h"
 #include "dissect-image.h"
 #include "dynamic-user.h"
 #include "env-file.h"
 #include "env-util.h"
 #include "escape.h"
+#include "exec-credential.h"
 #include "execute.h"
 #include "execute-serialize.h"
 #include "fd-util.h"
@@ -55,6 +57,7 @@
 #include "serialize.h"
 #include "set.h"
 #include "sort-util.h"
+#include "specifier.h"
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
@@ -476,7 +479,6 @@ int exec_spawn(
         assert(unit);
         assert(unit->manager);
         assert(unit->manager->executor_fd >= 0);
-        assert(unit->manager->executor_path);
         assert(command);
         assert(context);
         assert(params);
@@ -577,7 +579,7 @@ int exec_spawn(
         /* The executor binary is pinned, to avoid compatibility problems during upgrades. */
         r = posix_spawn_wrapper(
                         FORMAT_PROC_FD_PATH(unit->manager->executor_fd),
-                        STRV_MAKE(unit->manager->executor_path,
+                        STRV_MAKE("systemd-executor",
                                   "--deserialize", serialization_fd_number,
                                   "--log-level", max_log_levels,
                                   "--log-target", log_target_to_string(manager_get_executor_log_target(unit->manager))),
@@ -751,6 +753,88 @@ void exec_context_done(ExecContext *c) {
         c->extension_image_policy = image_policy_free(c->extension_image_policy);
 
         c->private_hostname = mfree(c->private_hostname);
+}
+
+int exec_context_apply_environment(
+                Unit *u,
+                ExecContext *c,
+                char **env,
+                UnitWriteFlags flags) {
+
+        assert(u);
+        assert(c);
+
+        if (strv_length(env) > ENVIRONMENT_ASSIGNMENTS_MAX)
+                return -E2BIG;
+        if (!strv_env_is_valid(env))
+                return -EINVAL;
+
+        if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
+                if (strv_isempty(env)) {
+                        c->environment = strv_free(c->environment);
+                        unit_write_setting(u, flags, "Environment", "Environment=");
+                } else {
+                        _cleanup_free_ char *joined = unit_concat_strv(env, UNIT_ESCAPE_SPECIFIERS|UNIT_ESCAPE_C);
+                        if (!joined)
+                                return -ENOMEM;
+
+                        char **e = strv_env_merge(c->environment, env);
+                        if (!e)
+                                return -ENOMEM;
+
+                        strv_free_and_replace(c->environment, e);
+                        unit_write_settingf(u, flags, "Environment", "Environment=%s", joined);
+                }
+        }
+
+        return 0;
+}
+
+int exec_context_apply_set_credential(
+                Unit *u,
+                ExecContext *c,
+                const char *id,
+                const void *data,
+                size_t size,
+                bool encrypted,
+                UnitWriteFlags flags,
+                const char **reterr_message) {
+
+        int r;
+
+        assert(u);
+        assert(c);
+        assert(id);
+        assert(data || size == 0);
+
+        if (!credential_name_valid(id)) {
+                if (reterr_message)
+                        *reterr_message = "Credential ID is invalid";
+                return -EINVAL;
+        }
+
+        if (UNIT_WRITE_FLAGS_NOOP(flags))
+                return 0;
+
+        _cleanup_free_ void *copy = memdup(data, size);
+        if (!copy)
+                return -ENOMEM;
+
+        _cleanup_free_ char *escaped_id = specifier_escape(id);
+        if (!escaped_id)
+                return -ENOMEM;
+
+        _cleanup_free_ char *escaped_value = cescape_length(data, size);
+        if (!escaped_value)
+                return -ENOMEM;
+
+        r = exec_context_put_set_credential(c, id, TAKE_PTR(copy), size, encrypted);
+        if (r < 0)
+                return r;
+
+        const char *name = encrypted ? "SetCredentialEncrypted" : "SetCredential";
+        unit_write_settingf(u, flags, name, "%s=%s:%s", name, escaped_id, escaped_value);
+        return 0;
 }
 
 int exec_context_destroy_runtime_directory(const ExecContext *c, const char *runtime_prefix) {
@@ -1888,9 +1972,11 @@ uint64_t exec_context_get_timer_slack_nsec(const ExecContext *c) {
         if (c->timer_slack_nsec != NSEC_INFINITY)
                 return c->timer_slack_nsec;
 
-        r = prctl(PR_GET_TIMERSLACK);
-        if (r < 0)
+        r = prctl_safe(PR_GET_TIMERSLACK, 0, 0, 0, 0);
+        if (r < 0) {
                 log_debug_errno(r, "Failed to get timer slack, ignoring: %m");
+                return 0;
+        }
 
         return (uint64_t) MAX(r, 0);
 }
@@ -2231,6 +2317,56 @@ void exec_command_append_list(ExecCommand **l, ExecCommand *e) {
                 *l = e;
 }
 
+int exec_command_to_setting(const ExecCommand *c, char **ret) {
+        _cleanup_free_ char *exec_chars = NULL, *a = NULL, *s = NULL;
+        UnitWriteFlags esc_flags;
+        bool via_shell;
+
+        assert(c);
+        assert(c->path);
+        assert(!strv_isempty(c->argv));
+        assert(ret);
+
+        /* Formats the command the way it appears on the right-hand side of an ExecStart= (or similar)
+         * assignment in a unit file, i.e. the prefix characters encoding the flags, followed by the
+         * (escaped) command line. This is the inverse of the ExecStart= parser in load-fragment.c, and used
+         * when writing transient unit files. */
+
+        esc_flags = UNIT_ESCAPE_SPECIFIERS |
+                (FLAGS_SET(c->flags, EXEC_COMMAND_NO_ENV_EXPAND) ? UNIT_ESCAPE_EXEC_SYNTAX : UNIT_ESCAPE_EXEC_SYNTAX_ENV);
+        via_shell = FLAGS_SET(c->flags, EXEC_COMMAND_VIA_SHELL);
+
+        exec_chars = exec_command_flags_to_exec_chars(c->flags);
+        if (!exec_chars)
+                return -ENOMEM;
+
+        /* For via-shell commands argv[0] is always "sh" or "-sh", which is implied by the "|" prefix
+         * (plus "@" for the login shell case), hence skip it. */
+        a = unit_concat_strv(via_shell ? strv_skip(c->argv, 1) : c->argv, esc_flags);
+        if (!a)
+                return -ENOMEM;
+
+        /* If argv[0] matches the path the path is implied, too. Note that we use streq() instead of
+         * path_equal() here as argv[0] can be arbitrary and may not be a path. */
+        if (via_shell || streq(c->path, c->argv[0]))
+                s = strjoin(exec_chars, via_shell && c->argv[0][0] == '-' ? "@" : "", a);
+        else {
+                _cleanup_free_ char *t = NULL;
+                const char *p;
+
+                p = unit_escape_setting(c->path, esc_flags, &t);
+                if (!p)
+                        return -ENOMEM;
+
+                s = strjoin(exec_chars, "@", p, " ", a);
+        }
+        if (!s)
+                return -ENOMEM;
+
+        *ret = TAKE_PTR(s);
+        return 0;
+}
+
 int exec_command_set(ExecCommand *c, const char *path, ...) {
         va_list ap;
         char **l, *p;
@@ -2425,6 +2561,7 @@ static int exec_shared_runtime_make(
         assert(m);
         assert(c);
         assert(id);
+        assert(ret);
 
         /* It is not necessary to create ExecSharedRuntime object. */
         if (!c->user_namespace_path && !exec_needs_network_namespace(c) && !exec_needs_ipc_namespace(c) &&
@@ -2664,7 +2801,8 @@ int exec_shared_runtime_deserialize_compat(Unit *u, const char *key, const char 
 int exec_shared_runtime_deserialize_one(Manager *m, const char *value, FDSet *fds) {
         _cleanup_free_ char *tmp_dir = NULL, *var_tmp_dir = NULL;
         char *id = NULL;
-        int r, userns_fdpair[] = {-1, -1}, netns_fdpair[] = {-1, -1}, ipcns_fdpair[] = {-1, -1};
+        _cleanup_close_pair_ int userns_fdpair[] = EBADF_PAIR, netns_fdpair[] = EBADF_PAIR, ipcns_fdpair[] = EBADF_PAIR;
+        int r;
         const char *p, *v = ASSERT_PTR(value);
         size_t n;
 
@@ -3097,9 +3235,10 @@ static const char* const exec_utmp_mode_table[_EXEC_UTMP_MODE_MAX] = {
 DEFINE_STRING_TABLE_LOOKUP(exec_utmp_mode, ExecUtmpMode);
 
 static const char* const exec_preserve_mode_table[_EXEC_PRESERVE_MODE_MAX] = {
-        [EXEC_PRESERVE_NO]      = "no",
-        [EXEC_PRESERVE_YES]     = "yes",
-        [EXEC_PRESERVE_RESTART] = "restart",
+        [EXEC_PRESERVE_NO]         = "no",
+        [EXEC_PRESERVE_YES]        = "yes",
+        [EXEC_PRESERVE_RESTART]    = "restart",
+        [EXEC_PRESERVE_ON_SUCCESS] = "on-success",
 };
 
 DEFINE_STRING_TABLE_LOOKUP_WITH_BOOLEAN(exec_preserve_mode, ExecPreserveMode, EXEC_PRESERVE_YES);

@@ -1,7 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <sys/prctl.h>
-
 #include "sd-bus.h"
 #include "sd-varlink.h"
 
@@ -18,6 +16,7 @@
 #include "manager.h"
 #include "path-util.h"
 #include "pidref.h"
+#include "process-util.h"
 #include "selinux-access.h"
 #include "set.h"
 #include "strv.h"
@@ -118,7 +117,7 @@ static int manager_context_build_json(sd_json_variant **ret, const char *name, v
                         JSON_BUILD_PAIR_FINITE_USEC("RuntimeWatchdogPreUSec", manager_get_watchdog(m, WATCHDOG_PRETIMEOUT)),
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("RuntimeWatchdogPreGovernor", m->watchdog_pretimeout_governor),
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("WatchdogDevice", watchdog_get_device()),
-                        JSON_BUILD_PAIR_FINITE_USEC("TimerSlackNSec", (uint64_t) prctl(PR_GET_TIMERSLACK)),
+                        JSON_BUILD_PAIR_FINITE_USEC("TimerSlackNSec", proc_get_timerslack()),
                         JSON_BUILD_PAIR_ENUM("DefaultOOMPolicy", oom_policy_to_string(m->defaults.oom_policy)),
                         SD_JSON_BUILD_PAIR_INTEGER("DefaultOOMScoreAdjust", m->defaults.oom_score_adjust),
                         SD_JSON_BUILD_PAIR_BOOLEAN("DefaultRestrictSUIDSGID", m->defaults.restrict_suid_sgid),
@@ -170,6 +169,12 @@ static int manager_runtime_build_json(sd_json_variant **ret, const char *name, v
                 JSON_BUILD_PAIR_DUAL_TIMESTAMP_NON_NULL("InitRDTimestamp", &m->timestamps[MANAGER_TIMESTAMP_INITRD]),
                 JSON_BUILD_PAIR_DUAL_TIMESTAMP_NON_NULL("UserspaceTimestamp", &m->timestamps[MANAGER_TIMESTAMP_USERSPACE]),
                 JSON_BUILD_PAIR_DUAL_TIMESTAMP_NON_NULL("FinishTimestamp", &m->timestamps[MANAGER_TIMESTAMP_FINISH]),
+                JSON_BUILD_PAIR_DUAL_TIMESTAMP_NON_NULL("ShutdownStartTimestamp", &m->timestamps[MANAGER_TIMESTAMP_SHUTDOWN_START]),
+                JSON_BUILD_PAIR_DUAL_TIMESTAMP_NON_NULL("ShutdownFinishTimestamp", &m->timestamps[MANAGER_TIMESTAMP_SHUTDOWN_FINISH]),
+                JSON_BUILD_PAIR_DUAL_TIMESTAMP_NON_NULL("PreviousShutdownStartTimestamp", &m->timestamps[MANAGER_TIMESTAMP_PREVIOUS_SHUTDOWN_START]),
+                JSON_BUILD_PAIR_DUAL_TIMESTAMP_NON_NULL("PreviousShutdownFinishTimestamp", &m->timestamps[MANAGER_TIMESTAMP_PREVIOUS_SHUTDOWN_FINISH]),
+                JSON_BUILD_PAIR_DUAL_TIMESTAMP_NON_NULL("PreviousShutdownLateStartTimestamp", &m->timestamps[MANAGER_TIMESTAMP_PREVIOUS_SHUTDOWN_LATE_START]),
+                JSON_BUILD_PAIR_DUAL_TIMESTAMP_NON_NULL("PreviousShutdownLateFinishTimestamp", &m->timestamps[MANAGER_TIMESTAMP_PREVIOUS_SHUTDOWN_LATE_FINISH]),
                 JSON_BUILD_PAIR_DUAL_TIMESTAMP_NON_NULL("SecurityStartTimestamp", &m->timestamps[MANAGER_TIMESTAMP_SECURITY_START]),
                 JSON_BUILD_PAIR_DUAL_TIMESTAMP_NON_NULL("SecurityFinishTimestamp", &m->timestamps[MANAGER_TIMESTAMP_SECURITY_FINISH]),
                 JSON_BUILD_PAIR_DUAL_TIMESTAMP_NON_NULL("GeneratorsStartTimestamp", &m->timestamps[MANAGER_TIMESTAMP_GENERATORS_START]),
@@ -193,7 +198,9 @@ static int manager_runtime_build_json(sd_json_variant **ret, const char *name, v
                 JSON_BUILD_PAIR_DUAL_TIMESTAMP_NON_NULL("WatchdogLastPingTimestamp", watchdog_get_last_ping_as_dual_timestamp(&watchdog_last_ping)),
                 SD_JSON_BUILD_PAIR_STRING("SystemState", manager_state_to_string(manager_state(m))),
                 SD_JSON_BUILD_PAIR_UNSIGNED("ExitCode", m->return_value),
-                SD_JSON_BUILD_PAIR_UNSIGNED("SoftRebootsCount", m->soft_reboots_count));
+                SD_JSON_BUILD_PAIR_UNSIGNED("SoftRebootsCount", m->soft_reboots_count),
+                SD_JSON_BUILD_PAIR_UNSIGNED("KExecCount", m->kexec_count),
+                SD_JSON_BUILD_PAIR_UNSIGNED("ReloadCount", m->reload_count));
 }
 
 int vl_method_describe_manager(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
@@ -381,6 +388,7 @@ int vl_method_enqueue_marked_jobs_manager(sd_varlink *link, sd_json_variant *par
                                         JOB_FAIL,
                                         /* reload_if_possible= */ !BIT_SET(u->markers, UNIT_MARKER_NEEDS_RESTART),
                                         &job_id,
+                                        /* ret_job= */ NULL,
                                         &bus_error);
                 if (ERRNO_IS_NEG_RESOURCE(r))
                         return r;

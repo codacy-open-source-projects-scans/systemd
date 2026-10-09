@@ -8,14 +8,13 @@
 #include <scsi/sg.h>
 #include <sys/ioctl.h>
 
+#include "sd-json.h"
+
 #include "alloc-util.h"
 #include "build.h"
 #include "errno-util.h"
 #include "fd-util.h"
-#include "format-table.h"
-#include "help-util.h"
 #include "main-func.h"
-#include "options.h"
 #include "random-util.h"
 #include "sort-util.h"
 #include "string-table.h"
@@ -24,11 +23,18 @@
 #include "time-util.h"
 #include "udev-util.h"
 #include "unaligned.h"
+#include "verbs.h"
 
 static bool arg_eject = false;
 static bool arg_lock = false;
 static bool arg_unlock = false;
 static const char *arg_node = NULL;
+
+COMMAND(
+        "cdrom_id\0",
+        "Identify CD/DVD drives and their media.",
+        .argspec = "DEVICE\0",
+);
 
 typedef enum Feature {
         FEATURE_RW_NONREMOVABLE = 0x01,
@@ -325,7 +331,7 @@ static int cd_media_compat(Context *c) {
 
 static int cd_inquiry(Context *c) {
         struct scsi_cmd sc;
-        unsigned char inq[36];
+        unsigned char inq[36] = {};
         int r;
 
         assert(c);
@@ -360,7 +366,7 @@ static int feature_profiles(Context *c, const unsigned char *profiles, size_t si
 }
 
 static int cd_profiles_old_mmc(Context *c) {
-        disc_information discinfo;
+        disc_information discinfo = {};
         struct scsi_cmd sc;
         size_t len;
         int r;
@@ -411,7 +417,7 @@ static int cd_profiles_old_mmc(Context *c) {
 
 static int cd_profiles(Context *c) {
         struct scsi_cmd sc;
-        unsigned char features[65530];
+        unsigned char features[65530] = {};
         unsigned cur_profile;
         size_t len;
         int r;
@@ -503,8 +509,8 @@ DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(media_state, MediaState);
 
 static int dvd_ram_media_update_state(Context *c) {
         struct scsi_cmd sc;
-        unsigned char dvdstruct[8];
-        unsigned char format[12];
+        unsigned char dvdstruct[8] = {};
+        unsigned char format[12] = {};
         unsigned char len;
         int r;
 
@@ -568,7 +574,7 @@ static int dvd_ram_media_update_state(Context *c) {
 
 static int dvd_media_update_state(Context *c) {
         struct scsi_cmd sc;
-        unsigned char buffer[32 * 2048];
+        unsigned char buffer[32 * 2048] = {};
         int r;
 
         r = dvd_ram_media_update_state(c);
@@ -614,7 +620,7 @@ static int dvd_media_update_state(Context *c) {
 
 static int cd_media_info(Context *c) {
         struct scsi_cmd sc;
-        unsigned char header[32];
+        unsigned char header[32] = {};
         MediaState state;
         int r;
 
@@ -666,8 +672,8 @@ static int cd_media_info(Context *c) {
 
 static int cd_media_toc(Context *c) {
         struct scsi_cmd sc;
-        unsigned char header[12];
-        unsigned char toc[65536];
+        unsigned char header[12] = {};
+        unsigned char toc[65536] = {};
         unsigned num_tracks;
         size_t len;
         int r;
@@ -900,31 +906,17 @@ static void print_properties(const Context *c) {
                 printf("ID_CDROM_MEDIA_TRACK_COUNT_DATA=%u\n", c->media_track_count_data);
 }
 
-static int help(void) {
-        _cleanup_(table_unrefp) Table *options = NULL;
-        int r;
-
-        r = option_parser_get_help_table(&options);
-        if (r < 0)
-                return r;
-
-        help_cmdline("[OPTIONS...] DEVICE");
-        help_section("Options:");
-
-        return table_print_or_warn(options);
-}
-
 static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
         OptionParser opts = { argc, argv };
 
-        FOREACH_OPTION(c, &opts, /* on_error= */ return c)
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return help();
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();
@@ -950,6 +942,9 @@ static int parse_argv(int argc, char *argv[]) {
                         log_set_max_level(LOG_DEBUG);
                         log_open();
                         break;
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
         char **args = option_parser_get_args(&opts);

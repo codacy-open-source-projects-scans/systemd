@@ -19,7 +19,7 @@
 #include "crypto-util.h"
 #include "dirent-util.h"
 #include "efi-api.h"
-#include "efi-fundamental.h"
+#include "efi.h"
 #include "efivars.h"
 #include "env-file.h"
 #include "fd-util.h"
@@ -45,6 +45,7 @@
 #include "tmpfile-util.h"
 #include "umask-util.h"
 #include "utf8.h"
+#include "varlink-util.h"
 
 typedef enum InstallOperation {
         INSTALL_NEW,
@@ -211,6 +212,8 @@ static int install_context_from_cmdline(
                         return log_oom();
         }
 
+        b.touch_variables = arg_touch_variables;
+
         *ret = TAKE_GENERIC(b, InstallContext, INSTALL_CONTEXT_NULL);
 
         return !!ret->esp_path; /* return positive if we found an ESP */
@@ -335,7 +338,8 @@ static int load_kernel_install_layout(InstallContext *c) {
                         /* ret_boot_root= */ NULL,
                         &layout,
                         /* ret_initrd_generator= */ NULL,
-                        /* ret_uki_generator= */ NULL);
+                        /* ret_uki_generator= */ NULL,
+                        /* ret_entry_name_format= */ NULL);
         if (r <= 0)
                 return r;
 
@@ -462,13 +466,13 @@ static int version_check(int fd_from, const char *from, int fd_to, const char *t
         if (r == -ESRCH)
                 return log_notice_errno(r, "Source file \"%s\" does not carry version information!", from);
         if (r < 0)
-                return r;
+                return log_error_errno(r, "Failed to get file version of '%s': %m", from);
 
         r = get_file_version(fd_to, &b);
         if (r == -ESRCH)
                 return log_info_errno(r, "Skipping \"%s\", it's owned by another boot loader (no version info found).", to);
         if (r < 0)
-                return r;
+                return log_error_errno(r, "Failed to get file version of '%s': %m", to);
         if (compare_product(a, b) != 0)
                 return log_info_errno(SYNTHETIC_ERRNO(ESRCH),
                                       "Skipping \"%s\", it's owned by another boot loader.", to);
@@ -520,7 +524,7 @@ static int copy_file_with_version_check(
          * might be left at the end of the file. (Resetting before rather than after a copy attempt is safer
          * because a previous attempt might have failed half-way, leaving the file offset at some undefined
          * place.) */
-        r = copy_bytes(source_fd, write_fd, UINT64_MAX, COPY_REFLINK|COPY_SEEK0_SOURCE);
+        r = copy_bytes(source_fd, write_fd, UINT64_MAX, COPY_SEEK0_SOURCE);
         if (r < 0)
                 return log_error_errno(r, "Failed to copy data from \"%s\" to \"%s\": %m", source_path, dest_path);
 
@@ -731,11 +735,57 @@ static int copy_one_file(
         if (dest_fd < 0 && dest_fd != -ENOENT)
                 return log_error_errno(dest_fd, "Failed to open '%s' under '%s/EFI/systemd' directory: %m", dest_name, j);
 
-        /* Note that if this fails we do the second copy anyway, but return this error code,
-         * so we stash it away in a separate variable. */
-        ret = copy_file_with_version_check(source_path, source_fd, dest_path, dest_parent_fd, dest_name, dest_fd, force);
-
         const char *e = startswith(dest_name, "systemd-boot");
+
+        /* If a primary sd-boot binary already exists and the source is a newer version, copy
+         * the existing primary to systemd-boot-fallback{arch}.efi before installing the new
+         * one, so firmware has a fallback to the previous binary. The fallback is left alone
+         * when its product and version match the currently booted bootloader (from LoaderInfo),
+         * so a known good binary stays as the fallback. In all other cases, like no fallback yet,
+         * LoaderInfo is unavailable, or product/version differs from what booted, it is
+         * overwritten with the current primary. */
+        if (e && dest_fd >= 0 && !force) {
+                r = version_check(source_fd, source_path, dest_fd, dest_path);
+                if (r < 0)
+                        /* Stash the error and fall through; the BOOT{arch}.EFI updates below still run. */
+                        ret = r;
+                else {
+                        _cleanup_free_ char *fallback_name = strjoin("systemd-boot-fallback", e);
+                        if (!fallback_name)
+                                return log_oom();
+
+                        _cleanup_free_ char *fallback_path = path_join(j, "/EFI/systemd", fallback_name);
+                        if (!fallback_path)
+                                return log_oom();
+
+                        /* Leave the fallback alone if it already holds the currently booted product
+                         * and version, so a known good binary stays as the fallback. If there is no
+                         * fallback yet, LoaderInfo is unavailable, or there is a mismatch, then
+                         * overwrite it with the current primary. */
+                        bool should_rotate = true;
+                        _cleanup_close_ int fallback_fd = xopenat_full(dest_parent_fd, fallback_name, O_RDONLY|O_CLOEXEC, XO_REGULAR, MODE_INVALID);
+                        if (fallback_fd >= 0) {
+                                _cleanup_free_ char *loader_info = NULL, *fallback_version = NULL;
+
+                                if (efi_get_variable_string(EFI_LOADER_VARIABLE_STR("LoaderInfo"), &loader_info) >= 0 &&
+                                    get_file_version(fallback_fd, &fallback_version) >= 0)
+                                        should_rotate = compare_product(loader_info, fallback_version) != 0 ||
+                                                        compare_version(loader_info, fallback_version) != 0;
+                        }
+
+                        if (should_rotate) {
+                                r = copy_file_with_version_check(dest_path, dest_fd, fallback_path, dest_parent_fd, fallback_name, /* dest_fd= */ -EBADF, /* force= */ true);
+                                if (r < 0)
+                                        log_warning_errno(r, "Failed to back up sd-boot binary to fallback path, continuing: %m");
+                        }
+
+                        ret = copy_file_with_version_check(source_path, source_fd, dest_path, dest_parent_fd, dest_name, dest_fd, /* force= */ true);
+                }
+        } else
+                /* Note that if this fails we do the second copy anyway, but return this error code,
+                 * so we stash it away in a separate variable. */
+                ret = copy_file_with_version_check(source_path, source_fd, dest_path, dest_parent_fd, dest_name, dest_fd, force);
+
         if (e) {
 
                 /* Create the EFI default boot loader name (specified for removable devices) */
@@ -1044,8 +1094,7 @@ static int install_secure_boot_auto_enroll(InstallContext *c) {
         int dercertsz;
         dercertsz = sym_i2d_X509(c->secure_boot_certificate, &dercert);
         if (dercertsz < 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to convert X.509 certificate to DER: %s",
-                                       sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                return log_openssl_errors(LOG_ERR, "Failed to convert X.509 certificate to DER");
 
         if (c->esp_fd < 0)
                 return c->esp_fd;
@@ -1102,33 +1151,31 @@ static int install_secure_boot_auto_enroll(InstallContext *c) {
 
                 /* Don't count the trailing NUL terminator. */
                 if (sym_BIO_write(bio, db16, char16_strsize(db16) - sizeof(char16_t)) < 0)
-                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to write variable name to bio");
+                        return log_openssl_errors(LOG_ERR, "Failed to write variable name to bio");
 
                 EFI_GUID *guid = STR_IN_SET(db, "PK", "KEK") ? &(EFI_GUID) EFI_GLOBAL_VARIABLE : &(EFI_GUID) EFI_IMAGE_SECURITY_DATABASE_GUID;
 
                 if (sym_BIO_write(bio, guid, sizeof(*guid)) < 0)
-                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to write variable GUID to bio");
+                        return log_openssl_errors(LOG_ERR, "Failed to write variable GUID to bio");
 
                 if (sym_BIO_write(bio, &attrs, sizeof(attrs)) < 0)
-                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to write variable attributes to bio");
+                        return log_openssl_errors(LOG_ERR, "Failed to write variable attributes to bio");
 
                 if (sym_BIO_write(bio, &timestamp, sizeof(timestamp)) < 0)
-                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to write timestamp to bio");
+                        return log_openssl_errors(LOG_ERR, "Failed to write timestamp to bio");
 
                 if (sym_BIO_write(bio, siglist, siglistsz) < 0)
-                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to write signature list to bio");
+                        return log_openssl_errors(LOG_ERR, "Failed to write signature list to bio");
 
                 _cleanup_(PKCS7_freep) PKCS7 *p7 = NULL;
                 p7 = sym_PKCS7_sign(c->secure_boot_certificate, c->secure_boot_private_key, /* certs= */ NULL, bio, PKCS7_DETACHED|PKCS7_NOATTR|PKCS7_BINARY|PKCS7_NOSMIMECAP);
                 if (!p7)
-                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to calculate PKCS7 signature: %s",
-                                               sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                        return log_openssl_errors(LOG_ERR, "Failed to calculate PKCS7 signature");
 
                 _cleanup_free_ uint8_t *sig = NULL;
                 int sigsz = sym_i2d_PKCS7(p7, &sig);
                 if (sigsz < 0)
-                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to convert PKCS7 signature to DER: %s",
-                                               sym_ERR_error_string(sym_ERR_get_error(), NULL));
+                        return log_openssl_errors(LOG_ERR, "Failed to convert PKCS7 signature to DER");
 
                 size_t authsz = offsetof(EFI_VARIABLE_AUTHENTICATION_2, AuthInfo.CertData) + sigsz;
                 _cleanup_free_ EFI_VARIABLE_AUTHENTICATION_2 *auth = malloc(authsz);
@@ -1233,7 +1280,7 @@ static int find_slot(sd_id128_t uuid, const char *path, uint16_t *id) {
         return 0;
 }
 
-static int insert_into_order(InstallContext *c, uint16_t slot) {
+static int insert_into_order(InstallContext *c, uint16_t slot, uint16_t after_slot) {
         _cleanup_free_ uint16_t *order = NULL;
         uint16_t *t;
         int n;
@@ -1255,13 +1302,35 @@ static int insert_into_order(InstallContext *c, uint16_t slot) {
                         continue;
 
                 /* we do not require to be the first one, all is fine */
-                if (c->operation != INSTALL_NEW)
+                /* if after_slot is set, leave existing position alone to preserve user reordering. */
+                if (i == 0 || c->operation != INSTALL_NEW || after_slot != UINT16_MAX)
                         return 0;
 
                 /* move us to the first slot */
                 memmove(order + 1, order, i * sizeof(uint16_t));
                 order[0] = slot;
                 return efi_set_boot_order(order, n);
+        }
+
+        /* slot is not yet in the order, so insert after a specific slot if requested */
+        if (after_slot != UINT16_MAX) {
+                t = reallocarray(order, n + 1, sizeof(uint16_t));
+                if (!t)
+                        return -ENOMEM;
+                order = t;
+
+                for (int i = 0; i < n; i++) {
+                        if (order[i] != after_slot)
+                                continue;
+
+                        memmove(order + i + 2, order + i + 1, (n - i - 1) * sizeof(uint16_t));
+                        order[i + 1] = slot;
+                        return efi_set_boot_order(order, n + 1);
+                }
+
+                log_warning("Boot entry %04" PRIx16 " not found in BootOrder, appending new entry at the end.", after_slot);
+                order[n] = slot;
+                return efi_set_boot_order(order, n + 1);
         }
 
         /* extend array */
@@ -1271,7 +1340,7 @@ static int insert_into_order(InstallContext *c, uint16_t slot) {
         order = t;
 
         /* add us to the top or end of the list */
-        if (c->operation != INSTALL_NEW) {
+        if (c->operation == INSTALL_NEW) {
                 memmove(order + 1, order, n * sizeof(uint16_t));
                 order[0] = slot;
         } else
@@ -1352,14 +1421,20 @@ fallback:
         return 0;
 }
 
-static int install_variables(
+static int install_boot_option(
                 InstallContext *c,
-                const char *path) {
+                const char *path,
+                const char *description,
+                bool require_existing,
+                uint16_t after_slot,
+                uint16_t *ret_slot) {
 
         uint16_t slot;
         int r;
 
         assert(c);
+        assert(path);
+        assert(description);
 
         if (c->esp_fd < 0)
                 return c->esp_fd;
@@ -1375,9 +1450,9 @@ static int install_variables(
                         CHASE_PROHIBIT_SYMLINKS|CHASE_MUST_BE_REGULAR,
                         F_OK,
                         /* ret_path= */ NULL);
-        if (r == -ENOENT)
+        if (r == -ENOENT && require_existing)
                 return 0;
-        if (r < 0)
+        if (r < 0 && r != -ENOENT)
                 return log_error_errno(r, "Cannot access \"%s/%s\": %m", j, skip_leading_slash(path));
 
         r = find_slot(c->esp_uuid, path, &slot);
@@ -1396,12 +1471,6 @@ static int install_variables(
         bool existing = r > 0;
 
         if (c->operation == INSTALL_NEW || !existing) {
-                _cleanup_free_ char *description = NULL;
-
-                r = pick_efi_boot_option_description(c->esp_fd, &description);
-                if (r < 0)
-                        return r;
-
                 r = efi_add_boot_option(
                                 slot,
                                 description,
@@ -1424,7 +1493,14 @@ static int install_variables(
                          description);
         }
 
-        return insert_into_order(c, slot);
+        r = insert_into_order(c, slot, after_slot);
+        if (r < 0)
+                return r;
+
+        if (ret_slot)
+                *ret_slot = slot;
+
+        return 0;
 }
 
 static int are_we_installed(InstallContext *c) {
@@ -1509,7 +1585,7 @@ static int load_secure_boot_auto_enroll(
         if (arg_private_key_source_type == OPENSSL_KEY_SOURCE_FILE) {
                 r = parse_path_argument(arg_private_key, /* suppress_root= */ false, &arg_private_key);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to parse private key path %s: %m", arg_private_key);
+                        return r;
         }
 
         r = openssl_load_private_key(
@@ -1534,6 +1610,38 @@ static int load_secure_boot_auto_enroll(
         return 0;
 }
 #endif
+
+static int install_variables(InstallContext *c, const char *arch) {
+        int r;
+
+        assert(c);
+
+        const char *path = strjoina("/EFI/systemd/systemd-boot", arch, ".efi");
+
+        _cleanup_free_ char *description = NULL;
+        r = pick_efi_boot_option_description(c->esp_fd, &description);
+        if (r < 0)
+                return r;
+
+        uint16_t primary_slot = UINT16_MAX;
+        r = install_boot_option(c, path, description, /* require_existing= */ true, /* after_slot= */ UINT16_MAX, &primary_slot);
+        if (r < 0)
+                return r;
+        /* If primary registration was skipped (e.g. binary not on ESP), skip the fallback too
+         * or else it would land at position 0 in BootOrder with no primary ahead of it. */
+        if (primary_slot == UINT16_MAX)
+                return 0;
+
+        const char *fallback_path = strjoina("/EFI/systemd/systemd-boot-fallback", arch, ".efi");
+
+        _cleanup_free_ char *fallback_description = strjoin("Fallback ", description);
+        if (!fallback_description)
+                return log_oom();
+
+        strshorten(fallback_description, EFI_BOOT_OPTION_DESCRIPTION_MAX);
+
+        return install_boot_option(c, fallback_path, fallback_description, /* require_existing= */ false, /* after_slot= */ primary_slot, /* ret_slot= */ NULL);
+}
 
 static int run_install(InstallContext *c) {
         int r;
@@ -1631,8 +1739,7 @@ static int run_install(InstallContext *c) {
                 return 0;
         }
 
-        char *path = strjoina("/EFI/systemd/systemd-boot", arch, ".efi");
-        return install_variables(c, path);
+        return install_variables(c, arch);
 }
 
 int verb_install(int argc, char *argv[], uintptr_t _data, void *userdata) {
@@ -1700,6 +1807,8 @@ static int remove_boot_efi(InstallContext *c) {
                         return log_oom();
 
                 fd = xopenat_full(dirfd(d), de->d_name, O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY|O_NOFOLLOW, XO_REGULAR, /* mode= */ MODE_INVALID);
+                if (fd == -ENOENT)
+                        continue;
                 if (fd < 0)
                         return log_error_errno(fd, "Failed to open '%s' for reading: %m", z);
 
@@ -1715,8 +1824,10 @@ static int remove_boot_efi(InstallContext *c) {
                 r = get_file_version(fd, &v);
                 if (r == -ESRCH)
                         continue;  /* No version information */
-                if (r < 0)
-                        return r;
+                if (r < 0) {
+                        log_warning_errno(r, "Failed to get file version of '%s', skipping: %m", de->d_name);
+                        continue;
+                }
                 if (!startswith(v, "systemd-boot "))
                         continue;
 
@@ -1810,7 +1921,7 @@ static int remove_binaries(InstallContext *c) {
         return RET_GATHER(r, remove_boot_efi(c));
 }
 
-static int remove_variables(sd_id128_t uuid, const char *path, bool in_order) {
+static int remove_boot_option(sd_id128_t uuid, const char *path, bool in_order) {
         uint16_t slot;
         int r;
 
@@ -1858,8 +1969,19 @@ static int remove_loader_variables(void) {
         return r;
 }
 
+static int remove_variables(sd_id128_t uuid) {
+        int r = 0;
+
+        const char *path = strjoina("/EFI/systemd/systemd-boot", get_efi_arch(), ".efi");
+        RET_GATHER(r, remove_boot_option(uuid, path, /* in_order= */ true));
+
+        const char *fallback_path = strjoina("/EFI/systemd/systemd-boot-fallback", get_efi_arch(), ".efi");
+        RET_GATHER(r, remove_boot_option(uuid, fallback_path, /* in_order= */ true));
+
+        return RET_GATHER(r, remove_loader_variables());
+}
+
 int verb_remove(int argc, char *argv[], uintptr_t _data, void *userdata) {
-        sd_id128_t uuid = SD_ID128_NULL;
         int r;
 
         _cleanup_(install_context_done) InstallContext c = INSTALL_CONTEXT_NULL;
@@ -1926,9 +2048,7 @@ int verb_remove(int argc, char *argv[], uintptr_t _data, void *userdata) {
                 return r;
         }
 
-        char *path = strjoina("/EFI/systemd/systemd-boot", get_efi_arch(), ".efi");
-        RET_GATHER(r, remove_variables(uuid, path, /* in_order= */ true));
-        return RET_GATHER(r, remove_loader_variables());
+        return remove_variables(c.esp_uuid);
 }
 
 int verb_is_installed(int argc, char *argv[], uintptr_t _data, void *userdata) {
@@ -1966,12 +2086,16 @@ static JSON_DISPATCH_ENUM_DEFINE(json_dispatch_boot_entry_token_type, BootEntryT
 typedef struct InstallParameters {
         InstallContext context;
         unsigned root_fd_index;
+        char *esp_path;
+        char *xbootldr_path;
 } InstallParameters;
 
 static void install_parameters_done(InstallParameters *p) {
         assert(p);
 
         install_context_done(&p->context);
+        free(p->esp_path);
+        free(p->xbootldr_path);
 }
 
 int vl_method_install(
@@ -1990,17 +2114,24 @@ int vl_method_install(
         };
 
         static const sd_json_dispatch_field dispatch_table[] = {
-                { "operation",          SD_JSON_VARIANT_STRING,        json_dispatch_install_operation,     voffsetof(p, context.operation),        SD_JSON_MANDATORY },
-                { "graceful",           SD_JSON_VARIANT_BOOLEAN,       sd_json_dispatch_stdbool,            voffsetof(p, context.graceful),         0                 },
-                { "rootFileDescriptor", _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint,               voffsetof(p, root_fd_index),            0                 },
-                { "rootDirectory",      SD_JSON_VARIANT_STRING,        json_dispatch_path,                  voffsetof(p, context.root),             0                 },
-                { "bootEntryTokenType", SD_JSON_VARIANT_STRING,        json_dispatch_boot_entry_token_type, voffsetof(p, context.entry_token_type), 0                 },
-                { "touchVariables",     SD_JSON_VARIANT_BOOLEAN,       sd_json_dispatch_tristate,           voffsetof(p, context.touch_variables),  0                 },
+                { "operation",          SD_JSON_VARIANT_STRING,        json_dispatch_install_operation,     voffsetof(p, context.operation),            SD_JSON_MANDATORY },
+                { "graceful",           SD_JSON_VARIANT_BOOLEAN,       sd_json_dispatch_stdbool,            voffsetof(p, context.graceful),             0                 },
+                { "rootFileDescriptor", _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint,               voffsetof(p, root_fd_index),                0                 },
+                { "rootDirectory",      SD_JSON_VARIANT_STRING,        json_dispatch_path,                  voffsetof(p, context.root),                 0                 },
+                { "espPath",            SD_JSON_VARIANT_STRING,        json_dispatch_path,                  voffsetof(p, esp_path),                     0                 },
+                { "xbootldrPath",       SD_JSON_VARIANT_STRING,        json_dispatch_path,                  voffsetof(p, xbootldr_path),                0                 },
+                { "bootEntryTokenType", SD_JSON_VARIANT_STRING,        json_dispatch_boot_entry_token_type, voffsetof(p, context.entry_token_type),     0                 },
+                { "makeEntryDirectory", SD_JSON_VARIANT_BOOLEAN,       sd_json_dispatch_tristate,           voffsetof(p, context.make_entry_directory), 0                 },
+                { "touchVariables",     SD_JSON_VARIANT_BOOLEAN,       sd_json_dispatch_tristate,           voffsetof(p, context.touch_variables),      0                 },
                 {},
         };
 
         r = sd_varlink_dispatch(link, parameters, dispatch_table, &p);
         if (r != 0)
+                return r;
+
+        r = varlink_check_privileged_peer(link);
+        if (r < 0)
                 return r;
 
         if (!IN_SET(p.context.operation, INSTALL_NEW, INSTALL_UPDATE))
@@ -2039,7 +2170,7 @@ int vl_method_install(
 
         r = find_esp_and_warn_at_full(
                         p.context.root_fd,
-                        /* path= */ NULL,
+                        p.esp_path,
                         /* unprivileged_mode= */ false,
                         &p.context.esp_path,
                         &p.context.esp_fd,
@@ -2055,7 +2186,7 @@ int vl_method_install(
 
         r = find_xbootldr_and_warn_at(
                         p.context.root_fd,
-                        /* path= */ NULL,
+                        p.xbootldr_path,
                         /* unprivileged_mode= */ false,
                         &p.context.xbootldr_path,
                         &p.context.xbootldr_fd);

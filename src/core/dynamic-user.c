@@ -174,6 +174,9 @@ static int pick_uid(char **suggested_paths, const char *name, uid_t *ret_uid) {
                 0x8a, 0xbb, 0x39, 0x57, 0x8d, 0xd9, 0xec, 0x59
         };
 
+        assert(name);
+        assert(ret_uid);
+
         unsigned n_tries = 100, current_suggested = 0;
         int r;
 
@@ -357,8 +360,8 @@ static int dynamic_user_realize(
 
         r = dynamic_user_pop(d, &num, &uid_lock_fd);
         if (r < 0) {
-                int new_uid_lock_fd;
-                uid_t new_uid;
+                int new_uid_lock_fd = -EBADF; /* avoid false maybe-uninitialized warning */
+                uid_t new_uid = UID_INVALID; /* avoid false maybe-uninitialized warning */
 
                 if (r != -EAGAIN)
                         return r;
@@ -465,7 +468,7 @@ static int dynamic_user_realize(
 
 int dynamic_user_current(DynamicUser *d, uid_t *ret) {
         _cleanup_close_ int lock_fd = -EBADF;
-        uid_t uid;
+        uid_t uid = UID_INVALID; /* avoid false maybe-uninitialized warning */
         int r;
 
         assert(d);

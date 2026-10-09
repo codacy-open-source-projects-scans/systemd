@@ -12,7 +12,7 @@
 #include <unistd.h>
 
 #include "alloc-util.h"
-#include "btrfs.h"
+#include "btrfs-util.h"
 #include "chattr-util.h"
 #include "copy.h"
 #include "dirent-util.h"
@@ -25,6 +25,7 @@
 #include "mountpoint-util.h"
 #include "nulstr-util.h"
 #include "path-util.h"
+#include "recurse-dir.h"
 #include "rm-rf.h"
 #include "selinux-util.h"
 #include "signal-util.h"
@@ -69,31 +70,6 @@ static ssize_t try_copy_file_range(
                 return -errno;
 
         return r;
-}
-
-enum {
-        FD_IS_NO_PIPE,
-        FD_IS_BLOCKING_PIPE,
-        FD_IS_NONBLOCKING_PIPE,
-};
-
-static int fd_is_nonblock_pipe(int fd) {
-        struct stat st;
-        int flags;
-
-        /* Checks whether the specified file descriptor refers to a pipe, and if so if O_NONBLOCK is set. */
-
-        if (fstat(fd, &st) < 0)
-                return -errno;
-
-        if (!S_ISFIFO(st.st_mode))
-                return FD_IS_NO_PIPE;
-
-        flags = fcntl(fd, F_GETFL);
-        if (flags < 0)
-                return -errno;
-
-        return FLAGS_SET(flags, O_NONBLOCK) ? FD_IS_NONBLOCKING_PIPE : FD_IS_BLOCKING_PIPE;
 }
 
 static int look_for_signals(CopyFlags copy_flags) {
@@ -154,6 +130,60 @@ static int create_hole(int fd, off_t size) {
         return 0;
 }
 
+static int try_reflink_copy_bytes(
+                int fdf,
+                int fdt,
+                uint64_t max_bytes,
+                CopyFlags copy_flags) {
+
+        int r;
+
+        assert(fdf >= 0);
+        assert(fdt >= 0);
+
+        if (max_bytes == 0)
+                return -EOPNOTSUPP;
+
+        off_t foffset = FLAGS_SET(copy_flags, COPY_SEEK0_SOURCE) ? 0 : lseek(fdf, 0, SEEK_CUR);
+        if (foffset < 0)
+                return -EOPNOTSUPP;
+
+        off_t toffset = FLAGS_SET(copy_flags, COPY_SEEK0_TARGET) ? 0 : lseek(fdt, 0, SEEK_CUR);
+        if (toffset < 0)
+                return -EOPNOTSUPP;
+
+        r = reflink_range(fdf, foffset, fdt, toffset, max_bytes);
+        if (r < 0)
+                return -EOPNOTSUPP;
+
+        if (max_bytes == UINT64_MAX) {
+                off_t end;
+
+                end = lseek(fdf, 0, SEEK_END);
+                if (end < 0)
+                        return -errno;
+                if (end < foffset)
+                        return -ESPIPE;
+
+                if (lseek(fdt, toffset + (end - foffset), SEEK_SET) < 0)
+                        return -errno;
+        } else {
+                if (lseek(fdf, foffset + max_bytes, SEEK_SET) < 0)
+                        return -errno;
+                if (lseek(fdt, toffset + max_bytes, SEEK_SET) < 0)
+                        return -errno;
+        }
+
+        if (FLAGS_SET(copy_flags, COPY_VERIFY_LINKED)) {
+                r = fd_verify_linked(fdf);
+                if (r < 0)
+                        return r;
+        }
+
+        return max_bytes == UINT64_MAX ? 0 /* we copied until EOF */
+                                       : 1 /* we copied the requested range */;
+}
+
 int copy_bytes_full(
                 int fdf, int fdt,
                 uint64_t max_bytes,
@@ -164,9 +194,9 @@ int copy_bytes_full(
                 void *userdata) {
 
         _cleanup_close_ int fdf_opened = -EBADF, fdt_opened = -EBADF;
-        bool try_cfr = true, try_sendfile = true, try_splice = true;
+        bool try_cfr = true, try_sendfile = true;
         uint64_t copied_total = 0;
-        int r, nonblock_pipe = -1;
+        int r;
 
         assert(fdf >= 0);
         assert(fdt >= 0);
@@ -201,78 +231,9 @@ int copy_bytes_full(
             lseek(fdt, 0, SEEK_SET) < 0)
                 return -errno;
 
-        /* Try btrfs reflinks first. This only works on regular, seekable files, hence let's check the file offsets of
-         * source and destination first. */
-        if ((copy_flags & COPY_REFLINK)) {
-                off_t foffset;
-
-                /* In reflink mode we need to know where the current file offset is, but if we just seeked to
-                 * 0 anyway, we can suppress that. */
-                foffset = FLAGS_SET(copy_flags, COPY_SEEK0_SOURCE) ? 0 : lseek(fdf, 0, SEEK_CUR);
-                if (foffset >= 0) {
-                        off_t toffset;
-
-                        toffset = FLAGS_SET(copy_flags, COPY_SEEK0_TARGET) ? 0 : lseek(fdt, 0, SEEK_CUR);
-                        if (toffset >= 0) {
-
-                                if (foffset == 0 && toffset == 0 && max_bytes == UINT64_MAX)
-                                        r = reflink(fdf, fdt); /* full file reflink */
-                                else
-                                        r = reflink_range(fdf, foffset, fdt, toffset, max_bytes == UINT64_MAX ? 0 : max_bytes); /* partial reflink */
-                                if (r >= 0) {
-                                        off_t t;
-                                        int ret;
-
-                                        /* This worked, yay! Now — to be fully correct — let's adjust the file pointers */
-                                        if (max_bytes == UINT64_MAX) {
-
-                                                /* We cloned to the end of the source file, let's position the read
-                                                 * pointer there, and query it at the same time. */
-                                                t = lseek(fdf, 0, SEEK_END);
-                                                if (t < 0)
-                                                        return -errno;
-                                                if (t < foffset)
-                                                        return -ESPIPE;
-
-                                                /* Let's adjust the destination file write pointer by the same number
-                                                 * of bytes. */
-                                                t = lseek(fdt, toffset + (t - foffset), SEEK_SET);
-                                                if (t < 0)
-                                                        return -errno;
-
-                                                if (FLAGS_SET(copy_flags, COPY_VERIFY_LINKED)) {
-                                                        r = fd_verify_linked(fdf);
-                                                        if (r < 0)
-                                                                return r;
-                                                }
-
-                                                /* We copied the whole thing, hence hit EOF, return 0. */
-                                                ret = 0;
-                                        } else {
-                                                t = lseek(fdf, foffset + max_bytes, SEEK_SET);
-                                                if (t < 0)
-                                                        return -errno;
-
-                                                t = lseek(fdt, toffset + max_bytes, SEEK_SET);
-                                                if (t < 0)
-                                                        return -errno;
-
-                                                /* We copied only some number of bytes, which worked, but
-                                                 * this means we didn't hit EOF, return 1. */
-                                                ret = 1;
-                                        }
-
-                                        if (FLAGS_SET(copy_flags, COPY_VERIFY_LINKED)) {
-                                                r = fd_verify_linked(fdf);
-                                                if (r < 0)
-                                                        return r;
-                                        }
-
-                                        return ret;
-                                }
-                        }
-                }
-        }
+        r = try_reflink_copy_bytes(fdf, fdt, max_bytes, copy_flags);
+        if (r != -EOPNOTSUPP)
+                return r;
 
         usec_t start_timestamp = USEC_INFINITY;
         if (progress)
@@ -367,7 +328,7 @@ int copy_bytes_full(
                         }
                 }
 
-                /* First try copy_file_range(), unless we already tried */
+                /* First, try copy_file_range(), unless we already tried */
                 if (try_cfr) {
                         n = try_copy_file_range(fdf, NULL, fdt, NULL, m, 0u);
                         if (n < 0) {
@@ -388,13 +349,13 @@ int copy_bytes_full(
                                  * back to simple read()s in case we encounter empty files.
                                  *
                                  * See: https://lwn.net/Articles/846403/ */
-                                try_cfr = try_sendfile = try_splice = false;
+                                try_cfr = try_sendfile = false;
                         } else
                                 /* Success! */
                                 goto next;
                 }
 
-                /* First try sendfile(), unless we already tried */
+                /* Second, try sendfile(), unless we already tried */
                 if (try_sendfile) {
                         n = sendfile(fdt, fdf, NULL, m);
                         if (n < 0) {
@@ -408,76 +369,13 @@ int copy_bytes_full(
                                 if (copied_total > 0)
                                         break;
 
-                                try_sendfile = try_splice = false; /* same logic as above for copy_file_range() */
+                                try_sendfile = false; /* same logic as above for copy_file_range() */
                         } else
                                 /* Success! */
                                 goto next;
                 }
 
-                /* Then try splice, unless we already tried. */
-                if (try_splice) {
-
-                        /* splice()'s asynchronous I/O support is a bit weird. When it encounters a pipe file
-                         * descriptor, then it will ignore its O_NONBLOCK flag and instead only honour the
-                         * SPLICE_F_NONBLOCK flag specified in its flag parameter. Let's hide this behaviour
-                         * here, and check if either of the specified fds are a pipe, and if so, let's pass
-                         * the flag automatically, depending on O_NONBLOCK being set.
-                         *
-                         * Here's a twist though: when we use it to move data between two pipes of which one
-                         * has O_NONBLOCK set and the other has not, then we have no individual control over
-                         * O_NONBLOCK behaviour. Hence in that case we can't use splice() and still guarantee
-                         * systematic O_NONBLOCK behaviour, hence don't. */
-
-                        if (nonblock_pipe < 0) {
-                                int a, b;
-
-                                /* Check if either of these fds is a pipe, and if so non-blocking or not */
-                                a = fd_is_nonblock_pipe(fdf);
-                                if (a < 0)
-                                        return a;
-
-                                b = fd_is_nonblock_pipe(fdt);
-                                if (b < 0)
-                                        return b;
-
-                                if ((a == FD_IS_NO_PIPE && b == FD_IS_NO_PIPE) ||
-                                    (a == FD_IS_BLOCKING_PIPE && b == FD_IS_NONBLOCKING_PIPE) ||
-                                    (a == FD_IS_NONBLOCKING_PIPE && b == FD_IS_BLOCKING_PIPE))
-
-                                        /* splice() only works if one of the fds is a pipe. If neither is,
-                                         * let's skip this step right-away. As mentioned above, if one of the
-                                         * two fds refers to a blocking pipe and the other to a non-blocking
-                                         * pipe, we can't use splice() either, hence don't try either. This
-                                         * hence means we can only use splice() if either only one of the two
-                                         * fds is a pipe, or if both are pipes with the same nonblocking flag
-                                         * setting. */
-
-                                        try_splice = false;
-                                else
-                                        nonblock_pipe = a == FD_IS_NONBLOCKING_PIPE || b == FD_IS_NONBLOCKING_PIPE;
-                        }
-                }
-
-                if (try_splice) {
-                        n = splice(fdf, NULL, fdt, NULL, m, nonblock_pipe ? SPLICE_F_NONBLOCK : 0);
-                        if (n < 0) {
-                                if (!IN_SET(errno, EINVAL, ENOSYS))
-                                        return -errno;
-
-                                try_splice = false;
-                                /* use fallback below */
-                        } else if (n == 0) { /* likely EOF */
-
-                                if (copied_total > 0)
-                                        break;
-
-                                try_splice = false; /* same logic as above for copy_file_range() + sendfile() */
-                        } else
-                                /* Success! */
-                                goto next;
-                }
-
-                /* As a fallback just copy bits by hand */
+                /* Third, as a fallback just copy bits by hand */
                 {
                         uint8_t buf[MIN(m, COPY_BUFFER_SIZE)], *p = buf;
                         ssize_t z;
@@ -561,6 +459,46 @@ int copy_bytes_full(
         return max_bytes <= 0; /* return 0 if we hit EOF earlier than the size limit */
 }
 
+/* Check whether *ts is within [epoch; clamp] */
+static bool timespec_within(const struct timespec *ts, usec_t ts_clamp) {
+        assert(ts);
+
+        return ts->tv_sec < 0 ||              /* Date pre-1970, cannot clamp these */
+               timespec_load(ts) <= ts_clamp; /* Date in [epoch; clamp] */
+}
+
+/* See ts_clamp in copy.h. */
+static void clamp_inode_times(const struct stat *st, usec_t ts_clamp, struct timespec ret[static 2]) {
+        assert(st);
+        assert(ret);
+
+        ret[0] = timespec_within(&st->st_atim, ts_clamp) ? st->st_atim : *TIMESPEC_STORE(ts_clamp);
+        ret[1] = timespec_within(&st->st_mtim, ts_clamp) ? st->st_mtim : *TIMESPEC_STORE(ts_clamp);
+}
+
+/* Put *st's clamped times on the inode referred to by fdt */
+static int clamp_futimens(int fdt, const struct stat *st, usec_t ts_clamp) {
+        struct timespec times[2];
+
+        assert(fdt >= 0);
+        assert(st);
+
+        clamp_inode_times(st, ts_clamp, times);
+        return RET_NERRNO(futimens(fdt, times));
+}
+
+/* Same for (dt, to) */
+static int clamp_utimensat(int dt, const char *to, const struct stat *st, usec_t ts_clamp) {
+        struct timespec times[2];
+
+        assert(dt >= 0 || dt == AT_FDCWD);
+        assert(to);
+        assert(st);
+
+        clamp_inode_times(st, ts_clamp, times);
+        return RET_NERRNO(utimensat(dt, to, times, AT_SYMLINK_NOFOLLOW));
+}
+
 static int fd_copy_symlink(
                 int df,
                 const char *from,
@@ -569,7 +507,8 @@ static int fd_copy_symlink(
                 const char *to,
                 uid_t override_uid,
                 gid_t override_gid,
-                CopyFlags copy_flags) {
+                CopyFlags copy_flags,
+                usec_t ts_clamp) {
 
         _cleanup_free_ char *target = NULL;
         int r;
@@ -582,7 +521,7 @@ static int fd_copy_symlink(
                 return r;
 
         if (copy_flags & COPY_MAC_CREATE) {
-                r = mac_selinux_create_file_prepare_at(dt, to, S_IFLNK);
+                r = mac_selinux_create_file_prepare_at(dt, to, S_IFLNK, /* label_context= */ NULL);
                 if (r < 0)
                         return r;
         }
@@ -608,7 +547,8 @@ static int fd_copy_symlink(
                 r = -errno;
 
         (void) copy_xattr(df, from, dt, to, copy_flags);
-        (void) utimensat(dt, to, (struct timespec[]) { st->st_atim, st->st_mtim }, AT_SYMLINK_NOFOLLOW);
+
+        (void) clamp_utimensat(dt, to, st, ts_clamp);
         return r;
 }
 
@@ -652,7 +592,7 @@ static int hardlink_context_setup(
          * <= 0, because in that case we will not actually allocate the hardlink inode lookup table directory
          * on disk (we do so lazily, when the first candidate with .n_link > 1 is seen). This means, in the
          * common case where hardlinks are not used at all or only for few files the fact that we store the
-         * table on disk shouldn't matter perfomance-wise. */
+         * table on disk shouldn't matter performance-wise. */
 
         if (!FLAGS_SET(copy_flags, COPY_HARDLINKS))
                 return 0;
@@ -900,6 +840,7 @@ static int fd_copy_tree_generic(
                 uid_t override_uid,
                 gid_t override_gid,
                 CopyFlags copy_flags,
+                usec_t ts_clamp,
                 Hashmap *denylist,
                 Hashmap *subvolumes,
                 HardlinkContext *hardlink_context,
@@ -917,6 +858,7 @@ static int fd_copy_regular(
                 uid_t override_uid,
                 gid_t override_gid,
                 CopyFlags copy_flags,
+                usec_t ts_clamp,
                 HardlinkContext *hardlink_context,
                 copy_progress_bytes_t progress,
                 void *userdata) {
@@ -938,7 +880,7 @@ static int fd_copy_regular(
                 return fdf;
 
         if (copy_flags & COPY_MAC_CREATE) {
-                r = mac_selinux_create_file_prepare_at(dt, to, S_IFREG);
+                r = mac_selinux_create_file_prepare_at(dt, to, S_IFREG, /* label_context= */ NULL);
                 if (r < 0)
                         return r;
         }
@@ -964,7 +906,7 @@ static int fd_copy_regular(
         if (fchmod(fdt, st->st_mode & 07777) < 0)
                 r = -errno;
 
-        (void) futimens(fdt, (struct timespec[]) { st->st_atim, st->st_mtim });
+        (void) clamp_futimens(fdt, st, ts_clamp);
         (void) copy_xattr(fdf, NULL, fdt, NULL, copy_flags);
 
         if (FLAGS_SET(copy_flags, COPY_VERIFY_LINKED)) {
@@ -1012,6 +954,7 @@ static int fd_copy_fifo(
                 uid_t override_uid,
                 gid_t override_gid,
                 CopyFlags copy_flags,
+                usec_t ts_clamp,
                 HardlinkContext *hardlink_context) {
         int r;
 
@@ -1025,7 +968,7 @@ static int fd_copy_fifo(
                 return 0;
 
         if (copy_flags & COPY_MAC_CREATE) {
-                r = mac_selinux_create_file_prepare_at(dt, to, S_IFIFO);
+                r = mac_selinux_create_file_prepare_at(dt, to, S_IFIFO, /* label_context= */ NULL);
                 if (r < 0)
                         return r;
         }
@@ -1047,10 +990,10 @@ static int fd_copy_fifo(
                      AT_SYMLINK_NOFOLLOW) < 0)
                 r = -errno;
 
-        if (fchmodat(dt, to, st->st_mode & 07777, 0) < 0)
+        if (fchmodat(dt, to, st->st_mode & 07777, AT_SYMLINK_NOFOLLOW) < 0)
                 r = -errno;
 
-        (void) utimensat(dt, to, (struct timespec[]) { st->st_atim, st->st_mtim }, AT_SYMLINK_NOFOLLOW);
+        (void) clamp_utimensat(dt, to, st, ts_clamp);
 
         (void) memorize_hardlink(hardlink_context, st, dt, to);
         return r;
@@ -1065,6 +1008,7 @@ static int fd_copy_node(
                 uid_t override_uid,
                 gid_t override_gid,
                 CopyFlags copy_flags,
+                usec_t ts_clamp,
                 HardlinkContext *hardlink_context) {
         int r;
 
@@ -1078,7 +1022,7 @@ static int fd_copy_node(
                 return 0;
 
         if (copy_flags & COPY_MAC_CREATE) {
-                r = mac_selinux_create_file_prepare_at(dt, to, st->st_mode & S_IFMT);
+                r = mac_selinux_create_file_prepare_at(dt, to, st->st_mode & S_IFMT, /* label_context= */ NULL);
                 if (r < 0)
                         return r;
         }
@@ -1100,10 +1044,10 @@ static int fd_copy_node(
                      AT_SYMLINK_NOFOLLOW) < 0)
                 r = -errno;
 
-        if (fchmodat(dt, to, st->st_mode & 07777, 0) < 0)
+        if (fchmodat(dt, to, st->st_mode & 07777, AT_SYMLINK_NOFOLLOW) < 0)
                 r = -errno;
 
-        (void) utimensat(dt, to, (struct timespec[]) { st->st_atim, st->st_mtim }, AT_SYMLINK_NOFOLLOW);
+        (void) clamp_utimensat(dt, to, st, ts_clamp);
 
         (void) memorize_hardlink(hardlink_context, st, dt, to);
         return r;
@@ -1120,6 +1064,7 @@ static int fd_copy_directory(
                 uid_t override_uid,
                 gid_t override_gid,
                 CopyFlags copy_flags,
+                usec_t ts_clamp,
                 Hashmap *denylist,
                 Hashmap *subvolumes,
                 HardlinkContext *hardlink_context,
@@ -1133,6 +1078,7 @@ static int fd_copy_directory(
                 .parent_fd = -EBADF,
         };
 
+        _cleanup_free_ DirectoryEntries *des = NULL;
         _cleanup_close_ int fdf = -EBADF, fdt = -EBADF;
         _cleanup_closedir_ DIR *d = NULL;
         struct stat dt_st;
@@ -1196,13 +1142,19 @@ static int fd_copy_directory(
                 goto finish;
         }
 
-        FOREACH_DIRENT_ALL(de, d, return -errno) {
+        /* Walk children in deterministic (alphabetical) order. The natural readdir() order depends on the
+         * source filesystem's directory storage (e.g. ext4 dir hash) and varies across hosts, which leaks
+         * into the destination when it records entries in insertion order (e.g. vfat). Sorting here keeps
+         * copy_tree() reproducible regardless of the source filesystem layout. */
+        r = readdir_all(dirfd(d), RECURSE_DIR_SORT, &des);
+        if (r < 0)
+                return r;
+
+        FOREACH_ARRAY(i, des->entries, des->n_entries) {
+                struct dirent *de = *i;
                 const char *child_display_path = NULL;
                 _cleanup_free_ char *dp = NULL;
                 struct stat buf;
-
-                if (dot_or_dot_dot(de->d_name))
-                        continue;
 
                 r = look_for_signals(copy_flags);
                 if (r < 0)
@@ -1264,7 +1216,7 @@ static int fd_copy_directory(
 
                 r = fd_copy_tree_generic(dirfd(d), de->d_name, &buf, fdt, de->d_name, original_device,
                                          depth_left-1, override_uid, override_gid, copy_flags & ~COPY_LOCK_BSD,
-                                         denylist, subvolumes, hardlink_context, child_display_path, progress_path,
+                                         ts_clamp, denylist, subvolumes, hardlink_context, child_display_path, progress_path,
                                          progress_bytes, userdata);
 
                 /* Propagate SIGINT/SIGTERM, ENOSPC, and fs-verity fails up instantly */
@@ -1288,7 +1240,8 @@ finish:
                 /* Run hardlink context cleanup now because it potentially changes timestamps */
                 hardlink_context_destroy(&our_hardlink_context);
                 (void) copy_xattr(dirfd(d), NULL, fdt, NULL, copy_flags);
-                (void) futimens(fdt, (struct timespec[]) { st->st_atim, st->st_mtim });
+
+                (void) clamp_futimens(fdt, st, ts_clamp);
         } else if (FLAGS_SET(copy_flags, COPY_RESTORE_DIRECTORY_TIMESTAMPS)) {
                 /* Run hardlink context cleanup now because it potentially changes timestamps */
                 hardlink_context_destroy(&our_hardlink_context);
@@ -1316,6 +1269,7 @@ static int fd_copy_leaf(
                 uid_t override_uid,
                 gid_t override_gid,
                 CopyFlags copy_flags,
+                usec_t ts_clamp,
                 HardlinkContext *hardlink_context,
                 const char *display_path,
                 copy_progress_bytes_t progress_bytes,
@@ -1323,13 +1277,13 @@ static int fd_copy_leaf(
         int r;
 
         if (S_ISREG(st->st_mode))
-                r = fd_copy_regular(df, from, st, dt, to, override_uid, override_gid, copy_flags, hardlink_context, progress_bytes, userdata);
+                r = fd_copy_regular(df, from, st, dt, to, override_uid, override_gid, copy_flags, ts_clamp, hardlink_context, progress_bytes, userdata);
         else if (S_ISLNK(st->st_mode))
-                r = fd_copy_symlink(df, from, st, dt, to, override_uid, override_gid, copy_flags);
+                r = fd_copy_symlink(df, from, st, dt, to, override_uid, override_gid, copy_flags, ts_clamp);
         else if (S_ISFIFO(st->st_mode))
-                r = fd_copy_fifo(df, from, st, dt, to, override_uid, override_gid, copy_flags, hardlink_context);
+                r = fd_copy_fifo(df, from, st, dt, to, override_uid, override_gid, copy_flags, ts_clamp, hardlink_context);
         else if (S_ISBLK(st->st_mode) || S_ISCHR(st->st_mode) || S_ISSOCK(st->st_mode))
-                r = fd_copy_node(df, from, st, dt, to, override_uid, override_gid, copy_flags, hardlink_context);
+                r = fd_copy_node(df, from, st, dt, to, override_uid, override_gid, copy_flags, ts_clamp, hardlink_context);
         else
                 r = -EOPNOTSUPP;
 
@@ -1347,6 +1301,7 @@ static int fd_copy_tree_generic(
                 uid_t override_uid,
                 gid_t override_gid,
                 CopyFlags copy_flags,
+                usec_t ts_clamp,
                 Hashmap *denylist,
                 Hashmap *subvolumes,
                 HardlinkContext *hardlink_context,
@@ -1361,7 +1316,7 @@ static int fd_copy_tree_generic(
 
         if (S_ISDIR(st->st_mode))
                 return fd_copy_directory(df, from, st, dt, to, original_device, depth_left-1, override_uid,
-                                         override_gid, copy_flags, denylist, subvolumes, hardlink_context,
+                                         override_gid, copy_flags, ts_clamp, denylist, subvolumes, hardlink_context,
                                          display_path, progress_path, progress_bytes, userdata);
 
         /* Only if we are copying a directory we are fine if the target dir is referenced by fd only */
@@ -1375,14 +1330,14 @@ static int fd_copy_tree_generic(
         } else if (t == DENY_CONTENTS)
                 log_debug("%s is configured to have its contents excluded, but is not a directory", from ?: "file to copy");
 
-        r = fd_copy_leaf(df, from, st, dt, to, override_uid, override_gid, copy_flags, hardlink_context, display_path, progress_bytes, userdata);
+        r = fd_copy_leaf(df, from, st, dt, to, override_uid, override_gid, copy_flags, ts_clamp, hardlink_context, display_path, progress_bytes, userdata);
         /* We just tried to copy a leaf node of the tree. If it failed because the node already exists *and* the COPY_REPLACE flag has been provided, we should unlink the node and re-copy. */
         if (r == -EEXIST && (copy_flags & COPY_REPLACE)) {
                 /* This codepath is us trying to address an error to copy, if the unlink fails, lets just return the original error. */
                 if (unlinkat(dt, to, 0) < 0)
                         return r;
 
-                r = fd_copy_leaf(df, from, st, dt, to, override_uid, override_gid, copy_flags, hardlink_context, display_path, progress_bytes, userdata);
+                r = fd_copy_leaf(df, from, st, dt, to, override_uid, override_gid, copy_flags, ts_clamp, hardlink_context, display_path, progress_bytes, userdata);
         }
 
         return r;
@@ -1396,6 +1351,7 @@ int copy_tree_at_full(
                 uid_t override_uid,
                 gid_t override_gid,
                 CopyFlags copy_flags,
+                usec_t ts_clamp,
                 Hashmap *denylist,
                 Hashmap *subvolumes,
                 copy_progress_path_t progress_path,
@@ -1411,7 +1367,7 @@ int copy_tree_at_full(
                 return -errno;
 
         r = fd_copy_tree_generic(fdf, from, &st, fdt, to, st.st_dev, COPY_DEPTH_MAX, override_uid,
-                                 override_gid, copy_flags, denylist, subvolumes, NULL, NULL, progress_path,
+                                 override_gid, copy_flags, ts_clamp, denylist, subvolumes, NULL, NULL, progress_path,
                                  progress_bytes, userdata);
         if (r < 0)
                 return r;
@@ -1483,10 +1439,11 @@ int copy_directory_at_full(
                         override_uid,
                         override_gid,
                         copy_flags,
+                        /* ts_clamp= */ USEC_INFINITY,
                         /* denylist= */ NULL,
                         /* subvolumes= */ NULL,
-                        /* progress_path= */ NULL,
-                        /* progress_bytes= */ NULL,
+                        /* hardlink_context= */ NULL,
+                        /* display_path= */ NULL,
                         progress_path,
                         progress_bytes,
                         userdata);
@@ -1672,7 +1629,7 @@ int copy_file_atomic_at_full(
         assert(!FLAGS_SET(copy_flags, COPY_LOCK_BSD));
 
         if (copy_flags & COPY_MAC_CREATE) {
-                r = mac_selinux_create_file_prepare_at(dir_fdt, to, S_IFREG);
+                r = mac_selinux_create_file_prepare_at(dir_fdt, to, S_IFREG, /* label_context= */ NULL);
                 if (r < 0)
                         return r;
         }
@@ -1726,12 +1683,17 @@ int copy_file_atomic_at_full(
         return 0;
 
 fail:
-        (void) unlinkat(dir_fdt, to, 0);
+        /* link_tmpfile_at() succeeded, so 'to' is now published. In replacement mode, do not
+         * remove it again, as that may delete a pre-existing target replaced by this copy. */
+        if (!FLAGS_SET(copy_flags, COPY_REPLACE))
+                (void) unlinkat(dir_fdt, to, 0);
+
         return r;
 }
 
-int copy_times(int fdf, int fdt, CopyFlags flags) {
+int copy_times_full(int fdf, int fdt, CopyFlags flags, usec_t ts_clamp) {
         struct stat st;
+        int r;
 
         assert(fdf >= 0);
         assert(fdt >= 0);
@@ -1739,14 +1701,15 @@ int copy_times(int fdf, int fdt, CopyFlags flags) {
         if (fstat(fdf, &st) < 0)
                 return -errno;
 
-        if (futimens(fdt, (struct timespec[2]) { st.st_atim, st.st_mtim }) < 0)
-                return -errno;
+        r = clamp_futimens(fdt, &st, ts_clamp);
+        if (r < 0)
+                return r;
 
         if (FLAGS_SET(flags, COPY_CRTIME)) {
                 usec_t crtime;
 
                 if (fd_getcrtime(fdf, &crtime) >= 0)
-                        (void) fd_setcrtime(fdt, crtime);
+                        (void) fd_setcrtime(fdt, MIN(crtime, ts_clamp));
         }
 
         return 0;
@@ -1839,22 +1802,19 @@ int reflink(int infd, int outfd) {
 
 assert_cc(sizeof(struct file_clone_range) == sizeof(struct btrfs_ioctl_clone_range_args));
 
-int reflink_range(int infd, uint64_t in_offset, int outfd, uint64_t out_offset, uint64_t sz) {
-        struct file_clone_range args = {
-                .src_fd = infd,
-                .src_offset = in_offset,
-                .src_length = sz,
-                .dest_offset = out_offset,
-        };
+int reflink_range(int infd, uint64_t in_offset, int outfd, uint64_t out_offset, uint64_t size) {
         int r;
 
         assert(infd >= 0);
         assert(outfd >= 0);
 
+        /* size==UINT64_MAX mean "clone everything". Translate to 0 for the kernel. */
+        if (size == UINT64_MAX)
+                size = 0;
+
         /* Inside the kernel, FICLONE is identical to FICLONERANGE with offsets and size set to zero, let's
-         * simplify things and use the simple ioctl in that case. Also, do the same if the size is
-         * UINT64_MAX, which is how we usually encode "everything". */
-        if (in_offset == 0 && out_offset == 0 && IN_SET(sz, 0, UINT64_MAX))
+         * simplify things and use the simple ioctl in that case. */
+        if (in_offset == 0 && out_offset == 0 && size == 0)
                 return reflink(infd, outfd);
 
         r = fd_verify_regular(outfd);
@@ -1863,5 +1823,11 @@ int reflink_range(int infd, uint64_t in_offset, int outfd, uint64_t out_offset, 
 
         assert_cc(FICLONERANGE == BTRFS_IOC_CLONE_RANGE);
 
+        struct file_clone_range args = {
+                .src_fd = infd,
+                .src_offset = in_offset,
+                .src_length = size,
+                .dest_offset = out_offset,
+        };
         return RET_NERRNO(ioctl(outfd, FICLONERANGE, &args));
 }

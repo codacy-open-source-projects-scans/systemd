@@ -3,7 +3,6 @@
 #include <endian.h>
 #include <fcntl.h>
 #include <pwd.h>
-#include <security/pam_misc.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -88,7 +87,7 @@ static int parse_caps(
 
                 c = capability_from_name(s);
                 if (c < 0) {
-                        pam_syslog(pamh, LOG_WARNING, "Unknown capability, ignoring: %s", s);
+                        sym_pam_syslog(pamh, LOG_WARNING, "Unknown capability, ignoring: %s", s);
                         continue;
                 }
 
@@ -118,6 +117,8 @@ static int parse_argv(
                 const char **type,
                 const char **desktop,
                 const char **area,
+                const char **inhibit_what,
+                const char **inhibit_why,
                 bool *debug,
                 uint64_t *default_capability_bounding_set,
                 uint64_t *default_capability_ambient_set) {
@@ -146,9 +147,15 @@ static int parse_argv(
                 } else if ((p = startswith(argv[i], "area="))) {
 
                         if (!isempty(p) && !filename_is_valid(p))
-                                pam_syslog(pamh, LOG_WARNING, "Area name specified among PAM module parameters is not valid, ignoring: %s", p);
+                                sym_pam_syslog(pamh, LOG_WARNING, "Area name specified among PAM module parameters is not valid, ignoring: %s", p);
                         else if (area)
                                 *area = p;
+                } else if ((p = startswith(argv[i], "inhibit="))) {
+                        if (inhibit_what)
+                                *inhibit_what = p;
+                } else if ((p = startswith(argv[i], "inhibit-why="))) {
+                        if (inhibit_why)
+                                *inhibit_why = p;
 
                 } else if (streq(argv[i], "debug")) {
                         if (debug)
@@ -157,22 +164,22 @@ static int parse_argv(
                 } else if ((p = startswith(argv[i], "debug="))) {
                         r = parse_boolean(p);
                         if (r < 0)
-                                pam_syslog(pamh, LOG_WARNING, "Failed to parse debug= argument, ignoring: %s", p);
+                                sym_pam_syslog(pamh, LOG_WARNING, "Failed to parse debug= argument, ignoring: %s", p);
                         else if (debug)
                                 *debug = r;
 
                 } else if ((p = startswith(argv[i], "default-capability-bounding-set="))) {
                         r = parse_caps(pamh, p, default_capability_bounding_set);
                         if (r < 0)
-                                pam_syslog(pamh, LOG_WARNING, "Failed to parse default-capability-bounding-set= argument, ignoring: %s", p);
+                                sym_pam_syslog(pamh, LOG_WARNING, "Failed to parse default-capability-bounding-set= argument, ignoring: %s", p);
 
                 } else if ((p = startswith(argv[i], "default-capability-ambient-set="))) {
                         r = parse_caps(pamh, p, default_capability_ambient_set);
                         if (r < 0)
-                                pam_syslog(pamh, LOG_WARNING, "Failed to parse default-capability-ambient-set= argument, ignoring: %s", p);
+                                sym_pam_syslog(pamh, LOG_WARNING, "Failed to parse default-capability-ambient-set= argument, ignoring: %s", p);
 
                 } else
-                        pam_syslog(pamh, LOG_WARNING, "Unknown parameter '%s', ignoring.", argv[i]);
+                        sym_pam_syslog(pamh, LOG_WARNING, "Unknown parameter '%s', ignoring.", argv[i]);
         }
 
         return 0;
@@ -184,7 +191,7 @@ static int acquire_user_record(pam_handle_t *pamh, UserRecord **ret_record) {
         assert(pamh);
 
         const char *username = NULL;
-        r = pam_get_user(pamh, &username, NULL);
+        r = sym_pam_get_user(pamh, &username, NULL);
         if (r != PAM_SUCCESS)
                 return pam_syslog_pam_error(pamh, LOG_ERR, r, "Failed to get user name: @PAMERR@");
         if (isempty(username))
@@ -198,7 +205,7 @@ static int acquire_user_record(pam_handle_t *pamh, UserRecord **ret_record) {
 
         _cleanup_(user_record_unrefp) UserRecord *ur = NULL;
         const char *json = NULL;
-        r = pam_get_data(pamh, field, (const void**) &json);
+        r = sym_pam_get_data(pamh, field, (const void**) &json);
         if (!IN_SET(r, PAM_SUCCESS, PAM_NO_MODULE_DATA))
                 return pam_syslog_pam_error(pamh, LOG_ERR, r, "Failed to get PAM user record data: @PAMERR@");
         if (r == PAM_SUCCESS && json) {
@@ -240,7 +247,7 @@ static int acquire_user_record(pam_handle_t *pamh, UserRecord **ret_record) {
                         return pam_syslog_errno(pamh, LOG_ERR, r, "Failed to format user JSON: %m");
 
                 /* And cache it for everyone else */
-                r = pam_set_data(pamh, field, formatted, pam_cleanup_free);
+                r = sym_pam_set_data(pamh, field, formatted, pam_cleanup_free);
                 if (r != PAM_SUCCESS)
                         return pam_syslog_pam_error(pamh, LOG_ERR, r,
                                                     "Failed to set PAM user record data '%s': @PAMERR@", field);
@@ -382,7 +389,7 @@ static int append_session_memory_max(pam_handle_t *pamh, sd_bus_message *m, cons
         uint64_t val;
         r = parse_size(limit, 1024, &val);
         if (r < 0) {
-                pam_syslog(pamh, LOG_WARNING, "Failed to parse systemd.memory_max, ignoring: %s", limit);
+                sym_pam_syslog(pamh, LOG_WARNING, "Failed to parse systemd.memory_max, ignoring: %s", limit);
                 return 0;
         }
 
@@ -402,7 +409,7 @@ static int append_session_runtime_max_sec(pam_handle_t *pamh, sd_bus_message *m,
         usec_t val;
         r = parse_sec(limit, &val);
         if (r < 0) {
-                pam_syslog(pamh, LOG_WARNING, "Failed to parse systemd.runtime_max_sec: %s, ignoring.", limit);
+                sym_pam_syslog(pamh, LOG_WARNING, "Failed to parse systemd.runtime_max_sec: %s, ignoring.", limit);
                 return 0;
         }
 
@@ -422,7 +429,7 @@ static int append_session_tasks_max(pam_handle_t *pamh, sd_bus_message *m, const
         uint64_t val;
         r = safe_atou64(limit, &val);
         if (r < 0) {
-                pam_syslog(pamh, LOG_WARNING, "Failed to parse systemd.tasks_max, ignoring: %s", limit);
+                sym_pam_syslog(pamh, LOG_WARNING, "Failed to parse systemd.tasks_max, ignoring: %s", limit);
                 return 0;
         }
 
@@ -441,7 +448,7 @@ static int append_session_cpu_weight(pam_handle_t *pamh, sd_bus_message *m, cons
         uint64_t val;
         r = cg_cpu_weight_parse(limit, &val);
         if (r < 0) {
-                pam_syslog(pamh, LOG_WARNING, "Failed to parse systemd.cpu_weight, ignoring: %s", limit);
+                sym_pam_syslog(pamh, LOG_WARNING, "Failed to parse systemd.cpu_weight, ignoring: %s", limit);
                 return 0;
         }
 
@@ -460,14 +467,14 @@ static int append_session_io_weight(pam_handle_t *pamh, sd_bus_message *m, const
         uint64_t val;
         r = cg_weight_parse(limit, &val);
         if (r < 0) {
-                pam_syslog(pamh, LOG_WARNING, "Failed to parse systemd.io_weight, ignoring: %s", limit);
+                sym_pam_syslog(pamh, LOG_WARNING, "Failed to parse systemd.io_weight, ignoring: %s", limit);
                 return 0;
         }
 
         return sd_bus_message_append(m, "(sv)", "IOWeight", "t", val);
 }
 
-static const char* getenv_harder(pam_handle_t *pamh, const char *key, const char *fallback) {
+static const char* getenv_harder(pam_handle_t *pamh, bool debug, const char *key, const char *fallback) {
         const char *v;
 
         assert(pamh);
@@ -479,63 +486,71 @@ static const char* getenv_harder(pam_handle_t *pamh, const char *key, const char
          * PAM services don't have to be reworked to set systemd-specific properties, but these properties
          * can still be set from the unit file Environment= block. */
 
-        v = pam_getenv(pamh, key);
-        if (!isempty(v))
+        v = sym_pam_getenv(pamh, key);
+        if (!isempty(v)) {
+                pam_debug_syslog(pamh, debug, "Found PAM environment variable %s='%s'", key, v);
                 return v;
+        }
 
         /* We use secure_getenv() here, since we might get loaded into su/sudo, which are SUID. Ideally
          * they'd clean up the environment before invoking foreign code (such as PAM modules), but alas they
          * currently don't (to be precise, they clean up the environment they pass to their children, but
          * not their own environ[]). */
         v = secure_getenv(key);
-        if (!isempty(v))
+        if (!isempty(v)) {
+                pam_debug_syslog(pamh, debug, "Found normal environment variable %s='%s'", key, v);
                 return v;
+        }
 
+        if (fallback)
+                pam_debug_syslog(pamh, debug, "Using fallback %s='%s'", key, fallback);
         return fallback;
 }
 
-static bool getenv_harder_bool(pam_handle_t *pamh, const char *key, bool fallback) {
+static bool getenv_harder_bool(pam_handle_t *pamh, bool debug, const char *key, bool fallback) {
         const char *v;
         int r;
 
         assert(pamh);
         assert(key);
 
-        v = getenv_harder(pamh, key, NULL);
-        if (isempty(v))
-                return fallback;
-
-        r = parse_boolean(v);
-        if (r < 0) {
-                pam_syslog(pamh, LOG_WARNING,
-                           "Failed to parse environment variable value '%s' of '%s', falling back to using '%s'.",
-                           v, key, true_false(fallback));
+        v = getenv_harder(pamh, debug, key, NULL);
+        if (!v) {
+                pam_debug_syslog(pamh, debug, "Using fallback %s=%s", key, true_false(fallback));
                 return fallback;
         }
 
-        return r;
+        r = parse_boolean(v);
+        if (r >= 0)
+                return r;
+
+        sym_pam_syslog(pamh, LOG_WARNING,
+                       "Failed to parse environment variable value '%s', using fallback %s=%s",
+                       v, key, true_false(fallback));
+        return fallback;
 }
 
-static uint32_t getenv_harder_uint32(pam_handle_t *pamh, const char *key, uint32_t fallback) {
+static uint32_t getenv_harder_uint32(pam_handle_t *pamh, bool debug, const char *key, uint32_t fallback) {
         int r;
 
         assert(pamh);
         assert(key);
 
-        const char *v = getenv_harder(pamh, key, NULL);
-        if (isempty(v))
-                return fallback;
-
-        uint32_t u;
-        r = safe_atou32(v, &u);
-        if (r < 0) {
-                pam_syslog(pamh, LOG_WARNING,
-                           "Failed to parse environment variable value '%s' of '%s' as unsigned integer, falling back to using %" PRIu32 ".",
-                           v, key, fallback);
+        const char *v = getenv_harder(pamh, debug, key, NULL);
+        if (!v) {
+                pam_debug_syslog(pamh, debug, "Using fallback %s=%"PRIu32, key, fallback);
                 return fallback;
         }
 
-        return u;
+        uint32_t u;
+        r = safe_atou32(v, &u);
+        if (r >= 0)
+                return u;
+
+        pam_syslog_errno(pamh, LOG_WARNING, r,
+                         "Failed to parse environment variable value '%s' as unsigned integer, using fallback %s=%"PRIu32 ": %m",
+                         v, key, fallback);
+        return fallback;
 }
 
 static int update_environment(pam_handle_t *pamh, const char *key, const char *value) {
@@ -548,14 +563,14 @@ static int update_environment(pam_handle_t *pamh, const char *key, const char *v
          * about errors. */
 
         if (isempty(value)) {
-                /* Unset the variable if set. Note that pam_putenv() would log nastily behind our back if we
+                /* Unset the variable if set. Note that sym_pam_putenv() would log nastily behind our back if we
                  * call it without the variable actually being set. Hence we check explicitly if it's set
                  * before. */
 
-                if (!pam_getenv(pamh, key))
+                if (!sym_pam_getenv(pamh, key))
                         return PAM_SUCCESS;
 
-                r = pam_putenv(pamh, key);
+                r = sym_pam_putenv(pamh, key);
                 if (!IN_SET(r, PAM_SUCCESS, PAM_BAD_ITEM))
                         return pam_syslog_pam_error(pamh, LOG_WARNING, r,
                                                     "Failed to unset %s environment variable: @PAMERR@", key);
@@ -563,7 +578,7 @@ static int update_environment(pam_handle_t *pamh, const char *key, const char *v
                 return PAM_SUCCESS;
         }
 
-        r = pam_misc_setenv(pamh, key, value, /* readonly= */ false);
+        r = pam_putenv_assign(pamh, key, value);
         if (r != PAM_SUCCESS)
                 return pam_syslog_pam_error(pamh, LOG_ERR, r,
                                             "Failed to set environment variable %s: @PAMERR@", key);
@@ -588,7 +603,7 @@ static int propagate_credential_to_environment(pam_handle_t *pamh, bool debug, c
                 return PAM_SUCCESS;
         }
 
-        r = pam_misc_setenv(pamh, varname, value, 0);
+        r = pam_putenv_assign(pamh, varname, value);
         if (r != PAM_SUCCESS)
                 return pam_syslog_pam_error(pamh, LOG_ERR, r,
                                             "Failed to set environment variable %s: @PAMERR@", varname);
@@ -610,7 +625,7 @@ static bool validate_runtime_directory(pam_handle_t *pamh, const char *path, uid
          * otherwise we might end up setting $XDG_RUNTIME_DIR to some directory owned by the wrong user. */
 
         if (!path_is_absolute(path)) {
-                pam_syslog(pamh, LOG_ERR, "Provided runtime directory '%s' is not absolute.", path);
+                sym_pam_syslog(pamh, LOG_ERR, "Provided runtime directory '%s' is not absolute.", path);
                 goto fail;
         }
 
@@ -620,19 +635,19 @@ static bool validate_runtime_directory(pam_handle_t *pamh, const char *path, uid
         }
 
         if (!S_ISDIR(st.st_mode)) {
-                pam_syslog(pamh, LOG_ERR, "Runtime directory '%s' is not actually a directory.", path);
+                sym_pam_syslog(pamh, LOG_ERR, "Runtime directory '%s' is not actually a directory.", path);
                 goto fail;
         }
 
         if (st.st_uid != uid) {
-                pam_syslog(pamh, LOG_ERR, "Runtime directory '%s' is not owned by UID " UID_FMT ", as it should.", path, uid);
+                sym_pam_syslog(pamh, LOG_ERR, "Runtime directory '%s' is not owned by UID " UID_FMT ", as it should.", path, uid);
                 goto fail;
         }
 
         return true;
 
 fail:
-        pam_syslog(pamh, LOG_WARNING, "Not setting $XDG_RUNTIME_DIR, as the directory is not in order.");
+        sym_pam_syslog(pamh, LOG_WARNING, "Not setting $XDG_RUNTIME_DIR, as the directory is not in order.");
         return false;
 }
 
@@ -642,7 +657,7 @@ static int pam_putenv_and_log(pam_handle_t *pamh, const char *e, bool debug) {
         assert(pamh);
         assert(e);
 
-        r = pam_putenv(pamh, e);
+        r = sym_pam_putenv(pamh, e);
         if (r != PAM_SUCCESS)
                 return pam_syslog_pam_error(pamh, LOG_ERR, r,
                                             "Failed to set PAM environment variable %s: @PAMERR@", e);
@@ -970,7 +985,7 @@ static void session_context_mangle(
                 /* Chop off leading /dev prefix that some clients specify, but others do not. */
                 c->tty = skip_dev_prefix(c->tty);
 
-        if (!isempty(c->display) && !c->vtnr) {
+        if (!isempty(c->display) && c->vtnr == 0) {
                 if (isempty(c->seat))
                         (void) get_seat_from_display(c->display, &c->seat, &c->vtnr);
                 else if (streq(c->seat, "seat0"))
@@ -992,7 +1007,7 @@ static void session_context_mangle(
                 c->area = ur->default_area;
 
         if (!isempty(c->area) && !filename_is_valid(c->area)) {
-                pam_syslog(pamh, LOG_WARNING, "Specified area '%s' is not a valid filename, ignoring area request.", c->area);
+                sym_pam_syslog(pamh, LOG_WARNING, "Specified area '%s' is not a valid filename, ignoring area request.", c->area);
                 c->area = NULL;
         }
 
@@ -1048,7 +1063,7 @@ static void session_context_mangle(
                 if (streq(c->class, "user"))
                         c->class = "user-incomplete";
                 else
-                        pam_syslog(pamh, LOG_WARNING, "PAM session of class '%s' is incomplete, which is not supported, ignoring.", c->class);
+                        sym_pam_syslog(pamh, LOG_WARNING, "PAM session of class '%s' is incomplete, which is not supported, ignoring.", c->class);
         }
 
         c->remote = !isempty(c->remote_host) && !is_localhost(c->remote_host);
@@ -1148,7 +1163,7 @@ static int register_session(
                                         JSON_BUILD_PAIR_ENUM("Class", c->class),
                                         JSON_BUILD_PAIR_STRING_NON_EMPTY("Desktop", c->desktop),
                                         JSON_BUILD_PAIR_STRING_NON_EMPTY("Seat", c->seat),
-                                        SD_JSON_BUILD_PAIR_CONDITION(c->vtnr > 0, "VTNr", SD_JSON_BUILD_UNSIGNED(c->vtnr)),
+                                        JSON_BUILD_PAIR_UNSIGNED_NON_ZERO("VTNr", c->vtnr),
                                         JSON_BUILD_PAIR_STRING_NON_EMPTY("TTY", c->tty),
                                         JSON_BUILD_PAIR_STRING_NON_EMPTY("Display", c->display),
                                         SD_JSON_BUILD_PAIR_BOOLEAN("Remote", c->remote),
@@ -1253,8 +1268,7 @@ static int register_session(
                                 return PAM_SUCCESS;
                         }
 
-                        pam_syslog(pamh, LOG_ERR,
-                                   "Failed to create session: %s", bus_error_message(&error, r));
+                        sym_pam_syslog(pamh, LOG_ERR, "Failed to create session: %s", bus_error_message(&error, r));
                         return PAM_SESSION_ERR;
                 }
 
@@ -1282,7 +1296,7 @@ static int register_session(
                         if (fd < 0)
                                 return pam_syslog_errno(pamh, LOG_ERR, errno, "Failed to dup session fd: %m");
 
-                        r = pam_set_data(pamh, "systemd.session-fd", FD_TO_PTR(fd), NULL);
+                        r = sym_pam_set_data(pamh, "systemd.session-fd", FD_TO_PTR(fd), NULL);
                         if (r != PAM_SUCCESS)
                                 return pam_syslog_pam_error(pamh, LOG_ERR, r, "Failed to install session fd: @PAMERR@");
                         TAKE_FD(fd);
@@ -1580,7 +1594,7 @@ static int setup_environment(
                         pam_syslog_errno(pamh, LOG_WARNING, r, "Path '%s' of requested user area '%s' is not accessible, reverting to regular home directory: %m", j, area);
 
                         /* Also tell the user directly at login, but a bit more vague */
-                        pam_info(pamh, "Path '%s' of requested user area '%s' is not accessible, reverting to regular home directory.", j, area);
+                        sym_pam_info(pamh, "Path '%s' of requested user area '%s' is not accessible, reverting to regular home directory.", j, area);
                         area = NULL;
                 } else {
                         /* Validate that the target is definitely owned by user */
@@ -1589,10 +1603,10 @@ static int setup_environment(
                                 return pam_syslog_errno(pamh, LOG_ERR, errno, "Unable to fstat() target area directory '%s': %m", ha);
 
                         if (st.st_uid != ur->uid) {
-                                pam_syslog(pamh, LOG_ERR, "Path '%s' of requested user area '%s' is not owned by user, reverting to regular home directory.", ha, area);
+                                sym_pam_syslog(pamh, LOG_ERR, "Path '%s' of requested user area '%s' is not owned by user, reverting to regular home directory.", ha, area);
 
                                 /* Also tell the user directly at login. */
-                                pam_info(pamh, "Path '%s' of requested user area '%s' is not owned by user, reverting to regular home directory.", ha, area);
+                                sym_pam_info(pamh, "Path '%s' of requested user area '%s' is not owned by user, reverting to regular home directory.", ha, area);
                                 area = NULL;
                         } else {
                                 /* All good, now make a copy of the area string, since we quite likely are
@@ -1631,13 +1645,13 @@ static int open_osc_context(pam_handle_t *pamh, const char *session_type, UserRe
         if (!streq_ptr(session_type, "tty"))
                 return PAM_SUCCESS;
 
-        const char *e = pam_getenv(pamh, "TERM");
+        const char *e = sym_pam_getenv(pamh, "TERM");
         if (!e)
                 e = getenv("TERM");
         if (streq_ptr(e, "dumb"))
                 return PAM_SUCCESS;
 
-        /* NB: we output directly to stdout, instead of going via pam_info() or so, because that's too
+        /* NB: we output directly to stdout, instead of going via sym_pam_info() or so, because that's too
          * high-level for us, as it suffixes the output with a newline, expecting a full blown text message
          * as prompt string, not just an ANSI sequence. Note that PAM's conv_misc() actually goes to stdout
          * anyway, hence let's do so here too, but only after careful validation. */
@@ -1657,7 +1671,7 @@ static int open_osc_context(pam_handle_t *pamh, const char *session_type, UserRe
         sd_id128_t osc_id;
         r = osc_context_open_session(
                         ur->user_name,
-                        pam_getenv(pamh, "XDG_SESSION_ID"),
+                        sym_pam_getenv(pamh, "XDG_SESSION_ID"),
                         &osc,
                         &osc_id);
         if (r < 0)
@@ -1672,7 +1686,7 @@ static int open_osc_context(pam_handle_t *pamh, const char *session_type, UserRe
         if (!osc_id_copy)
                 return pam_log_oom(pamh);
 
-        r = pam_set_data(pamh, "systemd.osc-context-id", osc_id_copy, pam_cleanup_free);
+        r = sym_pam_set_data(pamh, "systemd.osc-context-id", osc_id_copy, pam_cleanup_free);
         if (r != PAM_SUCCESS)
                 return pam_syslog_pam_error(pamh, LOG_ERR, r,
                                             "Failed to set PAM OSC sequence ID data: @PAMERR@");
@@ -1680,7 +1694,7 @@ static int open_osc_context(pam_handle_t *pamh, const char *session_type, UserRe
         TAKE_PTR(osc_id_copy);
 
         if (tty_opath_fd >= 0) {
-                r = pam_set_data(pamh, "systemd.osc-context-fd", FD_TO_PTR(tty_opath_fd), pam_cleanup_close);
+                r = sym_pam_set_data(pamh, "systemd.osc-context-fd", FD_TO_PTR(tty_opath_fd), pam_cleanup_close);
                 if (r != PAM_SUCCESS)
                         return pam_syslog_pam_error(pamh, LOG_ERR, r,
                                                     "Failed to set PAM OSC sequence fd data: @PAMERR@");
@@ -1698,7 +1712,7 @@ static int close_osc_context(pam_handle_t *pamh, bool debug) {
 
         const void *p;
         int tty_opath_fd = -EBADF;
-        r = pam_get_data(pamh, "systemd.osc-context-fd", &p);
+        r = sym_pam_get_data(pamh, "systemd.osc-context-fd", &p);
         if (r == PAM_SUCCESS)
                 tty_opath_fd = PTR_TO_FD(p);
         else if (r != PAM_NO_MODULE_DATA)
@@ -1707,7 +1721,7 @@ static int close_osc_context(pam_handle_t *pamh, bool debug) {
                 return PAM_SUCCESS;
 
         const sd_id128_t *osc_id = NULL;
-        r = pam_get_data(pamh, "systemd.osc-context-id", (const void**) &osc_id);
+        r = sym_pam_get_data(pamh, "systemd.osc-context-id", (const void**) &osc_id);
         if (!IN_SET(r, PAM_SUCCESS, PAM_NO_MODULE_DATA))
                 return pam_syslog_pam_error(pamh, LOG_ERR, r, "Failed to get PAM OSC context id data: @PAMERR@");
         if (!osc_id)
@@ -1721,7 +1735,7 @@ static int close_osc_context(pam_handle_t *pamh, bool debug) {
         }
 
         /* /bin/login calls us with fds 0, 1, 2 closed, which is just weird. Let's step outside of that
-         * range, just in case pam_syslog() or so logs to stderr */
+         * range, just in case sym_pam_syslog() or so logs to stderr */
         fd = fd_move_above_stdio(fd);
 
         /* Safety check, let's verify this is a valid TTY we just opened */
@@ -1741,6 +1755,57 @@ static int close_osc_context(pam_handle_t *pamh, bool debug) {
         return PAM_SUCCESS;
 }
 
+static int acquire_inhibit_lock(
+                pam_handle_t *pamh,
+                const char *inhibit_what,
+                const char *inhibit_why,
+                bool debug) {
+
+        _cleanup_(pam_bus_data_disconnectp) PamBusData *d = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        const char *service = NULL;
+        int r;
+
+        assert(pamh);
+        assert(inhibit_what);
+
+        r = pam_acquire_bus_connection(pamh, "pam-systemd", debug, &bus, &d);
+        if (r != PAM_SUCCESS)
+                return r;
+
+        (void) sym_pam_get_item(pamh, PAM_SERVICE, (const void **) &service);
+
+        r = bus_call_method(bus, bus_login_mgr, "Inhibit", &error, &reply, "ssss",
+                            inhibit_what,
+                            service ?: "pam_systemd",
+                            inhibit_why ?: "Active PAM session",
+                            "block");
+        if (r < 0) {
+                sym_pam_syslog(pamh, LOG_WARNING, "Failed to acquire inhibit lock: %s", bus_error_message(&error, r));
+                return PAM_SESSION_ERR;
+        }
+
+        int raw_fd;
+        r = sd_bus_message_read_basic(reply, SD_BUS_TYPE_UNIX_FD, &raw_fd);
+        if (r < 0)
+                return pam_bus_log_parse_error(pamh, r);
+
+        _cleanup_close_ int fd = fcntl(raw_fd, F_DUPFD_CLOEXEC, 3);
+        if (fd < 0)
+                return pam_syslog_errno(pamh, LOG_ERR, errno, "Failed to dup inhibit lock fd: %m");
+
+        r = sym_pam_set_data(pamh, "systemd.inhibit-fd", FD_TO_PTR(fd), pam_cleanup_close);
+        if (r != PAM_SUCCESS)
+                return pam_syslog_pam_error(pamh, LOG_ERR, r,
+                                            "Failed to store inhibit lock fd: @PAMERR@");
+        TAKE_FD(fd);
+
+        pam_debug_syslog(pamh, debug, "Acquired inhibit lock for '%s'.", inhibit_what);
+        return PAM_SUCCESS;
+}
+
 _public_ PAM_EXTERN int pam_sm_open_session(
                 pam_handle_t *pamh,
                 int flags,
@@ -1750,6 +1815,7 @@ _public_ PAM_EXTERN int pam_sm_open_session(
 
         assert(pamh);
 
+        LIBPAM_NOTE(required);
         r = dlopen_libpam(LOG_DEBUG);
         if (r < 0)
                 return PAM_SERVICE_ERR;
@@ -1757,7 +1823,7 @@ _public_ PAM_EXTERN int pam_sm_open_session(
         pam_log_setup();
 
         uint64_t default_capability_bounding_set = CAP_MASK_UNSET, default_capability_ambient_set = CAP_MASK_UNSET;
-        const char *class_pam = NULL, *type_pam = NULL, *desktop_pam = NULL, *area_pam = NULL;
+        const char *class_pam = NULL, *type_pam = NULL, *desktop_pam = NULL, *area_pam = NULL, *inhibit_what = NULL, *inhibit_why = NULL;
         bool debug = false;
         if (parse_argv(pamh,
                        argc, argv,
@@ -1765,12 +1831,20 @@ _public_ PAM_EXTERN int pam_sm_open_session(
                        &type_pam,
                        &desktop_pam,
                        &area_pam,
+                       &inhibit_what,
+                       &inhibit_why,
                        &debug,
                        &default_capability_bounding_set,
                        &default_capability_ambient_set) < 0)
                 return PAM_SESSION_ERR;
 
-        pam_debug_syslog(pamh, debug, "pam-systemd: initializing...");
+        pam_debug_syslog(pamh, debug,
+                         "pam-systemd: initializing (class=%s type=%s desktop=%s area=%s inhibit=%s)...",
+                         strempty(class_pam),
+                         strempty(type_pam),
+                         strempty(desktop_pam),
+                         strempty(area_pam),
+                         strempty(inhibit_what));
 
         _cleanup_(user_record_unrefp) UserRecord *ur = NULL;
         r = acquire_user_record(pamh, &ur);
@@ -1788,15 +1862,32 @@ _public_ PAM_EXTERN int pam_sm_open_session(
         if (r != PAM_SUCCESS)
                 return pam_syslog_pam_error(pamh, LOG_ERR, r, "Failed to get PAM items: @PAMERR@");
 
-        c.seat = getenv_harder(pamh, "XDG_SEAT", NULL);
-        c.vtnr = getenv_harder_uint32(pamh, "XDG_VTNR", 0);
-        c.type = getenv_harder(pamh, "XDG_SESSION_TYPE", type_pam);
-        c.class = getenv_harder(pamh, "XDG_SESSION_CLASS", class_pam);
-        c.desktop = getenv_harder(pamh, "XDG_SESSION_DESKTOP", desktop_pam);
-        c.area = getenv_harder(pamh, "XDG_AREA", area_pam);
-        c.incomplete = getenv_harder_bool(pamh, "XDG_SESSION_INCOMPLETE", false);
+        c.seat = getenv_harder(pamh, debug, "XDG_SEAT", NULL);
+        c.vtnr = getenv_harder_uint32(pamh, debug, "XDG_VTNR", 0);
+        c.type = getenv_harder(pamh, debug, "XDG_SESSION_TYPE", type_pam);
+        c.class = getenv_harder(pamh, debug, "XDG_SESSION_CLASS", class_pam);
+        c.desktop = getenv_harder(pamh, debug, "XDG_SESSION_DESKTOP", desktop_pam);
+        c.area = getenv_harder(pamh, debug, "XDG_AREA", area_pam);
+        c.incomplete = getenv_harder_bool(pamh, debug, "XDG_SESSION_INCOMPLETE", false);
+        inhibit_what = getenv_harder(pamh, debug, "XDG_SESSION_INHIBIT", inhibit_what);
+        inhibit_why = getenv_harder(pamh, debug, "XDG_SESSION_INHIBIT_WHY", inhibit_why);
 
-        const char *extra_device_access = getenv_harder(pamh, "XDG_SESSION_EXTRA_DEVICE_ACCESS", NULL);
+        pam_debug_syslog(pamh, debug,
+                         "Initial state: "
+                         "service=%s display=%s tty=%s remote_user=%s remote_host=%s seat=%s vtnr=%"PRIu32" type=%s class=%s desktop=%s area=%s incomplete=%s inhibit=%s",
+                         strempty(c.service),
+                         strempty(c.display),
+                         strempty(c.tty),
+                         strempty(c.remote_user), strempty(c.remote_host),
+                         strempty(c.seat), c.vtnr,
+                         strempty(c.type),
+                         strempty(c.class),
+                         strempty(c.desktop),
+                         strempty(c.area),
+                         yes_no(c.incomplete),
+                         strempty(inhibit_what));
+
+        const char *extra_device_access = getenv_harder(pamh, debug, "XDG_SESSION_EXTRA_DEVICE_ACCESS", NULL);
         if (extra_device_access) {
                 c.extra_device_access = strv_split(extra_device_access, ":");
                 if (!c.extra_device_access)
@@ -1819,6 +1910,11 @@ _public_ PAM_EXTERN int pam_sm_open_session(
         r = register_session(pamh, &c, ur, debug, &seat_buffer, &type_buffer, &runtime_dir);
         if (r != PAM_SUCCESS)
                 return r;
+
+        if (inhibit_what)
+                /* Failure to acquire the inhibit lock is not fatal, session setup should proceed
+                 * regardless. */
+                (void) acquire_inhibit_lock(pamh, inhibit_what, inhibit_why, debug);
 
         r = import_shell_credentials(pamh, debug);
         if (r != PAM_SUCCESS)
@@ -1849,6 +1945,10 @@ _public_ PAM_EXTERN int pam_sm_close_session(
 
         assert(pamh);
 
+        r = dlopen_libpam(LOG_DEBUG);
+        if (r < 0)
+                return PAM_SERVICE_ERR;
+
         pam_log_setup();
 
         if (parse_argv(pamh,
@@ -1857,6 +1957,8 @@ _public_ PAM_EXTERN int pam_sm_close_session(
                        /* type= */ NULL,
                        /* desktop= */ NULL,
                        /* area= */ NULL,
+                       /* inhibit_what= */ NULL,
+                       /* inhibit_why= */ NULL,
                        &debug,
                        /* default_capability_bounding_set= */ NULL,
                        /* default_capability_ambient_set= */ NULL) < 0)
@@ -1866,7 +1968,9 @@ _public_ PAM_EXTERN int pam_sm_close_session(
 
         (void) close_osc_context(pamh, debug);
 
-        id = pam_getenv(pamh, "XDG_SESSION_ID");
+        (void) sym_pam_set_data(pamh, "systemd.inhibit-fd", NULL, NULL);
+
+        id = sym_pam_getenv(pamh, "XDG_SESSION_ID");
         if (id) {
                 _cleanup_(sd_varlink_unrefp) sd_varlink *vl = NULL;
                 bool done = false;

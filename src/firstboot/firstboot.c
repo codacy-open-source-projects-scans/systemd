@@ -5,9 +5,11 @@
 
 #include "sd-bus.h"
 #include "sd-id128.h"
+#include "sd-json.h"
 #include "sd-varlink.h"
 
 #include "alloc-util.h"
+#include "ansi-color.h"
 #include "ask-password-api.h"
 #include "build.h"
 #include "bus-error.h"
@@ -19,13 +21,15 @@
 #include "copy.h"
 #include "creds-util.h"
 #include "dissect-image.h"
+#include "dlopen-note.h"
 #include "env-file.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "format-table.h"
+#include "firstboot-util.h"
 #include "fs-util.h"
 #include "glyph-util.h"
+#include "hostname-setup.h"
 #include "hostname-util.h"
 #include "image-policy.h"
 #include "kbd-util.h"
@@ -38,14 +42,11 @@
 #include "main-func.h"
 #include "memory-util.h"
 #include "mount-util.h"
-#include "options.h"
 #include "os-util.h"
 #include "parse-argument.h"
 #include "password-quality-util.h"
 #include "path-util.h"
 #include "plymouth-util.h"
-#include "pretty-print.h"
-#include "proc-cmdline.h"
 #include "prompt-util.h"
 #include "runtime-scope.h"
 #include "smack-util.h"
@@ -54,9 +55,10 @@
 #include "strv.h"
 #include "terminal-util.h"
 #include "time-util.h"
-#include "tmpfile-util-label.h"
+#include "tmpfile-util.h"
 #include "user-util.h"
 #include "vconsole-util.h"
+#include "verbs.h"
 
 static char *arg_root = NULL;
 static char *arg_image = NULL;
@@ -66,6 +68,7 @@ static char *arg_keymap = NULL;
 static char *arg_timezone = NULL;
 static char *arg_hostname = NULL;
 static sd_id128_t arg_machine_id = {};
+static char **arg_machine_tags = NULL;
 static char *arg_root_password = NULL;
 static char *arg_root_shell = NULL;
 static char *arg_kernel_cmdline = NULL;
@@ -76,6 +79,7 @@ static bool arg_prompt_timezone = false;
 static bool arg_prompt_hostname = false;
 static bool arg_prompt_root_password = false;
 static bool arg_prompt_root_shell = false;
+static bool arg_headless = false;
 static bool arg_copy_locale = false;
 static bool arg_copy_keymap = false;
 static bool arg_copy_timezone = false;
@@ -89,6 +93,7 @@ static bool arg_reset = false;
 static ImagePolicy *arg_image_policy = NULL;
 static bool arg_chrome = true;
 static bool arg_mute_console = false;
+static LabelContext *arg_label_context = NULL;
 
 STATIC_DESTRUCTOR_REGISTER(arg_root, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_image, freep);
@@ -97,14 +102,23 @@ STATIC_DESTRUCTOR_REGISTER(arg_locale_messages, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_keymap, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_timezone, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_hostname, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_machine_tags, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_root_password, erase_and_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_root_shell, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_kernel_cmdline, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_image_policy, image_policy_freep);
+STATIC_DESTRUCTOR_REGISTER(arg_label_context, mac_label_context_freep);
+
+COMMAND(
+        "systemd-firstboot\0",
+        "Configure basic settings of the system.",
+        .man_pages = "systemd-firstboot(1)\0",
+);
+
+static bool welcome_done = false;
 
 static void print_welcome(int rfd, sd_varlink **mute_console_link) {
-        _cleanup_free_ char *pretty_name = NULL, *os_name = NULL, *ansi_color = NULL;
-        static bool done = false;
+        _cleanup_free_ char *pretty_name = NULL, *os_name = NULL, *ansi_color = NULL, *fancy_name = NULL;
         const char *pn, *ac;
         int r;
 
@@ -121,7 +135,7 @@ static void print_welcome(int rfd, sd_varlink **mute_console_link) {
         if (!arg_welcome)
                 return;
 
-        if (done) {
+        if (welcome_done) {
                 putchar('\n'); /* Add some breathing room between multiple prompts */
                 return;
         }
@@ -133,6 +147,7 @@ static void print_welcome(int rfd, sd_varlink **mute_console_link) {
 
         r = parse_os_release_at(rfd,
                                 "PRETTY_NAME", &pretty_name,
+                                "FANCY_NAME", &fancy_name,
                                 "NAME", &os_name,
                                 "ANSI_COLOR", &ansi_color);
         if (r < 0)
@@ -142,7 +157,9 @@ static void print_welcome(int rfd, sd_varlink **mute_console_link) {
         pn = os_release_pretty_name(pretty_name, os_name);
         ac = isempty(ansi_color) ? "0" : ansi_color;
 
-        if (colors_enabled())
+        if (use_fancy_name(unescape_fancy_name(&fancy_name)))
+                printf(ANSI_HIGHLIGHT "Welcome to " ANSI_NORMAL "%s" ANSI_HIGHLIGHT "!" ANSI_NORMAL "\n", fancy_name);
+        else if (colors_enabled())
                 printf(ANSI_HIGHLIGHT "Welcome to " ANSI_NORMAL "\x1B[%sm%s" ANSI_HIGHLIGHT "!" ANSI_NORMAL "\n", ac, pn);
         else
                 printf("Welcome to %s!\n", pn);
@@ -154,7 +171,7 @@ static void print_welcome(int rfd, sd_varlink **mute_console_link) {
         }
         printf("Please configure the system!\n\n");
 
-        done = true;
+        welcome_done = true;
 }
 
 static int should_configure(int dir_fd, const char *filename) {
@@ -236,6 +253,16 @@ static int locale_is_ok(const char *name, void *userdata) {
         return r != 0 ? locale_is_installed(name) > 0 : locale_is_valid(name);
 }
 
+static bool headless_skips_prompt_for(const char *what) {
+        assert(what);
+
+        if (!arg_headless)
+                return false;
+
+        log_debug("Running headless, not prompting for %s.", what);
+        return true;
+}
+
 static int prompt_locale(int rfd, sd_varlink **mute_console_link) {
         _cleanup_strv_free_ char **locales = NULL;
         bool acquired_from_creds = false;
@@ -288,10 +315,17 @@ static int prompt_locale(int rfd, sd_varlink **mute_console_link) {
                         /* Not setting arg_locale_message here, since it defaults to LANG anyway */
                 }
         } else {
+                if (headless_skips_prompt_for("locale"))
+                        return 0;
+
                 print_welcome(rfd, mute_console_link);
+
+                _cleanup_free_ char *prefill = NULL;
+                (void) locale_lang_from_efi(&prefill, LOCALE_REQUIRE_INSTALLED|LOCALE_SUPPRESS_EN_US);
 
                 r = prompt_loop("Please enter the new system locale name or number",
                                 GLYPH_WORLD,
+                                prefill,
                                 locales,
                                 /* accepted= */ NULL,
                                 /* ellipsize_percentage= */ 60,
@@ -309,6 +343,7 @@ static int prompt_locale(int rfd, sd_varlink **mute_console_link) {
 
                 r = prompt_loop("Please enter the new system message locale name or number",
                                 GLYPH_WORLD,
+                                /* prefill= */ NULL,
                                 locales,
                                 /* accepted= */ NULL,
                                 /* ellipsize_percentage= */ 60,
@@ -356,7 +391,7 @@ static int process_locale(int rfd, sd_varlink **mute_console_link) {
                 return log_error_errno(r, "Failed to check if directory file descriptor is root: %m");
 
         if (arg_copy_locale && r == 0) {
-                r = copy_file_atomic_at(AT_FDCWD, etc_locale_conf(), pfd, f, 0644, COPY_REFLINK);
+                r = copy_file_atomic_at(AT_FDCWD, etc_locale_conf(), pfd, f, 0644, /* copy_flags= */ 0);
                 if (r != -ENOENT) {
                         if (r < 0)
                                 return log_error_errno(r, "Failed to copy host's /etc/locale.conf: %m");
@@ -380,12 +415,13 @@ static int process_locale(int rfd, sd_varlink **mute_console_link) {
 
         locales[i] = NULL;
 
-        r = write_env_file(
+        r = write_env_file_label(
                         pfd,
                         f,
                         /* headers= */ NULL,
                         locales,
-                        WRITE_ENV_FILE_LABEL);
+                        WRITE_ENV_FILE_LABEL,
+                        arg_label_context);
         if (r < 0)
                 return log_error_errno(r, "Failed to write /etc/locale.conf: %m");
 
@@ -443,6 +479,9 @@ static int prompt_keymap(int rfd, sd_varlink **mute_console_link) {
                 return 0;
         }
 
+        if (headless_skips_prompt_for("keymap"))
+                return 0;
+
         r = get_keymaps(&kmaps);
         if (r == -ENOENT) /* no keymaps installed */
                 return log_debug_errno(r, "No keymaps are installed.");
@@ -451,9 +490,13 @@ static int prompt_keymap(int rfd, sd_varlink **mute_console_link) {
 
         print_welcome(rfd, mute_console_link);
 
+        _cleanup_free_ char *prefill = NULL;
+        (void) vconsole_keymap_from_efi(&prefill);
+
         return prompt_loop(
                         "Please enter the new keymap name or number",
                         GLYPH_KEYBOARD,
+                        prefill,
                         kmaps,
                         /* accepted= */ NULL,
                         /* ellipsize_percentage= */ 60,
@@ -491,7 +534,7 @@ static int process_keymap(int rfd, sd_varlink **mute_console_link) {
                 return log_error_errno(r, "Failed to check if directory file descriptor is root: %m");
 
         if (arg_copy_keymap && r == 0) {
-                r = copy_file_atomic_at(AT_FDCWD, etc_vconsole_conf(), pfd, f, 0644, COPY_REFLINK);
+                r = copy_file_atomic_at(AT_FDCWD, etc_vconsole_conf(), pfd, f, 0644, /* copy_flags= */ 0);
                 if (r != -ENOENT) {
                         if (r < 0)
                                 return log_error_errno(r, "Failed to copy host's /etc/vconsole.conf: %m");
@@ -561,6 +604,9 @@ static int prompt_timezone(int rfd, sd_varlink **mute_console_link) {
                 return 0;
         }
 
+        if (headless_skips_prompt_for("timezone"))
+                return 0;
+
         r = get_timezones(&zones);
         if (r < 0)
                 return log_error_errno(r, "Cannot query timezone list: %m");
@@ -570,6 +616,7 @@ static int prompt_timezone(int rfd, sd_varlink **mute_console_link) {
         return prompt_loop(
                         "Please enter the new timezone name or number",
                         GLYPH_CLOCK,
+                        /* prefill= */ NULL,
                         zones,
                         /* accepted= */ NULL,
                         /* ellipsize_percentage= */ 30,
@@ -614,7 +661,7 @@ static int process_timezone(int rfd, sd_varlink **mute_console_link) {
                         if (r < 0)
                                 return log_error_errno(r, "Failed to read host's /etc/localtime: %m");
 
-                        r = symlinkat_atomic_full(s, pfd, f, SYMLINK_LABEL);
+                        r = symlinkat_atomic_full_label(s, pfd, f, SYMLINK_LABEL, arg_label_context);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to create /etc/localtime symlink: %m");
 
@@ -635,7 +682,7 @@ static int process_timezone(int rfd, sd_varlink **mute_console_link) {
         if (r < 0)
                 return r;
 
-        r = symlinkat_atomic_full(relpath, pfd, f, SYMLINK_LABEL);
+        r = symlinkat_atomic_full_label(relpath, pfd, f, SYMLINK_LABEL, arg_label_context);
         if (r < 0)
                 return log_error_errno(r, "Failed to create /etc/localtime symlink: %m");
 
@@ -659,7 +706,7 @@ static int prompt_hostname(int rfd, sd_varlink **mute_console_link) {
         r = read_credential("firstboot.hostname", (void**) &hn, NULL);
         if (r < 0)
                 log_debug_errno(r, "Failed to read credential firstboot.hostname, ignoring: %m");
-        else if (!hostname_is_valid(hn, VALID_HOSTNAME_TRAILING_DOT|VALID_HOSTNAME_QUESTION_MARK))
+        else if (!hostname_is_valid(hn, VALID_HOSTNAME_TRAILING_DOT|VALID_HOSTNAME_QUESTION_MARK|VALID_HOSTNAME_WORD_TOKEN))
                 log_warning_errno(SYNTHETIC_ERRNO(EINVAL), "Hostname '%s' supplied via credential is not valid, ignoring.", hn);
         else {
                 log_debug("Acquired hostname from credentials.");
@@ -673,10 +720,14 @@ static int prompt_hostname(int rfd, sd_varlink **mute_console_link) {
                 return 0;
         }
 
+        if (headless_skips_prompt_for("hostname"))
+                return 0;
+
         print_welcome(rfd, mute_console_link);
 
         r = prompt_loop("Please enter the new hostname",
                         GLYPH_LABEL,
+                        /* prefill= */ NULL,
                         /* menu= */ NULL,
                         /* accepted= */ NULL,
                         /* ellipsize_percentage= */ 100,
@@ -720,8 +771,52 @@ static int process_hostname(int rfd, sd_varlink **mute_console_link) {
         if (isempty(arg_hostname))
                 return 0;
 
-        r = write_string_file_at(pfd, f, arg_hostname,
-                                 WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_SYNC|WRITE_STRING_FILE_ATOMIC|WRITE_STRING_FILE_LABEL);
+        /* On running systems we have a machine ID, so resolve any '?'/'$' wildcards now and persist them.
+         * This "freezes" the name, so later word list updates do not change it. When operating on an offline
+         * image (--root=/--image=) the target's machine ID is not known yet, so write the template verbatim
+         * and let it be resolved on each first boot. */
+        const char *hostname = arg_hostname;
+        _cleanup_free_ char *resolved = NULL;
+        _cleanup_(sd_varlink_unrefp) sd_varlink *vl = NULL;
+        if (!arg_root) {
+                r = hostname_substitute_wildcards(arg_hostname, &resolved);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to resolve wildcards in hostname '%s', writing it verbatim: %m", arg_hostname);
+                else if (!hostname_is_valid(resolved, VALID_HOSTNAME_TRAILING_DOT))
+                        log_warning("Resolved hostname '%s' is invalid, writing template '%s' verbatim instead.", resolved, arg_hostname);
+                else {
+                        hostname = resolved;
+
+                        r = sd_varlink_connect_address(&vl, "/run/systemd/io.systemd.Hostname");
+                        if (r < 0)
+                                log_warning_errno(r, "Failed to connect to systemd-hostnamed, writing /etc/hostname directly: %m");
+                }
+        }
+
+        if (vl) {
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *reply = NULL;
+                const char *error_id = NULL;
+                r = sd_varlink_callbo(
+                                vl,
+                                "io.systemd.Hostname.SetStaticHostname",
+                                &reply,
+                                &error_id,
+                                SD_JSON_BUILD_PAIR_STRING("newValue", hostname));
+                if (r < 0)
+                        log_warning_errno(r, "Failed to call io.systemd.Hostname.SetStaticHostname, writing /etc/hostname directly: %m");
+                else if (error_id)
+                        log_warning_errno(sd_varlink_error_to_errno(error_id, reply),
+                                          "Failed to set static hostname, writing /etc/hostname directly: %s", error_id);
+                else {
+                        log_info("Static hostname configured via systemd-hostnamed.");
+                        return 0;
+                }
+        }
+
+        r = write_string_file_full_label(
+                        pfd, f, hostname,
+                        WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_SYNC|WRITE_STRING_FILE_ATOMIC|WRITE_STRING_FILE_LABEL,
+                        /* ts= */ NULL, /* label_fn= */ NULL, arg_label_context);
         if (r < 0)
                 return log_error_errno(r, "Failed to write /etc/hostname: %m");
 
@@ -753,12 +848,79 @@ static int process_machine_id(int rfd) {
                 return 0;
         }
 
-        r = write_string_file_at(pfd, "machine-id", SD_ID128_TO_STRING(arg_machine_id),
-                                 WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_SYNC|WRITE_STRING_FILE_ATOMIC|WRITE_STRING_FILE_LABEL);
+        r = write_string_file_full_label(pfd, "machine-id", SD_ID128_TO_STRING(arg_machine_id),
+                                   WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_SYNC|WRITE_STRING_FILE_ATOMIC|WRITE_STRING_FILE_LABEL,
+                                   /* ts= */ NULL, /* label_fn= */ NULL, arg_label_context);
         if (r < 0)
                 return log_error_errno(r, "Failed to write /etc/machine-id: %m");
 
         log_info("/etc/machine-id written.");
+        return 0;
+}
+
+static int process_machine_tags(int rfd) {
+        int r;
+
+        assert(rfd >= 0);
+
+        _cleanup_free_ char *f = NULL;
+        _cleanup_close_ int pfd = chase_and_open_parent_at(
+                        /* root_fd= */ rfd,
+                        /* dir_fd= */ rfd,
+                        "/etc/machine-info",
+                        CHASE_MKDIR_0755|CHASE_WARN|CHASE_NOFOLLOW,
+                        &f);
+        if (pfd < 0)
+                return log_error_errno(pfd, "Failed to chase /etc/machine-info parent: %m");
+
+        r = should_configure(pfd, f);
+        if (r == 0)
+                log_debug("Found /etc/machine-info, assuming machine tags have been configured.");
+        if (r <= 0)
+                return r;
+
+        if (!arg_machine_tags) {
+                _cleanup_free_ char *tags = NULL;
+                r = read_credential("firstboot.machine-tags", (void**) &tags, /* ret_size= */ NULL);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to read credential firstboot.machine-tags, ignoring: %m");
+                else {
+                        _cleanup_strv_free_ char **l = NULL;
+                        r = machine_tags_from_string(tags, /* graceful= */ false, &l);
+                        if (r < 0)
+                                log_warning_errno(r, "Failed to parse machine tags '%s', ignoring credential: %m", tags);
+                        else {
+                                strv_free_and_replace(arg_machine_tags, l);
+                                log_debug("Acquired machine tags list from credentials.");
+                        }
+                }
+        }
+
+        /* NB: We do not prompt for machine tags, at least not for now */
+
+        if (!arg_machine_tags) {
+                log_debug("Initialization of machine tags was not requested, skipping.");
+                return 0;
+        }
+
+        _cleanup_free_ char *j = strv_join(arg_machine_tags, ":");
+        if (!j)
+                return log_oom();
+
+        _cleanup_free_ char *c = strjoin("TAGS=\"", j, "\"\n");
+        if (!c)
+                return log_oom();
+
+        r = write_string_file_full_label(
+                        pfd,
+                        "machine-info",
+                        c,
+                        WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_SYNC|WRITE_STRING_FILE_ATOMIC|WRITE_STRING_FILE_LABEL,
+                        /* ts= */ NULL, /* label_fn= */ NULL, arg_label_context);
+        if (r < 0)
+                return log_error_errno(r, "Failed to write /etc/machine-info: %m");
+
+        log_info("/etc/machine-info written.");
         return 0;
 }
 
@@ -778,6 +940,9 @@ static int prompt_root_password(int rfd, sd_varlink **mute_console_link) {
                 log_debug("Prompting for root password was not requested.");
                 return 0;
         }
+
+        if (headless_skips_prompt_for("root password"))
+                return 0;
 
         print_welcome(rfd, mute_console_link);
 
@@ -871,6 +1036,10 @@ static int prompt_root_shell(int rfd, sd_varlink **mute_console_link) {
         if (r < 0)
                 log_debug_errno(r, "Failed to read credential passwd.shell.root, ignoring: %m");
         else {
+                r = find_shell(rfd, arg_root_shell);
+                if (r < 0)
+                        return r;
+
                 log_debug("Acquired root shell from credential.");
                 return 0;
         }
@@ -880,11 +1049,15 @@ static int prompt_root_shell(int rfd, sd_varlink **mute_console_link) {
                 return 0;
         }
 
+        if (headless_skips_prompt_for("root shell"))
+                return 0;
+
         print_welcome(rfd, mute_console_link);
 
         return prompt_loop(
                         "Please enter the new root shell",
                         GLYPH_SHELL,
+                        /* prefill= */ NULL,
                         /* menu= */ NULL,
                         /* accepted= */ NULL,
                         /* ellipsize_percentage= */ 0,
@@ -903,7 +1076,7 @@ static int write_root_passwd(int rfd, int etc_fd, const char *password, const ch
         int r;
         bool found = false;
 
-        r = fopen_temporary_at_label(etc_fd, "passwd", "passwd", &passwd, &passwd_tmp);
+        r = fopen_temporary_at_label(etc_fd, "passwd", "passwd", &passwd, &passwd_tmp, arg_label_context);
         if (r < 0)
                 return r;
 
@@ -974,7 +1147,7 @@ static int write_root_shadow(int etc_fd, const char *hashed_password) {
         int r;
         bool found = false;
 
-        r = fopen_temporary_at_label(etc_fd, "shadow", "shadow", &shadow, &shadow_tmp);
+        r = fopen_temporary_at_label(etc_fd, "shadow", "shadow", &shadow, &shadow_tmp, arg_label_context);
         if (r < 0)
                 return r;
 
@@ -1184,8 +1357,9 @@ static int process_kernel_cmdline(int rfd) {
                 return 0;
         }
 
-        r = write_string_file_at(pfd, "cmdline", arg_kernel_cmdline,
-                                 WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_SYNC|WRITE_STRING_FILE_ATOMIC|WRITE_STRING_FILE_LABEL);
+        r = write_string_file_full_label(pfd, "cmdline", arg_kernel_cmdline,
+                                   WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_SYNC|WRITE_STRING_FILE_ATOMIC|WRITE_STRING_FILE_LABEL,
+                                   /* ts= */ NULL, /* label_fn= */ NULL, arg_label_context);
         if (r < 0)
                 return log_error_errno(r, "Failed to write /etc/kernel/cmdline: %m");
 
@@ -1236,33 +1410,6 @@ static int process_reset(int rfd) {
         return 0;
 }
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        _cleanup_(table_unrefp) Table *options = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-firstboot", "1", &link);
-        if (r < 0)
-                return log_oom();
-
-        r = option_parser_get_help_table(&options);
-        if (r < 0)
-                return r;
-
-        printf("%s [OPTIONS...]\n\n"
-               "%sConfigures basic settings of the system.%s\n\n",
-               program_invocation_short_name,
-               ansi_highlight(),
-               ansi_normal());
-
-        r = table_print_or_warn(options);
-        if (r < 0)
-                return r;
-
-        printf("\nSee the %s for details.\n", link);
-        return 0;
-}
-
 static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
@@ -1270,11 +1417,11 @@ static int parse_argv(int argc, char *argv[]) {
         OptionParser opts = { argc, argv };
         int r;
 
-        FOREACH_OPTION(c, &opts, /* on_error= */ return c)
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return help();
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();
@@ -1330,7 +1477,7 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 OPTION_LONG("hostname", "NAME", "Set hostname"):
-                        if (!hostname_is_valid(opts.arg, VALID_HOSTNAME_TRAILING_DOT|VALID_HOSTNAME_QUESTION_MARK))
+                        if (!hostname_is_valid(opts.arg, VALID_HOSTNAME_TRAILING_DOT|VALID_HOSTNAME_QUESTION_MARK|VALID_HOSTNAME_WORD_TOKEN))
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "Host name %s is not valid.", opts.arg);
 
@@ -1352,6 +1499,16 @@ static int parse_argv(int argc, char *argv[]) {
                         if (r < 0)
                                 return log_error_errno(r, "Failed to parse machine id %s.", opts.arg);
                         break;
+
+                OPTION_LONG("machine-tags", "TAG[:…]", "Set machine tags"): {
+                        _cleanup_strv_free_ char **tags = NULL;
+                        r = machine_tags_from_string(opts.arg, /* graceful= */ false, &tags);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse machine tags '%s': %m", opts.arg);
+
+                        strv_free_and_replace(arg_machine_tags, tags);
+                        break;
+                }
 
                 OPTION_LONG("root-password", "PASSWORD", "Set root password from plaintext password"):
                         r = free_and_strdup_warn(&arg_root_password, opts.arg);
@@ -1483,6 +1640,9 @@ static int parse_argv(int argc, char *argv[]) {
                 OPTION_LONG("reset", NULL, "Remove existing files"):
                         arg_reset = true;
                         break;
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
         if (arg_delete_root_password && (arg_copy_root_password || arg_root_password || arg_prompt_root_password))
@@ -1547,10 +1707,19 @@ static int reload_vconsole(sd_bus **bus) {
         if (r < 0)
                 return bus_log_parse_error(r);
 
-        r = bus_wait_for_jobs_one(w, object, BUS_WAIT_JOBS_LOG_ERROR, NULL);
+        r = bus_wait_for_jobs_one(w, object, BUS_WAIT_JOBS_LOG_ERROR);
         if (r < 0)
                 return log_error_errno(r, "Failed to wait for systemd-vconsole-setup.service/restart: %m");
         return 0;
+}
+
+static void end_marker(void) {
+
+        if (!welcome_done)
+                return;
+
+        printf("\n%sExiting first boot settings tool.%s\n\n", ansi_grey(), ansi_normal());
+        fflush(stdout);
 }
 
 static int run(int argc, char *argv[]) {
@@ -1559,6 +1728,14 @@ static int run(int argc, char *argv[]) {
         _cleanup_(umount_and_freep) char *mounted_dir = NULL;
         _cleanup_close_ int rfd = -EBADF;
         int r;
+
+        LIBBLKID_NOTE(recommended);
+        LIBCRYPT_NOTE(recommended);
+        LIBCRYPTO_NOTE(suggested);
+        LIBCRYPTSETUP_NOTE(suggested);
+        LIBMOUNT_NOTE(recommended);
+        LIBSELINUX_NOTE(recommended);
+        PASSWORD_NOTE(suggested);
 
         r = parse_argv(argc, argv);
         if (r <= 0)
@@ -1575,13 +1752,18 @@ static int run(int argc, char *argv[]) {
                  * command line option, because we are called to provision the host with basic settings (as
                  * opposed to some other file system tree/image) */
 
-                bool enabled;
-                r = proc_cmdline_get_bool("systemd.firstboot", /* flags= */ 0, &enabled);
+                FirstBootMode mode;
+                _cleanup_free_ char *bad = NULL;
+                r = firstboot_mode_from_cmdline(&mode, &bad);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to parse systemd.firstboot= kernel command line argument, ignoring: %m");
-                if (r > 0 && !enabled) {
+                        return log_error_errno(r, "Failed to parse systemd.firstboot= kernel command line argument%s: %m",
+                                               bad ? strjoina(" (invalid value '", bad, "')") : "");
+                if (mode == FIRSTBOOT_NO) {
                         log_debug("Found systemd.firstboot=no kernel command line argument, turning off all prompts.");
                         arg_prompt_locale = arg_prompt_keymap = arg_prompt_keymap_auto = arg_prompt_timezone = arg_prompt_hostname = arg_prompt_root_password = arg_prompt_root_shell = false;
+                } else if (mode == FIRSTBOOT_HEADLESS) {
+                        log_debug("Found systemd.firstboot=headless kernel command line argument, skipping interactive prompts but keeping non-interactive auto-configuration.");
+                        arg_headless = true;
                 }
         }
 
@@ -1617,7 +1799,12 @@ static int run(int argc, char *argv[]) {
                         return log_error_errno(errno, "Failed to open %s: %m", empty_to_root(arg_root));
         }
 
+        r = mac_label_context_new(arg_root, &arg_label_context);
+        if (r < 0)
+                return log_error_errno(r, "Failed to initialize label context for root '%s': %m", arg_root);
+
         LOG_SET_PREFIX(arg_image ?: arg_root);
+        DEFER_VOID_CALL(end_marker);
         DEFER_VOID_CALL(chrome_hide);
 
         /* We check these conditions here instead of in parse_argv() so that we can take the root directory
@@ -1670,6 +1857,10 @@ static int run(int argc, char *argv[]) {
                 return r;
 
         r = process_machine_id(rfd);
+        if (r < 0)
+                return r;
+
+        r = process_machine_tags(rfd);
         if (r < 0)
                 return r;
 

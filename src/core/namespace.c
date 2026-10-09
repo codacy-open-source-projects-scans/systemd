@@ -31,7 +31,7 @@
 #include "log.h"
 #include "loop-util.h"
 #include "loopback-setup.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
 #include "mstack.h"
@@ -564,8 +564,9 @@ static int append_extensions(
                 _cleanup_free_ char *mount_point = NULL;
                 const MountImage *m = mount_images + i;
 
-                r = path_pick(/* toplevel_path= */ NULL,
-                              /* toplevel_fd= */ AT_FDCWD,
+                r = path_pick(/* root_path= */ NULL,
+                              /* root_fd= */ AT_FDCWD,
+                              /* dir_fd= */ AT_FDCWD,
                               m->source,
                               pick_filter_image_raw,
                               ELEMENTSOF(pick_filter_image_raw),
@@ -636,8 +637,9 @@ static int append_extensions(
                 if (startswith(e, "+"))
                         e++;
 
-                r = path_pick(/* toplevel_path= */ NULL,
-                              /* toplevel_fd= */ AT_FDCWD,
+                r = path_pick(/* root_path= */ NULL,
+                              /* root_fd= */ AT_FDCWD,
+                              /* dir_fd= */ AT_FDCWD,
                               e,
                               pick_filter_image_dir,
                               ELEMENTSOF(pick_filter_image_dir),
@@ -1218,7 +1220,7 @@ static int clone_device_node(const char *node, const char *temporary_mount, bool
 
         /* First, try to create device node properly */
         if (*make_devnode) {
-                mac_selinux_create_file_prepare(node, st.st_mode);
+                mac_selinux_create_file_prepare(node, st.st_mode, /* label_context= */ NULL);
                 r = mknod(dn, st.st_mode, st.st_rdev);
                 mac_selinux_create_file_clear();
                 if (r >= 0)
@@ -1339,7 +1341,7 @@ static int mount_private_dev(const MountEntry *m, const NamespaceParameters *p) 
         if (r < 0)
                 return r;
 
-        r = label_fix_full(AT_FDCWD, dev, "/dev", 0);
+        r = label_fix_full(AT_FDCWD, dev, "/dev", /* flags= */ 0, /* label_context= */ NULL);
         if (r < 0)
                 return log_debug_errno(r, "Failed to fix label of '%s' as /dev/: %m", dev);
 
@@ -1608,7 +1610,7 @@ static int mount_tmpfs(const MountEntry *m) {
         if (r < 0)
                 return r;
 
-        r = label_fix_full(AT_FDCWD, entry_path, inner_path, 0);
+        r = label_fix_full(AT_FDCWD, entry_path, inner_path, /* flags= */ 0, /* label_context= */ NULL);
         if (r < 0)
                 return log_debug_errno(r, "Failed to fix label of '%s' as '%s': %m", entry_path, inner_path);
 
@@ -1641,6 +1643,8 @@ static int mount_mqueuefs(const MountEntry *m) {
         (void) umount_recursive(entry_path, 0);
 
         r = mount_nofollow_verbose(LOG_DEBUG, "mqueue", entry_path, "mqueue", m->flags, mount_entry_options(m));
+        if (r == -ENODEV) /* POSIX message queues may be disabled in the kernel. */
+                return 0;
         if (r < 0)
                 return r;
 
@@ -1843,6 +1847,54 @@ static int follow_symlink(
         return 0;
 }
 
+static int mount_bind(
+                const MountEntry *m,
+                const char *what,
+                bool recursive,
+                bool make) {
+
+        int r;
+
+        assert(m);
+        assert(what);
+
+        r = mount_nofollow_verbose(
+                        LOG_DEBUG,
+                        what,
+                        mount_entry_path(m),
+                        NULL,
+                        MS_BIND|(recursive ? MS_REC : 0),
+                        NULL);
+        if (r >= 0)
+                return 0;
+        if (r != -ENOENT || !make)
+                return log_debug_errno(r, "Failed to mount %s to %s: %m", what, mount_entry_path(m));
+
+        /* Either the source or the destination is missing. Create the destination and try again. */
+        r = mkdir_parents(mount_entry_path(m), 0755);
+        if (r < 0 && r != -EEXIST)
+                return log_debug_errno(r,
+                                       "Failed to create parent directories of destination mount point node '%s': %m",
+                                       mount_entry_path(m));
+
+        r = make_mount_point_inode_from_path(what, mount_entry_path(m), 0755);
+        if (r < 0 && r != -EEXIST)
+                return log_debug_errno(r, "Failed to create destination mount point node '%s': %m",
+                                       mount_entry_path(m));
+
+        r = mount_nofollow_verbose(
+                        LOG_DEBUG,
+                        what,
+                        mount_entry_path(m),
+                        NULL,
+                        MS_BIND|(recursive ? MS_REC : 0),
+                        NULL);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to mount %s to %s: %m", what, mount_entry_path(m));
+
+        return 0;
+}
+
 static int apply_one_mount(
                 const char *root_directory,
                 MountEntry *m,
@@ -2015,7 +2067,7 @@ static int apply_one_mount(
                         if (r < 0)
                                 return log_debug_errno(r, "Failed to create source directory %s: %m", mount_entry_source(m));
 
-                        r = label_fix_full(AT_FDCWD, mount_entry_source(m), mount_entry_unprefixed_path(m), /* flags= */ 0);
+                        r = label_fix_full(AT_FDCWD, mount_entry_source(m), mount_entry_unprefixed_path(m), /* flags= */ 0, /* label_context= */ NULL);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to set label of the source directory %s: %m", mount_entry_source(m));
                 }
@@ -2095,37 +2147,9 @@ static int apply_one_mount(
 
         assert(what);
 
-        r = mount_nofollow_verbose(LOG_DEBUG, what, mount_entry_path(m), NULL, MS_BIND|(rbind ? MS_REC : 0), NULL);
-        if (r < 0) {
-                bool try_again = false;
-
-                if (r == -ENOENT && make) {
-                        int q;
-
-                        /* Hmm, either the source or the destination are missing. Let's see if we can create
-                           the destination, then try again. */
-
-                        q = mkdir_parents(mount_entry_path(m), 0755);
-                        if (q < 0 && q != -EEXIST)
-                                // FIXME: this shouldn't be logged at LOG_WARNING, but be bubbled up, and logged there to avoid duplicate logging
-                                log_warning_errno(q, "Failed to create parent directories of destination mount point node '%s', ignoring: %m",
-                                                  mount_entry_path(m));
-                        else {
-                                q = make_mount_point_inode_from_path(what, mount_entry_path(m), 0755);
-                                if (q < 0 && q != -EEXIST)
-                                        // FIXME: this shouldn't be logged at LOG_WARNING, but be bubbled up, and logged there to avoid duplicate logging
-                                        log_warning_errno(q, "Failed to create destination mount point node '%s', ignoring: %m",
-                                                          mount_entry_path(m));
-                                else
-                                        try_again = true;
-                        }
-                }
-
-                if (try_again)
-                        r = mount_nofollow_verbose(LOG_DEBUG, what, mount_entry_path(m), NULL, MS_BIND|(rbind ? MS_REC : 0), NULL);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to mount %s to %s: %m", what, mount_entry_path(m)); // FIXME: this should not be logged here, but be bubbled up, to avoid duplicate logging
-        }
+        r = mount_bind(m, what, rbind, make);
+        if (r < 0)
+                return r;
 
         log_debug("Successfully mounted %s to %s", what, mount_entry_path(m));
 
@@ -2626,7 +2650,7 @@ int setup_namespace(const NamespaceParameters *p, char **reterr_path) {
                                 root_mount_fd = _root_mount_fd;
                         }
 
-                        /* Try to to clone the directory mount if we have privs to, so that we can apply the
+                        /* Try to clone the directory mount if we have privs to, so that we can apply the
                          * MS_SLAVE propagation settings right-away. */
                         if (root_mount_fd < 0) {
                                 _root_mount_fd = open_tree_attr_with_fallback(
@@ -3450,7 +3474,7 @@ int setup_tmp_dir_one(const char *id, const char *prefix, char **ret_path) {
                         return r;
                 }
 
-                r = label_fix_full(AT_FDCWD, inner_dir, prefix, 0);
+                r = label_fix_full(AT_FDCWD, inner_dir, prefix, /* flags= */ 0, /* label_context= */ NULL);
                 if (r < 0) {
                         (void) rmdir(inner_dir);
                         (void) rmdir(d);
@@ -4161,7 +4185,7 @@ DEFINE_STRING_TABLE_LOOKUP(bpf_delegate_map_type, uint64_t);
 DEFINE_STRING_TABLE_LOOKUP(bpf_delegate_prog_type, uint64_t);
 DEFINE_STRING_TABLE_LOOKUP(bpf_delegate_attach_type, uint64_t);
 
-char* bpf_delegate_to_string(uint64_t u, const char * (*parser)(uint64_t) _const_ ) {
+char* bpf_delegate_to_string(uint64_t u, const char* (*parser)(uint64_t)) {
         assert(parser);
 
         if (u == UINT64_MAX)

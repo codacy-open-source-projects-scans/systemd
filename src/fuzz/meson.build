@@ -15,7 +15,15 @@ simple_fuzzers += files(
         'fuzz-varlink-idl.c',
 )
 
+executables += [
+        fuzz_template + {
+                'sources' : files('fuzz-pe-binary.c'),
+                'dependencies' : libopenssl_cflags,
+        },
+]
+
 # The following fuzzers do not work on oss-fuzz. See #11018.
 if not want_ossfuzz
         simple_fuzzers += files('fuzz-compress.c')
+        simple_fuzzers += files('fuzz-decompress.c')
 endif

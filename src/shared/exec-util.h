@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "shared-forward.h"
+#include "forward.h"
 
 typedef int (*gather_stdout_callback_t) (int fd, void *arg);
 
@@ -55,6 +55,7 @@ typedef enum ExecCommandFlags {
 
 int exec_command_flags_from_strv(char * const *ex_opts, ExecCommandFlags *ret);
 int exec_command_flags_to_strv(ExecCommandFlags flags, char ***ret);
+char* exec_command_flags_to_exec_chars(ExecCommandFlags flags);
 
 DECLARE_STRING_TABLE_LOOKUP(exec_command_flags, ExecCommandFlags);
 

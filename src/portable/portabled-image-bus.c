@@ -591,14 +591,6 @@ static int normalize_portable_changes(
 
         CLEANUP_ARRAY(changes, n_changes, portable_changes_free);
 
-        /* Corner case: only detached, nothing attached */
-        if (n_changes_attached == 0) {
-                memcpy(changes, changes_detached, sizeof(PortableChange) * n_changes_detached);
-                *ret_changes = TAKE_PTR(changes);
-                *ret_n_changes = n_changes_detached;
-                return 0;
-        }
-
         for (size_t i = 0; i < n_changes_detached; ++i) {
                 bool found = false;
 
@@ -721,6 +713,11 @@ int bus_image_common_reattach(
                 return r;
         if (r == 0) /* Will call us back */
                 return 1;
+
+        /* portable_attach() checks this too, but by then the image is detached already. */
+        r = portable_profile_validate(m->runtime_scope, profile, error);
+        if (r < 0)
+                return r;
 
         r = portable_detach(
                         m->runtime_scope,

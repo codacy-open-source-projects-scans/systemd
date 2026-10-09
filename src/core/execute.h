@@ -61,6 +61,7 @@ typedef enum ExecPreserveMode {
         EXEC_PRESERVE_NO,
         EXEC_PRESERVE_YES,
         EXEC_PRESERVE_RESTART,
+        EXEC_PRESERVE_ON_SUCCESS,
         _EXEC_PRESERVE_MODE_MAX,
         _EXEC_PRESERVE_MODE_INVALID = -EINVAL,
 } ExecPreserveMode;
@@ -512,6 +513,12 @@ static inline bool exec_input_is_inheritable(ExecInput i) {
         return exec_input_is_terminal(i) || IN_SET(i, EXEC_INPUT_SOCKET, EXEC_INPUT_NAMED_FD);
 }
 
+static inline bool exec_output_is_file(ExecOutput o) {
+        /* The output types that refer to a regular file (StandardOutput=file:…, append:…, truncate:…), i.e.
+         * that require a companion path in ExecContext.stdio_file[] */
+        return IN_SET(o, EXEC_OUTPUT_FILE, EXEC_OUTPUT_FILE_APPEND, EXEC_OUTPUT_FILE_TRUNCATE);
+}
+
 int exec_spawn(
                 Unit *unit,
                 ExecCommand *command,
@@ -533,12 +540,16 @@ void exec_command_reset_status_list_array(ExecCommand **c, size_t n);
 void exec_command_dump(ExecCommand *c, FILE *f, const char *prefix);
 void exec_command_dump_list(ExecCommand *c, FILE *f, const char *prefix);
 void exec_command_append_list(ExecCommand **l, ExecCommand *e);
+int exec_command_to_setting(const ExecCommand *c, char **ret);
 int exec_command_set(ExecCommand *c, const char *path, ...) _sentinel_;
 int exec_command_append(ExecCommand *c, const char *path, ...) _sentinel_;
 
 void exec_context_init(ExecContext *c);
 void exec_context_done(ExecContext *c);
 void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix);
+
+int exec_context_apply_environment(Unit *u, ExecContext *c, char **env, UnitWriteFlags flags);
+int exec_context_apply_set_credential(Unit *u, ExecContext *c, const char *id, const void *data, size_t size, bool encrypted, UnitWriteFlags flags, const char **reterr_message);
 
 int exec_context_destroy_runtime_directory(const ExecContext *c, const char *runtime_prefix);
 int exec_context_destroy_mount_ns_dir(Unit *u);

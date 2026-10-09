@@ -42,6 +42,7 @@ typedef enum MetadataField {
         META_UNIT,
         META_PROC_AUXV,
         META_THREAD_NAME,
+        META_CODE, /* code of signal causing dump (eg: 2 for SEGV_ACCERR). Since v7.1. */
         _META_MAX,
         _META_INVALID = -EINVAL,
 } MetadataField;
@@ -51,11 +52,12 @@ struct CoredumpContext {
         uid_t uid;         /* META_ARGV_UID */
         gid_t gid;         /* META_ARGV_GID */
         int signo;         /* META_ARGV_SIGNAL */
+        int code;          /* META_CODE */
         usec_t timestamp;  /* META_ARGV_TIMESTAMP */
         uint64_t rlimit;   /* META_ARGV_RLIMIT */
         char *hostname;    /* META_ARGV_HOSTNAME */
         unsigned dumpable; /* META_ARGV_DUMPABLE */
-        pid_t tid;         /* META_ARGV_TID */
+        PidRef tidref;     /* META_ARGV_TID */
         char *comm;        /* META_COMM */
         char *exe;         /* META_EXE */
         char *unit;        /* META_UNIT */
@@ -63,6 +65,7 @@ struct CoredumpContext {
         size_t auxv_size;  /* META_PROC_AUXV */
         char *thread_name; /* META_THREAD_NAME */
         bool got_pidfd;    /* META_ARGV_PIDFD */
+        int got_code;      /* META_CODE, tristate */
         bool same_pidns;
         bool forwarded;
         int input_fd;
@@ -75,6 +78,8 @@ struct CoredumpContext {
                 .pidref = PIDREF_NULL,          \
                 .uid = UID_INVALID,             \
                 .gid = GID_INVALID,             \
+                .tidref = PIDREF_NULL,          \
+                .got_code = -1,                 \
                 .mount_tree_fd = -EBADF,        \
                 .input_fd = -EBADF,             \
         }
@@ -85,3 +90,4 @@ bool coredump_context_is_journald(CoredumpContext *context);
 int coredump_context_build_iovw(CoredumpContext *context);
 int coredump_context_parse_iovw(CoredumpContext *context);
 int coredump_context_parse_from_argv(CoredumpContext *context, int argc, char **argv);
+int coredump_context_parse_from_peer(CoredumpContext *context);

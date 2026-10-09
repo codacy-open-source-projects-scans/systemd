@@ -83,6 +83,10 @@ static int dhcp6_remove(Link *link, bool only_marked) {
                 RET_GATHER(ret, address_remove_and_cancel(address, link));
         }
 
+        if (!only_marked)
+                /* Also drop pending requests when the lease is lost or the client is stopped. */
+                RET_GATHER(ret, link_drop_requests(link, NETWORK_CONFIG_SOURCE_DHCP6));
+
         return ret;
 }
 
@@ -364,7 +368,7 @@ static int dhcp6_lease_information_acquired(sd_dhcp6_client *client, Link *link)
         if (r < 0)
                 return log_link_error_errno(link, r, "Failed to get DHCPv6 lease: %m");
 
-        unref_and_replace_full(link->dhcp6_lease, lease, sd_dhcp6_lease_ref, sd_dhcp6_lease_unref);
+        unref_and_replace_new_ref(link->dhcp6_lease, lease, sd_dhcp6_lease_ref, sd_dhcp6_lease_unref);
 
         link_dirty(link);
         return 0;

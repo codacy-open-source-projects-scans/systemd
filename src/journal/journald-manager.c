@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <linux/audit.h>
 #include <linux/sockios.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
@@ -47,6 +46,7 @@
 #include "journald-sync.h"
 #include "journald-syslog.h"
 #include "journald-varlink.h"
+#include "libaudit-util.h"
 #include "log.h"
 #include "log-ratelimit.h"
 #include "memory-util.h"
@@ -697,7 +697,10 @@ static int manager_archive_offline_user_journals(Manager *m) {
 
                 TAKE_FD(fd); /* Donated to journal_file_open() */
 
-                journal_file_write_final_tag(f);
+                r = journal_file_auth_append_tag(f);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to append tag when closing journal, ignoring: %m");
+
                 r = journal_file_archive(f, NULL);
                 if (r < 0)
                         log_debug_errno(r, "Failed to archive journal file '%s', ignoring: %m", full);
@@ -1870,7 +1873,7 @@ static int manager_schedule_sync(Manager *m, int priority) {
         }
 
         if (!m->event || sd_event_get_state(m->event) == SD_EVENT_FINISHED) {
-                /* Shutting down the server? Let's sync immediately. */
+                /* Shutting down the manager? Let's sync immediately. */
                 manager_sync(m, /* wait= */ false);
                 return 0;
         }
@@ -2130,7 +2133,7 @@ int manager_unlink_seqnum_file(Manager *m, const char *fname) {
 static bool manager_is_idle(Manager *m) {
         assert(m);
 
-        /* The server for the main namespace is never idle */
+        /* The manager for the main namespace is never idle */
         if (!m->namespace)
                 return false;
 
@@ -2539,18 +2542,16 @@ int manager_init(Manager *m) {
 }
 
 void manager_maybe_append_tags(Manager *m) {
-#if HAVE_GCRYPT
-        JournalFile *f;
-        usec_t n;
+        assert(m);
 
-        n = now(CLOCK_REALTIME);
+        usec_t n = now(CLOCK_REALTIME);
 
         if (m->system_journal)
-                journal_file_maybe_append_tag(m->system_journal, n);
+                journal_file_auth_append_tag_maybe(m->system_journal, n);
 
+        JournalFile *f;
         ORDERED_HASHMAP_FOREACH(f, m->user_journals)
-                journal_file_maybe_append_tag(f, n);
-#endif
+                journal_file_auth_append_tag_maybe(f, n);
 }
 
 Manager* manager_free(Manager *m) {

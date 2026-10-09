@@ -19,6 +19,9 @@ static int open_passwd_file(const char *root, const char *fname, FILE **ret_file
         _cleanup_close_ int fd = -EBADF;
         _cleanup_fclose_ FILE *f = NULL;
 
+        assert(fname);
+        assert(ret_file);
+
         fd = chase_and_open(fname, root, CHASE_PREFIX_ROOT, O_RDONLY|O_CLOEXEC, &p);
         if (fd < 0)
                 return fd;
@@ -53,10 +56,10 @@ static int populate_uid_cache(const char *root, Hashmap **ret) {
         /* The directory list is hardcoded here: /etc is the standard, and rpm-ostree uses /usr/lib. This
          * could be made configurable, but I don't see the point right now. */
 
-        FOREACH_STRING(fname, "/etc/passwd", "/usr/lib/passwd") {
+        STRV_FOREACH(fname, PASSWD_FILES) {
                 _cleanup_fclose_ FILE *f = NULL;
 
-                r = open_passwd_file(root, fname, &f);
+                r = open_passwd_file(root, *fname, &f);
                 if (r == -ENOENT)
                         continue;
                 if (r < 0)
@@ -93,10 +96,10 @@ static int populate_gid_cache(const char *root, Hashmap **ret) {
         if (!cache)
                 return -ENOMEM;
 
-        FOREACH_STRING(fname, "/etc/group", "/usr/lib/group") {
+        STRV_FOREACH(fname, GROUP_FILES) {
                 _cleanup_fclose_ FILE *f = NULL;
 
-                r = open_passwd_file(root, fname, &f);
+                r = open_passwd_file(root, *fname, &f);
                 if (r == -ENOENT)
                         continue;
                 if (r < 0)

@@ -1,11 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#if HAVE_OPENSSL
-#  include <openssl/core_names.h>
-#endif
-
-#include "sd-dlopen.h"
-
 #include "alloc-util.h"
 #include "ask-password-api.h"
 #include "crypto-util.h"
@@ -17,6 +11,7 @@
 #include "memory-util.h"
 #include "pkcs11-util.h"
 #include "random-util.h"
+#include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
 
@@ -41,9 +36,15 @@ bool pkcs11_uri_valid(const char *uri) {
         return true;
 }
 
-#if HAVE_P11KIT
+static const char* const pkcs11_rsa_padding_table[_PKCS11_RSA_PADDING_MAX] = {
+        [PKCS11_RSA_PADDING_PKCS1V15]    = "pkcs1",
+        [PKCS11_RSA_PADDING_OAEP_SHA1]   = "oaep-sha1",
+        [PKCS11_RSA_PADDING_OAEP_SHA256] = "oaep-sha256",
+};
 
-static void *p11kit_dl = NULL;
+DEFINE_STRING_TABLE_LOOKUP(pkcs11_rsa_padding, Pkcs11RsaPadding);
+
+#if HAVE_P11KIT
 
 DLSYM_PROTOTYPE(p11_kit_module_get_name) = NULL;
 DLSYM_PROTOTYPE(p11_kit_modules_finalize_and_release) = NULL;
@@ -562,10 +563,10 @@ int pkcs11_token_read_public_key(
 
                 _cleanup_(EVP_PKEY_CTX_freep) EVP_PKEY_CTX *ctx = sym_EVP_PKEY_CTX_new_from_name(NULL, "EC", NULL);
                 if (!ctx)
-                        return log_debug_errno(SYNTHETIC_ERRNO(EIO), "Failed to create an EVP_PKEY_CTX for EC.");
+                        return log_openssl_errors(LOG_DEBUG, "Failed to create an EVP_PKEY_CTX for EC.");
 
                 if (sym_EVP_PKEY_fromdata_init(ctx) != 1)
-                        return log_debug_errno(SYNTHETIC_ERRNO(EIO), "Failed to init an EVP_PKEY_CTX for EC.");
+                        return log_openssl_errors(LOG_DEBUG, "Failed to init an EVP_PKEY_CTX for EC.");
 
                 OSSL_PARAM ec_params[8] = {
                         /* We need to drop the const from the data param, because ec_params is
@@ -606,7 +607,7 @@ int pkcs11_token_read_public_key(
                                 return log_oom_debug();
 
                         if (sym_EC_GROUP_get_curve(group, bn_p, bn_a, bn_b, bnctx) != 1)
-                                return log_debug_errno(SYNTHETIC_ERRNO(EIO), "Failed to extract EC parameters from EC_GROUP.");
+                                return log_openssl_errors(LOG_DEBUG, "Failed to extract EC parameters from EC_GROUP.");
 
                         order_size = sym_BN_num_bytes(bn_order);
                         p_size = sym_BN_num_bytes(bn_p);
@@ -633,12 +634,12 @@ int pkcs11_token_read_public_key(
                             sym_BN_bn2nativepad(bn_p, p, p_size) <= 0 ||
                             sym_BN_bn2nativepad(bn_a, a, a_size) <= 0 ||
                             sym_BN_bn2nativepad(bn_b, b, b_size) <= 0 )
-                                return log_debug_errno(SYNTHETIC_ERRNO(EIO), "Failed to store EC parameters in native byte order.");
+                                return log_openssl_errors(LOG_DEBUG, "Failed to store EC parameters in native byte order.");
 
                         const EC_POINT *point_gen = sym_EC_GROUP_get0_generator(group);
                         generator_size = sym_EC_POINT_point2oct(group, point_gen, POINT_CONVERSION_UNCOMPRESSED, NULL, 0, bnctx);
                         if (generator_size == 0)
-                                return log_debug_errno(SYNTHETIC_ERRNO(EIO), "Failed to determine size of a EC generator.");
+                                return log_openssl_errors(LOG_DEBUG, "Failed to determine size of a EC generator.");
 
                         generator = malloc(generator_size);
                         if (!generator)
@@ -646,7 +647,7 @@ int pkcs11_token_read_public_key(
 
                         generator_size = sym_EC_POINT_point2oct(group, point_gen, POINT_CONVERSION_UNCOMPRESSED, generator, generator_size, bnctx);
                         if (generator_size == 0)
-                                return log_debug_errno(SYNTHETIC_ERRNO(EIO), "Failed to convert a EC generator to octet string.");
+                                return log_openssl_errors(LOG_DEBUG, "Failed to convert a EC generator to octet string.");
 
                         ec_params[1] = sym_OSSL_PARAM_construct_utf8_string(OSSL_PKEY_PARAM_EC_FIELD_TYPE, (char*)field_type, strlen(field_type));
                         ec_params[2] = sym_OSSL_PARAM_construct_octet_string(OSSL_PKEY_PARAM_EC_GENERATOR, generator, generator_size);
@@ -658,7 +659,7 @@ int pkcs11_token_read_public_key(
                 }
 
                 if (sym_EVP_PKEY_fromdata(ctx, &pkey, EVP_PKEY_PUBLIC_KEY, ec_params) != 1)
-                        return log_debug_errno(SYNTHETIC_ERRNO(EIO), "Failed to create EVP_PKEY from EC parameters.");
+                        return log_openssl_errors(LOG_DEBUG, "Failed to create EVP_PKEY from EC parameters.");
                 break;
         }
         default:
@@ -718,7 +719,7 @@ int pkcs11_token_read_x509_certificate(
 
         _cleanup_free_ char *t = sym_X509_NAME_oneline(name, NULL, 0);
         if (!t)
-                return log_debug_errno(SYNTHETIC_ERRNO(EIO), "Failed to format X.509 subject name as string.");
+                return log_openssl_errors(LOG_DEBUG, "Failed to format X.509 subject name as string.");
 
         log_debug("Using X.509 certificate issued for '%s'.", t);
 
@@ -1043,7 +1044,7 @@ static int ecc_convert_to_compressed(
 
         compressed_point_size = sym_EC_POINT_point2oct(group, point, POINT_CONVERSION_COMPRESSED, NULL, 0, bnctx);
         if (compressed_point_size == 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to determine size of a compressed EC point");
+                return log_openssl_errors(LOG_ERR, "Failed to determine size of a compressed EC point");
 
         compressed_point = malloc(compressed_point_size);
         if (!compressed_point)
@@ -1051,7 +1052,7 @@ static int ecc_convert_to_compressed(
 
         compressed_point_size = sym_EC_POINT_point2oct(group, point, POINT_CONVERSION_COMPRESSED, compressed_point, compressed_point_size, bnctx);
         if (compressed_point_size == 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to convert a EC point to compressed format");
+                return log_openssl_errors(LOG_ERR, "Failed to convert a EC point to compressed format");
 
         *ret_compressed_point = TAKE_PTR(compressed_point);
         *ret_compressed_point_size = compressed_point_size;
@@ -1173,12 +1174,23 @@ static int pkcs11_token_decrypt_data_rsa(
                 CK_OBJECT_HANDLE object,
                 const void *encrypted_data,
                 size_t encrypted_data_size,
+                Pkcs11RsaPadding rsa_padding,
                 void **ret_decrypted_data,
                 size_t *ret_decrypted_data_size) {
 
-        static const CK_MECHANISM mechanism = {
-                 .mechanism = CKM_RSA_PKCS
+        /* For RSA-OAEP we use SHA-256 or SHA-1 with the matching MGF1 and an empty (zero-length) label.
+         * SHA-256 is preferred when the token supports it, but for example SoftHSM doesn't support it. */
+        CK_RSA_PKCS_OAEP_PARAMS oaep_params_sha1 = {
+                .hashAlg = CKM_SHA_1,
+                .mgf = CKG_MGF1_SHA1,
+                .source = CKZ_DATA_SPECIFIED,
         };
+        CK_RSA_PKCS_OAEP_PARAMS oaep_params_sha256 = {
+                .hashAlg = CKM_SHA256,
+                .mgf = CKG_MGF1_SHA256,
+                .source = CKZ_DATA_SPECIFIED,
+        };
+        CK_MECHANISM mechanism;
         _cleanup_(erase_and_freep) CK_BYTE *dbuffer = NULL;
         CK_ULONG dbuffer_size = 0;
         CK_RV rv;
@@ -1186,7 +1198,36 @@ static int pkcs11_token_decrypt_data_rsa(
         assert(ret_decrypted_data);
         assert(ret_decrypted_data_size);
 
-        rv = m->C_DecryptInit(session, (CK_MECHANISM*) &mechanism, object);
+        switch (rsa_padding) {
+
+        case PKCS11_RSA_PADDING_PKCS1V15:
+                mechanism = (CK_MECHANISM) {
+                        .mechanism = CKM_RSA_PKCS,
+                };
+                break;
+
+        case PKCS11_RSA_PADDING_OAEP_SHA1:
+                mechanism = (CK_MECHANISM) {
+                        .mechanism = CKM_RSA_PKCS_OAEP,
+                        .pParameter = &oaep_params_sha1,
+                        .ulParameterLen = sizeof(oaep_params_sha1),
+                };
+                break;
+
+        case PKCS11_RSA_PADDING_OAEP_SHA256:
+                mechanism = (CK_MECHANISM) {
+                        .mechanism = CKM_RSA_PKCS_OAEP,
+                        .pParameter = &oaep_params_sha256,
+                        .ulParameterLen = sizeof(oaep_params_sha256),
+                };
+                break;
+
+        default:
+                return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
+                                       "Unknown RSA padding scheme requested for PKCS#11 decryption.");
+        }
+
+        rv = m->C_DecryptInit(session, &mechanism, object);
         if (rv != CKR_OK)
                 return log_error_errno(SYNTHETIC_ERRNO(EIO),
                                        "Failed to initialize decryption on security token: %s", sym_p11_kit_strerror(rv));
@@ -1210,7 +1251,8 @@ static int pkcs11_token_decrypt_data_rsa(
                 return log_error_errno(SYNTHETIC_ERRNO(EIO),
                                        "Failed to decrypt key on security token: %s", sym_p11_kit_strerror(rv));
 
-        log_info("Successfully decrypted key with security token.");
+        log_info("Successfully decrypted key with security token (%s padding).",
+                 pkcs11_rsa_padding_to_string(rsa_padding));
 
         *ret_decrypted_data = TAKE_PTR(dbuffer);
         *ret_decrypted_data_size = dbuffer_size;
@@ -1223,6 +1265,7 @@ int pkcs11_token_decrypt_data(
                 CK_OBJECT_HANDLE object,
                 const void *encrypted_data,
                 size_t encrypted_data_size,
+                Pkcs11RsaPadding rsa_padding,
                 void **ret_decrypted_data,
                 size_t *ret_decrypted_data_size) {
 
@@ -1243,7 +1286,7 @@ int pkcs11_token_decrypt_data(
         switch (key_type) {
 
         case CKK_RSA:
-                return pkcs11_token_decrypt_data_rsa(m, session, object, encrypted_data, encrypted_data_size, ret_decrypted_data, ret_decrypted_data_size);
+                return pkcs11_token_decrypt_data_rsa(m, session, object, encrypted_data, encrypted_data_size, rsa_padding, ret_decrypted_data, ret_decrypted_data_size);
 
         case CKK_EC:
                 return pkcs11_token_decrypt_data_ecc(m, session, object, encrypted_data, encrypted_data_size, ret_decrypted_data, ret_decrypted_data_size);
@@ -1531,6 +1574,7 @@ int pkcs11_find_token(
 struct pkcs11_acquire_public_key_callback_data {
         char *pin_used;
         EVP_PKEY *pkey;
+        Pkcs11RsaPadding rsa_padding;
         const char *askpw_friendly_name, *askpw_icon, *askpw_credential;
         AskPasswordFlags askpw_flags;
 };
@@ -1539,6 +1583,86 @@ static void pkcs11_acquire_public_key_callback_data_release(struct pkcs11_acquir
         erase_and_free(data->pin_used);
         if (data->pkey)
                 sym_EVP_PKEY_free(data->pkey);
+}
+
+static int pkcs11_token_try_oaep_mechanism(
+                CK_FUNCTION_LIST *m,
+                CK_SESSION_HANDLE session,
+                CK_OBJECT_HANDLE private_key,
+                CK_MECHANISM_TYPE hash_alg,
+                CK_RSA_PKCS_MGF_TYPE mgf) {
+
+        CK_RSA_PKCS_OAEP_PARAMS params = {
+                .hashAlg = hash_alg,
+                .mgf = mgf,
+                .source = CKZ_DATA_SPECIFIED,
+        };
+        CK_MECHANISM mechanism = {
+                .mechanism = CKM_RSA_PKCS_OAEP,
+                .pParameter = &params,
+                .ulParameterLen = sizeof(params),
+        };
+        CK_RV rv;
+
+        rv = m->C_DecryptInit(session, &mechanism, private_key);
+        if (rv != CKR_OK)
+                return -EIO;
+
+        /* Accepted: terminate the operation. Per PKCS#11 spec section 5.2 any cryptographic function
+         * returning an error other than CKR_BUFFER_TOO_SMALL terminates the active operation, so feed
+         * deliberately invalid (too-short) ciphertext to C_Decrypt to trigger a cancellation that's
+         * likely to be portable across token implementations. */
+        CK_BYTE in[1] = {};
+        CK_BYTE out[1];
+        CK_ULONG out_len = sizeof(out);
+        (void) m->C_Decrypt(session, in, sizeof(in), out, &out_len);
+
+        return 0;
+}
+
+static int pkcs11_token_probe_rsa_oaep_padding(
+                CK_FUNCTION_LIST *m,
+                CK_SESSION_HANDLE session,
+                CK_OBJECT_HANDLE private_key,
+                Pkcs11RsaPadding *ret) {
+
+        CK_KEY_TYPE key_type;
+        CK_ATTRIBUTE key_type_template = { CKA_KEY_TYPE, &key_type, sizeof(key_type) };
+        CK_RV rv;
+        int r;
+
+        assert(m);
+        assert(ret);
+
+        /* Probes whether the token will accept the OAEP-SHA256 or OAEP-SHA1 mechanism for decryption with
+         * the given private key. On any failure (wrong key type, related-object lookup ambiguity yielded
+         * an EC private key, both mechanisms rejected, etc.) we bail out, this can only be best-effort. */
+        rv = m->C_GetAttributeValue(session, private_key, &key_type_template, /* ulCount= */ 1);
+        if (rv != CKR_OK)
+                return log_debug_errno(SYNTHETIC_ERRNO(EIO),
+                                       "Failed to retrieve private key type: %s", sym_p11_kit_strerror(rv));
+        if (key_type != CKK_RSA)
+                return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
+                                       "Located private key is not RSA, skipping OAEP padding probe.");
+
+        /* For RSA-OAEP we use SHA-256 or SHA-1 with the matching MGF1 and an empty (zero-length) label.
+         * SHA-256 is preferred when the token supports it, but for example SoftHSM doesn't support it, so
+         * fall back to SHA-1 if it gets rejected. */
+        r = pkcs11_token_try_oaep_mechanism(m, session, private_key, CKM_SHA256, CKG_MGF1_SHA256);
+        if (r >= 0) {
+                *ret = PKCS11_RSA_PADDING_OAEP_SHA256;
+                log_debug("Token accepts OAEP-SHA256 for decryption.");
+                return 0;
+        }
+
+        r = pkcs11_token_try_oaep_mechanism(m, session, private_key, CKM_SHA_1, CKG_MGF1_SHA1);
+        if (r >= 0) {
+                *ret = PKCS11_RSA_PADDING_OAEP_SHA1;
+                log_debug("Token accepts OAEP-SHA1 for decryption.");
+                return 0;
+        }
+
+        return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Token rejected both OAEP-SHA256 and OAEP-SHA1.");
 }
 
 static int pkcs11_acquire_public_key_callback(
@@ -1696,13 +1820,37 @@ static int pkcs11_acquire_public_key_callback(
 
                 pkey = sym_X509_get_pubkey(cert);
                 if (!pkey)
-                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to extract public key from X.509 certificate.");
+                        return log_openssl_errors(LOG_ERR, "Failed to extract public key from X.509 certificate.");
         }
 success:
         /* Let's read some random data off the token and write it to the kernel pool before we generate our
          * random key from it. This way we can claim the quality of the RNG is at least as good as the
          * kernel's and the token's pool */
         (void) pkcs11_token_acquire_rng(m, session);
+
+        /* Decide whether the enrolled key needs RSA padding metadata at all based on the public key we
+         * extracted (RSA vs EC). For RSA, default to OAEP-SHA1 which works on all known tokens (e.g.
+         * SoftHSM only accepts SHA-1), then try to upgrade to OAEP-SHA256 by probing the matching private
+         * key on the token. The probe is best-effort: if we cannot find the private key (e.g. token holds
+         * only the certificate, or the related-object lookup is ambiguous because CKA_ID is missing or
+         * doesn't match) we keep the OAEP-SHA1 default. For non-RSA keys (EC) we leave rsa_padding as
+         * _INVALID, so no padding tag is recorded and the decrypt path uses ECDH instead. */
+        data->rsa_padding = _PKCS11_RSA_PADDING_INVALID;
+
+        if (sym_EVP_PKEY_get_base_id(pkey) == EVP_PKEY_RSA) {
+                CK_OBJECT_HANDLE prototype = public_key != CK_INVALID_HANDLE ? public_key : certificate;
+                CK_OBJECT_HANDLE private_key = CK_INVALID_HANDLE;
+                Pkcs11RsaPadding padding = PKCS11_RSA_PADDING_OAEP_SHA1; /* default to SHA1 unless we can do better */
+
+                if (pkcs11_token_find_related_object(m, session, prototype, CKO_PRIVATE_KEY, &private_key) >= 0) {
+                        r = pkcs11_token_probe_rsa_oaep_padding(m, session, private_key, &padding);
+                        if (r < 0)
+                                log_info_errno(r, "Token rejected both OAEP-SHA256 and OAEP-SHA1, defaulting RSA enrollment to OAEP-SHA1.");
+                } else
+                        log_info("No matching PKCS#11 private key found, OAEP padding probe skipped, defaulting RSA enrollment to OAEP-SHA1.");
+
+                data->rsa_padding = padding;
+        }
 
         data->pin_used = TAKE_PTR(pin_used);
         data->pkey = TAKE_PTR(pkey);
@@ -1716,6 +1864,7 @@ int pkcs11_acquire_public_key(
                 const char *askpw_credential,
                 AskPasswordFlags askpw_flags,
                 EVP_PKEY **ret_pkey,
+                Pkcs11RsaPadding *ret_rsa_padding,
                 char **ret_pin_used) {
 
         _cleanup_(pkcs11_acquire_public_key_callback_data_release) struct pkcs11_acquire_public_key_callback_data data = {
@@ -1723,6 +1872,7 @@ int pkcs11_acquire_public_key(
                 .askpw_icon = askpw_icon,
                 .askpw_credential = askpw_credential,
                 .askpw_flags = askpw_flags,
+                .rsa_padding = _PKCS11_RSA_PADDING_INVALID,
         };
         int r;
 
@@ -1738,6 +1888,8 @@ int pkcs11_acquire_public_key(
                 return r;
 
         *ret_pkey = TAKE_PTR(data.pkey);
+        if (ret_rsa_padding)
+                *ret_rsa_padding = data.rsa_padding;
         if (ret_pin_used)
                 *ret_pin_used = TAKE_PTR(data.pin_used);
         return 0;
@@ -1807,11 +1959,9 @@ static int list_callback(
 
 int dlopen_p11kit(int log_level) {
 #if HAVE_P11KIT
-        SD_ELF_NOTE_DLOPEN(
-                        "p11-kit",
-                        "Support for PKCS11 hardware tokens",
-                        SD_ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED,
-                        "libp11-kit.so.0");
+        static void *p11kit_dl = NULL;
+
+        LIBP11KIT_NOTE(suggested);
 
         return dlopen_many_sym_or_warn(
                         &p11kit_dl,
@@ -1978,6 +2128,7 @@ int pkcs11_crypt_device_callback(
                         object,
                         data->encrypted_key,
                         data->encrypted_key_size,
+                        data->rsa_padding,
                         &data->decrypted_key,
                         &data->decrypted_key_size);
         if (r < 0)

@@ -141,27 +141,27 @@
               </row>
 
               <row>
-                <entry><constant>root-verity</constant></entry>
+                <entry><constant>root-verity</constant>, <constant>root-vty</constant></entry>
                 <entry>Verity data for the root file system partition for the local architecture</entry>
               </row>
 
               <row>
-                <entry><constant>root-verity-sig</constant></entry>
+                <entry><constant>root-verity-sig</constant>, <constant>root-vsig</constant></entry>
                 <entry>Verity signature data for the root file system partition for the local architecture</entry>
               </row>
 
               <row>
-                <entry><constant>root-secondary</constant></entry>
+                <entry><constant>root-secondary</constant>, <constant>root2</constant></entry>
                 <entry>Root file system partition of the secondary architecture of the local architecture (usually the matching 32-bit architecture for the local 64-bit architecture)</entry>
               </row>
 
               <row>
-                <entry><constant>root-secondary-verity</constant></entry>
+                <entry><constant>root-secondary-verity</constant>, <constant>root-vty2</constant></entry>
                 <entry>Verity data for the root file system partition of the secondary architecture</entry>
               </row>
 
               <row>
-                <entry><constant>root-secondary-verity-sig</constant></entry>
+                <entry><constant>root-secondary-verity-sig</constant>, <constant>root-vsig2</constant></entry>
                 <entry>Verity signature data for the root file system partition of the secondary architecture</entry>
               </row>
 
@@ -171,12 +171,12 @@
               </row>
 
               <row>
-                <entry><constant>root-{arch}-verity</constant></entry>
+                <entry><constant>root-{arch}-verity</constant>, <constant>root-{arch}-vty</constant></entry>
                 <entry>Verity data for the root file system partition of the given architecture</entry>
               </row>
 
               <row>
-                <entry><constant>root-{arch}-verity-sig</constant></entry>
+                <entry><constant>root-{arch}-verity-sig</constant>, <constant>root-{arch}-vsig</constant></entry>
                 <entry>Verity signature data for the root file system partition of the given architecture</entry>
               </row>
 
@@ -186,27 +186,27 @@
               </row>
 
               <row>
-                <entry><constant>usr-verity</constant></entry>
+                <entry><constant>usr-verity</constant>, <constant>usr-vty</constant></entry>
                 <entry>Verity data for the <filename>/usr/</filename> file system partition for the local architecture</entry>
               </row>
 
               <row>
-                <entry><constant>usr-verity-sig</constant></entry>
+                <entry><constant>usr-verity-sig</constant>, <constant>usr-vsig</constant></entry>
                 <entry>Verity signature data for the <filename>/usr/</filename> file system partition for the local architecture</entry>
               </row>
 
               <row>
-                <entry><constant>usr-secondary</constant></entry>
+                <entry><constant>usr-secondary</constant>, <constant>usr2</constant></entry>
                 <entry><filename>/usr/</filename> file system partition of the secondary architecture of the local architecture (usually the matching 32-bit architecture for the local 64-bit architecture)</entry>
               </row>
 
               <row>
-                <entry><constant>usr-secondary-verity</constant></entry>
+                <entry><constant>usr-secondary-verity</constant>, <constant>usr-vty2</constant></entry>
                 <entry>Verity data for the <filename>/usr/</filename> file system partition of the secondary architecture</entry>
               </row>
 
               <row>
-                <entry><constant>usr-secondary-verity-sig</constant></entry>
+                <entry><constant>usr-secondary-verity-sig</constant>, <constant>usr-vsig2</constant></entry>
                 <entry>Verity signature data for the <filename>/usr/</filename> file system partition of the secondary architecture</entry>
               </row>
 
@@ -216,12 +216,12 @@
               </row>
 
               <row>
-                <entry><constant>usr-{arch}-verity</constant></entry>
+                <entry><constant>usr-{arch}-verity</constant>, <constant>usr-{arch}-vty</constant></entry>
                 <entry>Verity data for the <filename>/usr/</filename> file system partition of the given architecture</entry>
               </row>
 
               <row>
-                <entry><constant>usr-{arch}-verity-sig</constant></entry>
+                <entry><constant>usr-{arch}-verity-sig</constant>, <constant>usr-{arch}-vsig</constant></entry>
                 <entry>Verity signature data for the <filename>/usr/</filename> file system partition of the given architecture</entry>
               </row>
             </tbody>
@@ -237,6 +237,23 @@
         <constant>s390</constant>, <constant>s390x</constant>, <constant>tilegx</constant>,
         <constant>x86</constant> (32-bit, aka i386) and <constant>x86-64</constant> (64-bit, aka amd64).</para>
 
+        <para>In partition type identifiers, <constant>-vty</constant> stands for
+        <constant>-verity</constant>, <constant>-vsig</constant> stands for <constant>-verity-sig</constant>,
+        and a <constant>2</constant> suffix stands for <constant>-secondary</constant>. For example,
+        <constant>usr-vsig2</constant> is the same partition type as
+        <constant>usr-secondary-verity-sig</constant>. The partition identifiers in
+        <citerefentry><refentrytitle>systemd.image-policy</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+        and
+        <citerefentry><refentrytitle>systemd.image-filter</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+        accept the same abbreviations.</para>
+
+        <para>GPT limits partition labels to 36 characters. Use an abbreviated identifier in
+        <varname>Label=</varname> to leave more room for a version string, for example
+        <literal>usr-x86-64-vsig_1.2.3</literal>. The label that
+        <citerefentry><refentrytitle>systemd-repart</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+        derives from the partition type when <varname>Label=</varname> is not set uses the long spelling.
+        <command>systemd-repart</command> always shows partition types with the long spelling.</para>
+
         <para>Most of the partition type UUIDs listed above are defined in the <ulink
         url="https://uapi-group.org/specifications/specs/discoverable_partitions_specification">UAPI.2 Discoverable Partitions
         Specification</ulink>.</para>
@@ -249,7 +266,7 @@
 
         <listitem><para>The textual label to assign to the partition if none is assigned yet. Note that this
         setting is not used for matching. It is also not used when a label is already set for an existing
-        partition. It is thus only used when a partition is newly created or when an existing one had a no
+        partition. It is thus only used when a partition is newly created or when an existing one had no
         label set (that is: an empty label). If not specified, a label derived from the partition type is
         automatically used. Simple specifier expansion is supported, see below.</para>
 
@@ -509,6 +526,23 @@
         <para>Note that when <varname>CopyFiles=</varname> is used with <varname>Format=xfs</varname>,
         <command>xfsprogs</command> 6.17 or newer is required.</para>
 
+        <para>Note that <command>systemd-repart</command> always excludes the contents of a number of API
+        file systems and temporary directories, namely <filename>/proc/</filename>, <filename>/sys/</filename>,
+        <filename>/dev/</filename>, <filename>/tmp/</filename>, <filename>/run/</filename>, and
+        <filename>/var/tmp/</filename>, as their contents are not expected to be part of a disk image. The
+        directories themselves are still created (empty) in the new file system.</para>
+
+        <para>When a root partition is populated, the contents below the mount points of any other
+        partitions that are part of the same image are excluded too, so that data belonging to a separate
+        partition is not duplicated into the root file system. For example, if an <constant>esp</constant>
+        partition is part of the image, the contents of <filename>/boot/</filename> and
+        <filename>/efi/</filename> are not copied into the root partition.</para>
+
+        <para>To copy a directory that is excluded by the mount-point rule above, add an explicit
+        <varname>CopyFiles=</varname> entry for it. For example, <literal>CopyFiles=/boot:/boot</literal>
+        overrides the implicit exclusion and copies <filename>/boot/</filename> into the root
+        partition.</para>
+
         <xi:include href="version-info.xml" xpointer="v247"/></listitem>
       </varlistentry>
 
@@ -653,6 +687,39 @@
       </varlistentry>
 
       <varlistentry>
+        <term><varname>BlockDeviceReplace=</varname></term>
+
+        <listitem><para>Takes a path to a mountpoint. Its filesystem's backing device will be replaced
+        with the newly created partition. This works only for btrfs filesystems. This option is ignored for already existing partitions.</para>
+
+        <para>If after moving the filesystem, an error happens before the writing of the partition table is
+        finished, there will be an attempt to move the filesystem back to its original device. But if that
+        attempt also fails, the filesystem might be living on a partition that does not exist in the
+        partition table and will be lost on reboot. This feature is intended to save initially volatile
+        mounted filesystems into the new disk with no important data, like a live boot system. They might
+        need to be recreated after a failure writing the partition table.</para>
+
+        <para>This option is not compatible with <option>--offline=yes</option>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v261"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>VolumeName=</varname></term>
+
+        <listitem><para>If an encrypted partition is created through <varname>Encrypt=</varname>, and it will
+        stay activated after <command>systemd-repart</command> is done (using
+        <varname>BlockDeviceReplace=</varname>), then the name of the device mapper volume created will use
+        the name specified by <varname>VolumeName=</varname>.</para>
+
+        <para>The value must be a valid filename. If not specified, it will default to the value of
+        <varname>VolumeLabel=</varname> (which could be derived from <varname>Label=</varname>) if
+        valid.</para>
+
+        <xi:include href="version-info.xml" xpointer="v261"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><varname>Encrypt=</varname></term>
 
         <listitem><para>Takes one of <literal>off</literal>, <literal>key-file</literal>,
@@ -675,6 +742,10 @@
         for the LUKS2 superblock (see above).</para>
 
         <para>This option has no effect if the partition already exists.</para>
+
+        <para>This option may be combined with <varname>Verity=data</varname> in order to place the
+        encrypted partition inside a dm-verity protection envelope, see the description of
+        <varname>Verity=</varname> below.</para>
 
         <xi:include href="version-info.xml" xpointer="v247"/></listitem>
       </varlistentry>
@@ -720,6 +791,59 @@
       </varlistentry>
 
       <varlistentry>
+        <term><varname>EncryptAddToken=</varname></term>
+
+        <listitem><para>Registers a custom LUKS2 token in the partition's LUKS2 header at provisioning
+        time. This option may be specified more than once to register multiple tokens. Each invocation adds
+        one token entry. Assigning the empty string clears all previously assigned tokens.</para>
+
+        <para>The syntax is:</para>
+        <programlisting>EncryptAddToken=<replaceable>type</replaceable>[:<replaceable>source</replaceable>:<replaceable>value</replaceable>]</programlisting>
+
+        <para>The <replaceable>type</replaceable> field is mandatory and specifies the LUKS2 token type
+        name (e.g. <literal>tdx-kbs</literal>). It must be a valid filename component (no
+        <literal>/</literal>, no <literal>.</literal> or <literal>..</literal>) and corresponds to the
+        name of the token handler plugin installed as
+        <filename>libcryptsetup-token-<replaceable>type</replaceable>.so</filename>.</para>
+
+        <para>The optional <replaceable>source</replaceable> and <replaceable>value</replaceable> fields
+        supply token-plugin-specific metadata as a JSON object. Two sources are supported:</para>
+
+        <variablelist>
+          <varlistentry>
+            <term><literal>file</literal></term>
+            <listitem><para>The <replaceable>value</replaceable> is a path to a file containing a JSON
+            object with the extra token metadata. Example:</para>
+            <programlisting>EncryptAddToken=tdx-kbs:file:/etc/repart/tdx-kbs-token.json</programlisting>
+            <xi:include href="version-info.xml" xpointer="v262"/></listitem>
+          </varlistentry>
+
+          <varlistentry>
+            <term><literal>data</literal></term>
+            <listitem><para>The <replaceable>value</replaceable> is a Base64-encoded JSON object with the
+            extra token metadata, suitable for embedding directly in the configuration file. Example:</para>
+            <programlisting>EncryptAddToken=tdx-kbs:data:eyJ0cnVzdGVlLmticy51cmwiOiJodHRwOi8va2JzLXNlcnZpY2U6ODA4MCJ9</programlisting>
+            <xi:include href="version-info.xml" xpointer="v262"/></listitem>
+          </varlistentry>
+        </variablelist>
+
+        <para>The extra metadata object must not contain <literal>type</literal> or
+        <literal>keyslots</literal> fields — these are always set by
+        <command>systemd-repart</command>: <literal>type</literal> is taken from the
+        <replaceable>type</replaceable> argument, and <literal>keyslots</literal> is set to the keyslot
+        number created for this partition.</para>
+
+        <para>This option is supported with all <varname>Encrypt=</varname> modes except
+        <literal>off</literal>. When used with <literal>key-file+tpm2</literal>, the token is bound to the
+        key-file keyslot. When used with <literal>tpm2</literal>, the token is bound to the TPM2
+        keyslot.</para>
+
+        <para>This option has no effect if the partition already exists.</para>
+
+        <xi:include href="version-info.xml" xpointer="v262"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><varname>Verity=</varname></term>
 
         <listitem><para>Takes one of <literal>off</literal>, <literal>data</literal>,
@@ -740,7 +864,19 @@
 
         <para>This option has no effect if the partition already exists.</para>
 
-        <para>Usage of this option in combination with <varname>Encrypt=</varname> is not supported.</para>
+        <para><literal>data</literal> may be combined with <varname>Encrypt=</varname>, in which case the
+        partition is first encrypted with LUKS2 and the verity hash data is then generated from the
+        resulting ciphertext, i.e. Verity is the outer protection envelope and LUKS2 the inner. Tools such
+        as <citerefentry><refentrytitle>systemd-dissect</refentrytitle><manvolnum>1</manvolnum></citerefentry>
+        will then set up the dm-verity device first, and open the LUKS2 volume on top of it, so that all
+        encrypted data read is also authenticated via the verity root hash. Note that in this case the
+        verity hashes necessarily cover freshly generated ciphertext, hence the root hash (and thus the
+        default partition UUIDs derived from it) will change on every build, even if the plaintext contents
+        are fully reproducible. <varname>Encrypt=</varname> may not be combined with
+        <literal>Verity=hash</literal> or <literal>Verity=signature</literal>. Since the ciphertext is only
+        generated while the final image is built, <varname>Minimize=</varname> cannot be used for the hash
+        partition of an encrypted data partition; use <varname>SizeMaxBytes=</varname> on the data partition
+        to size the hash partition instead.</para>
 
         <para>For each unique <varname>VerityMatchKey=</varname> value, a single verity data partition
         (<literal>Verity=data</literal>) and a single verity hash partition (<literal>Verity=hash</literal>)
@@ -1143,8 +1279,8 @@
     <title>Specifiers</title>
 
     <para>Specifiers may be used in the <varname>Label=</varname>, <varname>CopyBlocks=</varname>,
-    <varname>CopyFiles=</varname>, <varname>MakeDirectories=</varname>, <varname>SplitName=</varname>
-    settings. The following expansions are understood:</para>
+    <varname>CopyFiles=</varname>, <varname>MakeDirectories=</varname>, <varname>MakeSymlinks=</varname>,
+    <varname>SplitName=</varname> settings. The following expansions are understood:</para>
       <table class='specifiers'>
         <title>Specifiers available</title>
         <tgroup cols='3' align='left' colsep='1' rowsep='1'>

@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "basic-forward.h"
+#include "forward.h"
 
 typedef enum Virtualization {
         VIRTUALIZATION_NONE = 0,
@@ -64,3 +64,4 @@ int running_in_chroot(void);
 
 DECLARE_STRING_TABLE_LOOKUP(virtualization, Virtualization);
 bool has_cpu_with_flag(const char *flag);
+int cpu_known_features(char ***ret);

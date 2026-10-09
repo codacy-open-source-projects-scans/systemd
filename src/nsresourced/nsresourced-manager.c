@@ -5,7 +5,7 @@
 
 #include "sd-daemon.h"
 
-#include "bpf-dlopen.h"
+#include "bpf-util.h"
 #if HAVE_VMLINUX_H
 #include "bpf-link.h"
 #include "userns-restrict-skel.h"
@@ -13,12 +13,14 @@
 #include "build-path.h"
 #include "common-signal.h"
 #include "env-util.h"
+#include "errno-util.h"
 #include "event-util.h"
 #include "fd-util.h"
 #include "format-util.h"
 #include "fs-util.h"
 #include "log.h"
 #include "mkdir.h"
+#include "namespace-util.h"
 #include "nsresourced-manager.h"
 #include "parse-util.h"
 #include "pidfd-util.h"
@@ -31,11 +33,12 @@
 #include "string-util.h"
 #include "strv.h"
 #include "time-util.h"
+#include "uid-classification.h"
 #include "umask-util.h"
 #include "unaligned.h"
-#include "user-util.h"
 #include "userns-registry.h"
 #include "userns-restrict.h"
+#include "xattr-util.h"
 
 #define LISTEN_TIMEOUT_USEC (25 * USEC_PER_SEC)
 
@@ -132,6 +135,16 @@ int manager_new(Manager **ret) {
         return 0;
 }
 
+#if HAVE_VMLINUX_H
+static void manager_unload_bpf(Manager *m) {
+        assert(m);
+
+        m->userns_restrict_bpf_ring_buffer_event_source = sd_event_source_disable_unref(m->userns_restrict_bpf_ring_buffer_event_source);
+        m->userns_restrict_bpf_ring_buffer = bpf_ring_buffer_free(m->userns_restrict_bpf_ring_buffer);
+        m->userns_restrict_bpf = userns_restrict_bpf_free(m->userns_restrict_bpf);
+}
+#endif
+
 Manager* manager_free(Manager *m) {
         if (!m)
                 return NULL;
@@ -144,9 +157,7 @@ Manager* manager_free(Manager *m) {
         safe_close(m->listen_fd);
 
 #if HAVE_VMLINUX_H
-        sd_event_source_disable_unref(m->userns_restrict_bpf_ring_buffer_event_source);
-        bpf_ring_buffer_free(m->userns_restrict_bpf_ring_buffer);
-        userns_restrict_bpf_free(m->userns_restrict_bpf);
+        manager_unload_bpf(m);
 #endif
 
         safe_close(m->registry_fd);
@@ -290,7 +301,7 @@ static int start_workers(Manager *m, bool explicit_request) {
                                 r = sd_event_add_time(
                                                 m->event,
                                                 &m->deferred_start_worker_event_source,
-                                                CLOCK_MONOTONIC,
+                                                CLOCK_BOOTTIME,
                                                 ratelimit_end(&m->worker_ratelimit),
                                                 /* accuracy= */ 0,
                                                 on_deferred_start_worker,
@@ -312,81 +323,106 @@ static int start_workers(Manager *m, bool explicit_request) {
         return 0;
 }
 
-static void manager_release_userns_bpf(Manager *m, uint64_t inode) {
-#if HAVE_VMLINUX_H
-        int r;
-
+static struct userns_restrict_bpf *manager_bpf(Manager *m) {
         assert(m);
 
-        if (inode == 0)
-                return;
-
-        assert(m->userns_restrict_bpf);
-
-        r = userns_restrict_reset_by_inode(m->userns_restrict_bpf, inode);
-        if (r < 0)
-                return (void) log_warning_errno(r, "Failed to remove namespace inode from BPF map, ignoring: %m");
+#if HAVE_VMLINUX_H
+        return m->userns_restrict_bpf;
+#else
+        return NULL;
 #endif
 }
 
-static void manager_release_userns_fds(Manager *m, uint64_t inode) {
-        int r;
-
+/* Releases the resources tied to a user namespace described by info. The caller must hold the
+ * registry lock if there is any chance of a concurrent writer (i.e. workers — true once the listen
+ * socket is open; not true during manager_startup() before that point). */
+static void manager_release_userns_by_info(Manager *m, UserNamespaceInfo *info) {
         assert(m);
-        assert(inode != 0);
+        assert(info);
+        assert(info->userns_inode != 0);
 
-        r = sd_notifyf(/* unset_environment= */ false,
-                       "FDSTOREREMOVE=1\n"
-                       "FDNAME=userns-%" PRIu64 "\n", inode);
-        if (r < 0)
-                log_warning_errno(r, "Failed to send fd store removal message, ignoring: %m");
+        /* Before tearing anything down, confirm by namespace id that the namespace we're releasing is
+         * actually dead. The kernel may have recycled this inode for a freshly created live namespace
+         * (e.g. between a BPF death event firing and us getting here); proceeding in that case would
+         * clobber the new namespace's BPF allowlist, fdstore fd and registry entry. */
+        if (info->userns_id != 0) {
+                _cleanup_close_ int probe_fd = namespace_open_by_id(info->userns_id);
+                if (probe_fd >= 0) {
+                        log_warning("Refusing to release user namespace %" PRIu64 " (id %" PRIu64 "): the namespace is still alive.",
+                                    info->userns_inode, info->userns_id);
+                        return;
+                }
+                if (probe_fd != -ESTALE &&
+                    !ERRNO_IS_NEG_PRIVILEGE(probe_fd) &&
+                    !ERRNO_IS_NEG_NOT_SUPPORTED(probe_fd))
+                        log_warning_errno(probe_fd,
+                                          "Failed to probe liveness of user namespace %" PRIu64 " (id %" PRIu64 "), proceeding with release: %m",
+                                          info->userns_inode, info->userns_id);
+        }
+
+        userns_registry_release_by_info(manager_bpf(m), m->registry_fd, info);
 }
 
 static void manager_release_userns_by_inode(Manager *m, uint64_t inode) {
         _cleanup_(userns_info_freep) UserNamespaceInfo *userns_info = NULL;
-        _cleanup_close_ int lock_fd = -EBADF;
         int r;
 
         assert(m);
         assert(inode != 0);
 
-        lock_fd = userns_registry_lock(m->registry_fd);
-        if (lock_fd < 0)
-                return (void) log_error_errno(lock_fd, "Failed to lock registry: %m");
-
         r = userns_registry_load_by_userns_inode(m->registry_fd, inode, &userns_info);
-        if (r < 0)
-                log_full_errno(r == -ENOENT ? LOG_DEBUG : LOG_WARNING, r,
-                               "Failed to find userns for inode %" PRIu64 ", ignoring: %m", inode);
+        if (r >= 0)
+                return manager_release_userns_by_info(m, userns_info);
 
-        if (DEBUG_LOGGING) {
-                if (userns_info && uid_is_valid(userns_info->start_uid))
-                        log_debug("Removing user namespace mapping %" PRIu64 " for UID " UID_FMT ".", inode, userns_info->start_uid);
-                else
-                        log_debug("Removing user namespace mapping %" PRIu64 ".", inode);
+        /* No registry entry to consult — fall through to inode-only cleanup of kernel resources. */
+        log_full_errno(r == -ENOENT ? LOG_DEBUG : LOG_WARNING, r,
+                       "Failed to load registry entry for user namespace %" PRIu64 ", proceeding with inode-only cleanup: %m", inode);
+        userns_registry_release_by_userns_inode(manager_bpf(m), m->registry_fd, inode);
+}
+
+/* Re-adds a registered, still-alive user namespace to the BPF maps. This is idempotent when the pinned
+ * maps already carry the entry (the common restart case), and load-bearing after an nsresourced upgrade
+ * that had to replace the pinned maps because their schema changed: the new maps come up empty, so
+ * without this the namespaces still alive from before the upgrade would silently lose their write
+ * restriction (and, for "self" allocations, their setgroups() denial). */
+/* Borrows the registry entry if the caller already has it at hand, and loads its own copy otherwise. */
+static void manager_restore_userns_policy(Manager *m, uint64_t inode, UserNamespaceInfo *info) {
+        _cleanup_(userns_info_freep) UserNamespaceInfo *loaded = NULL;
+        struct userns_restrict_bpf *bpf;
+        int r;
+
+        assert(m);
+        assert(inode != 0);
+
+        bpf = manager_bpf(m);
+        if (!bpf) /* BPF disabled at build time or its setup failed — nothing to restore. */
+                return;
+
+        if (!info) {
+                r = userns_registry_load_by_userns_inode(m->registry_fd, inode, &loaded);
+                if (r < 0)
+                        return (void) log_debug_errno(r, "Failed to load registry entry for user namespace %" PRIu64 " while restoring BPF policy, ignoring: %m", inode);
+
+                info = loaded;
         }
 
-        /* Remove the BPF rules */
-        manager_release_userns_bpf(m, inode);
+        r = userns_restrict_register_by_inode(bpf, inode);
+        if (r < 0)
+                return (void) log_debug_errno(r, "Failed to restore write restriction for user namespace %" PRIu64 ", ignoring: %m", inode);
 
-        /* Remove the resources from the fdstore */
-        manager_release_userns_fds(m, inode);
+        /* Entries written before we recorded this carry no answer, and those are precisely the entries an
+         * upgrade finds. Fall back to what the flag mirrors: a "self" allocation maps the caller's own UID
+         * instead of a transient range, so it is the one whose start UID is its owner and outside the
+         * ranges we hand out. Without that last condition a managed size-1 allocation that happened to be
+         * given its own caller's UID would be mistaken for one, and we would deny setgroups() on a
+         * namespace that never had it denied. */
+        bool deny = info->setgroups_deny >= 0 ? info->setgroups_deny :
+                (info->size == 1 && info->start_uid == info->owner && !uid_is_transient(info->start_uid));
 
-        /* And finally remove the resources file from disk */
-        if (userns_info) {
-                /* Remove the cgroups of this userns */
-                r = userns_info_remove_cgroups(userns_info);
+        if (deny) {
+                r = userns_restrict_setgroups_deny_by_inode(bpf, inode);
                 if (r < 0)
-                        log_warning_errno(r, "Failed to remove cgroups of user namespace, ignoring: %m");
-
-                /* Remove the netifs of this userns */
-                r = userns_info_remove_netifs(userns_info);
-                if (r < 0)
-                        log_warning_errno(r, "Failed to remove netifs of user namespace, ignoring: %m");
-
-                r = userns_registry_remove(m->registry_fd, userns_info);
-                if (r < 0)
-                        log_warning_errno(r, "Failed to remove user namespace '%s', ignoring.", userns_info->name);
+                        log_debug_errno(r, "Failed to restore setgroups() denial for user namespace %" PRIu64 ", ignoring: %m", inode);
         }
 }
 
@@ -470,6 +506,16 @@ static int manager_make_listen_socket(Manager *m) {
         if (r < 0)
                 return log_error_errno(r, "Failed to symlink userdb socket: %m");
 
+        /* Reduce the noise routed to us: advertise that only look-ups for the higher UID range */
+        char text[2 * (DECIMAL_STR_MAX(uid_t) + 1 + DECIMAL_STR_MAX(uid_t) + 1)];
+        xsprintf(text, UID_FMT "-" UID_FMT "," UID_FMT "-" UID_FMT,
+                 CONTAINER_UID_MIN, CONTAINER_UID_MAX,
+                 (uid_t) DYNAMIC_UID_MIN, (uid_t) DYNAMIC_UID_MAX);
+        FOREACH_STRING(xattr, "user.userdb.uid", "user.userdb.gid")
+                (void) xsetxattr(AT_FDCWD, sockaddr.un.sun_path, /* at_flags= */ 0, xattr, text);
+        (void) xsetxattr(AT_FDCWD, sockaddr.un.sun_path, /* at_flags= */ 0, "user.userdb.username", "ns-*");
+        (void) xsetxattr(AT_FDCWD, sockaddr.un.sun_path, /* at_flags= */ 0, "user.userdb.groupname", "ns-*");
+
         if (listen(m->listen_fd, SOMAXCONN) < 0)
                 return log_error_errno(errno, "Failed to listen on socket: %m");
 
@@ -539,6 +585,13 @@ static int ringbuf_event(void *userdata, void *data, size_t size) {
         if ((size % sizeof(unsigned)) != 0) /* Not multiples of "unsigned"? */
                 return -EIO;
 
+        /* Workers are active alongside us once we're processing BPF events, so we have to serialize
+         * registry mutations against them. The startup-time release callers run before any worker
+         * exists and skip the lock. */
+        _cleanup_close_ int lock_fd = userns_registry_lock(m->registry_fd);
+        if (lock_fd < 0)
+                return log_error_errno(lock_fd, "Failed to lock registry: %m");
+
         n = size / sizeof(unsigned);
         for (size_t i = 0; i < n; i++) {
                 const void *d;
@@ -603,10 +656,32 @@ static int manager_setup_bpf(Manager *m) {
 
         return 0;
 }
+
+/* Puts the programs loaded by manager_setup_bpf() in effect. Deliberately separate, so that the maps are
+ * already seeded from the registry by the time the first hook runs. */
+static void manager_attach_bpf(Manager *m) {
+        int r;
+
+        assert(m);
+
+        if (!m->userns_restrict_bpf) /* Setup failed earlier, and we already told the user. */
+                return;
+
+        /* Some kernels can load BPF-LSM programs but not attach them, e.g. arm64 before 7.2. Handle this
+         * like a failed setup. */
+        r = userns_restrict_attach(m->userns_restrict_bpf, /* pin= */ true);
+        if (r < 0) {
+                log_notice_errno(r, "Proceeding with user namespace interfaces disabled.");
+                manager_unload_bpf(m);
+        }
+}
 #else
 static int manager_setup_bpf(Manager *m) {
         log_notice("Not setting up BPF subsystem, as functionality has been disabled at compile time.");
         return 0;
+}
+
+static void manager_attach_bpf(Manager *m) {
 }
 #endif
 
@@ -647,6 +722,53 @@ int manager_startup(Manager *m) {
                 log_debug("Found stale fd store entry for user namespace %" PRIu64 ", removing.", inode);
                 manager_release_userns_by_inode(m, inode);
         }
+
+        /* Walk the registry entries for two purposes: reap the dead ones, and re-establish the
+         * BPF-LSM policy for the live ones.
+         *
+         * A namespace may have died without us getting a BPF notification — e.g. because the BPF ring
+         * buffer overflowed, the kprobe is missing, or something else dropped the fd store entry without
+         * going through our cleanup path. Each registry entry stores the kernel's unique namespace
+         * identifier; ask the kernel to open the namespace by that identifier and release the entry if
+         * the lookup fails. Entries written by older versions don't carry the identifier, and old kernels
+         * (or running outside the initial user namespace) don't support lookup by it — in those cases we
+         * leave the entry alone.
+         *
+         * Everything that isn't reaped is (re-)added to the BPF maps. Normally the pinned maps already
+         * carry these entries and the update is a no-op, but after an upgrade that replaced the pinned
+         * maps with an incompatible schema the new maps start empty, and this is what keeps namespaces
+         * that predate the upgrade protected. */
+
+        bool can_probe = true;
+        SET_FOREACH(p, registry_inodes) {
+                _cleanup_(userns_info_freep) UserNamespaceInfo *info = NULL;
+                uint64_t inode = PTR_TO_UINT32(p);
+
+                if (can_probe) {
+                        r = userns_registry_reap_if_dead(manager_bpf(m), m->registry_fd, inode, &info);
+                        if (r < 0)
+                                log_debug_errno(r, "Failed to probe liveness of user namespace %" PRIu64 ", assuming alive: %m", inode);
+                        else if (r == USERNS_REAP_RELEASED)
+                                continue; /* Dead and released — nothing to restore. */
+                        else if (r == USERNS_REAP_UNSUPPORTED) {
+                                /* Can't look namespaces up by id at all here (old kernel, or not in the
+                                 * initial user namespace). Stop probing (and logging) once per entry, but
+                                 * still restore the policy for this and the remaining entries below. */
+                                log_debug("Cannot detect stale registry entries, restoring the rest unconditionally.");
+                                can_probe = false;
+                        }
+                        /* USERNS_REAP_ALIVE or _INDETERMINATE fall through to the restore below. */
+                }
+
+                /* Re-establish the BPF-LSM policy for the still-live namespace. Idempotent when the pinned
+                 * maps already carry it, essential after an upgrade replaced them with empty ones. */
+                manager_restore_userns_policy(m, inode, info);
+        }
+
+        /* The maps now describe every namespace we are responsible for, so the policy can go into
+         * effect. Until this point the previous version's programs, if any, were still attached and
+         * enforcing, so no namespace was ever left unguarded. */
+        manager_attach_bpf(m);
 
         r = manager_make_listen_socket(m);
         if (r < 0)

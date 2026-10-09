@@ -50,22 +50,43 @@ See [reporting of security vulnerabilities](https://systemd.io/SECURITY).
 * Github will automatically add the `please-review` label when a pull request is opened or updated.
   If you need more information after a review, you can comment `/please-review` on the pull request to have Github add the `please-review` label to the pull request.
 
-## Using AI Code Generators
+## Policy on the use of Large Language Models (LLMs) and AI tooling
 
-If you use an AI code generator such as ChatGPT, Claude, Copilot, Llama or a similar tool, this must be
-disclosed in the commit messages by adding e.g. `Co-developed-by: Claude Opus 4.6 <noreply@anthropic.com>`
-and pull request description.
+You may use generative AI and LLM tools ("AI") to help create
+contributions, as long as you review and edit what they produce so it
+follows the project guidelines.
 
-The quality bar for contributions to this project is high, and unlikely to be met by an unattended AI tool,
-without significant manual corrections. Always thoroughly review and correct any such outputs, for example
-ensuring it accurately follows [Coding Style](https://systemd.io/CODING_STYLE) at the very minimum. Please do
-not fire-and-forget pull requests without any human intervention and review, as that will likely result in
-low-quality results that will not be accepted, and if done repeatedly, may result in the account being
-blocked. As with any other submissions, authors are responsible for doing due diligence and ensuring their
-submissions are compatible with the project's license as documented in LICENSES/README.md.
+1. **You are the author.** You must be able to explain every part of your
+   contribution and why it was done that way, and you own the code like
+   any other code you wrote. Do not list AI tools as author or co-author,
+   or credit them in any way that suggests ownership.
 
-As a guideline, if someone notices that a contribution (code, issues, comments) was made with the help of AI,
-there was likely a lack of human review of the AI generated output.
+2. **You must understand what you contribute.** Do not submit AI-generated
+   code that you do not understand. If you cannot explain the code you
+   contributed, your contribution will not be merged and any further pull
+   requests will likely not get reviewed.
+
+3. **You must speak for yourself.** Do not let an AI agent open pull
+   requests or post for you. Write issues, review comments, and posts to
+   the [systemd-devel mailing list](https://lists.freedesktop.org/mailman/listinfo/systemd-devel)
+   yourself.
+
+   You may use AI to help write commit messages, code comments, and pull
+   request descriptions, but you must review and edit the result so it
+   matches the style of existing commits and pull requests. A pull request
+   description briefly explains what the change does and why. Avoid the
+   "AI voice": unusual metaphors, filler, headings and bullet lists for a
+   simple change, file-by-file summaries that restate the diff, and
+   excessive detail about unimportant things.
+
+   The first time maintainers find that you let AI communicate for you, or
+   that you posted AI-written text without reviewing it, you get a
+   warning. The second time, you are banned from the project.
+
+4. **You are responsible for licensing.** Make sure your contribution,
+   including any AI-generated code, is compatible with the project's
+   license as documented in
+   [`LICENSES/README.md`](https://github.com/systemd/systemd/blob/main/LICENSES/README.md).
 
 ## Reviewing Pull Requests
 
@@ -78,6 +99,8 @@ there was likely a lack of human review of the AI generated output.
   * `needs-rebase` if the pull request needs a rebase because of conflicts
   * `good-to-merge/waiting-for-ci` if the pull request should be merged without further review
   * `good-to-merge/with-minor-suggestions` if the pull request should be merged after an update without going through another round of reviews
+
+  See [GitHub Labels](https://systemd.io/LABELS) for a description of all labels.
 
 Unfortunately only members of the `systemd` organization on github can change labels.
 If your pull request is mislabeled, make a comment in the pull request and somebody will fix it.

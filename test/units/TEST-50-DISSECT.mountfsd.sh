@@ -14,7 +14,7 @@ if [[ ! -f /usr/lib/systemd/system/systemd-mountfsd.socket ]] ||
    systemd-analyze compare-versions "$(uname -r)" lt 6.5 ||
    systemd-analyze compare-versions "$(pkcheck --version | awk '{print $3}')" lt 124; then
     echo "Skipping mountfsd/nsresourced tests"
-    exit 0
+    exit 77
 fi
 
 at_exit() {
@@ -175,13 +175,13 @@ EOF
     systemd-run -M testuser@ --user --pipe --wait \
         --property RootImage="$MINIMAL_IMAGE.gpt" \
         --property RootImageOptions="root:nosuid" \
-        sh -c "test -e \"/dev/mapper/${MINIMAL_IMAGE_ROOTHASH}-verity\" && mount | grep -F squashfs | grep -q -F nosuid"
+        sh -c "test -e \"/dev/mapper/${MINIMAL_IMAGE_ROOTHASH}-verity\" && mount | grep -F squashfs | grep -F nosuid >/dev/null"
 
     systemd-run -M testuser@ --user --pipe --wait \
         --property RootImage="$MINIMAL_IMAGE.raw" \
         --property ExtensionImages=/tmp/app0.raw \
         --property MountImages=/tmp/app0.raw:/var/tmp:nosuid \
-        sh -c "test -e \"/dev/mapper/${MINIMAL_IMAGE_ROOTHASH}-verity\" && test -e \"/dev/mapper/$(</tmp/app0.roothash)-verity\" && mount | grep -F /var/tmp | grep -q -F nosuid"
+        sh -c "test -e \"/dev/mapper/${MINIMAL_IMAGE_ROOTHASH}-verity\" && test -e \"/dev/mapper/$(</tmp/app0.roothash)-verity\" && mount | grep -F /var/tmp | grep -F nosuid >/dev/null"
 
     rm -f /etc/polkit-1/rules.d/mountoptions.rules
     systemctl try-reload-or-restart polkit.service

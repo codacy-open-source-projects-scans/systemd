@@ -81,7 +81,7 @@
       <arg choice="opt" rep="repeat">OPTIONS</arg>
       <arg choice="plain">unit-shell</arg>
       <arg choice="plain"><replaceable>SERVICE</replaceable></arg>
-      <arg choice="opt" rep="repeat"><replaceable>Command</replaceable></arg>
+      <arg choice="opt" rep="repeat"><replaceable>COMMAND</replaceable></arg>
     </cmdsynopsis>
     <cmdsynopsis>
       <command>systemd-analyze</command>
@@ -227,6 +227,12 @@
     <cmdsynopsis>
       <command>systemd-analyze</command>
       <arg choice="opt" rep="repeat">OPTIONS</arg>
+      <arg choice="plain">cpu-features</arg>
+      <arg choice="opt" rep="repeat"><replaceable>NAME</replaceable></arg>
+    </cmdsynopsis>
+    <cmdsynopsis>
+      <command>systemd-analyze</command>
+      <arg choice="opt" rep="repeat">OPTIONS</arg>
       <arg choice="plain">smbios11</arg>
     </cmdsynopsis>
     <cmdsynopsis>
@@ -262,6 +268,16 @@
       userspace took to initialize. Note that these measurements simply measure the time passed up to the
       point where all system services have been spawned, but not necessarily until they fully finished
       initialization or the disk is idle.</para>
+
+      <para>If the manager carried shutdown timestamps across a kexec-based live update (i.e. they were
+      restored from the previous boot through the Live Update Orchestrator), the previous boot's shutdown
+      phases are prepended to the chain, so the full shutdown plus bootup sequence is shown and summed into
+      the total: the time spent stopping units (<literal>(stopping)</literal>), the time the manager took to
+      hand off to
+      <citerefentry><refentrytitle>systemd-shutdown</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+      (<literal>(exit)</literal>) and the time spent in <command>systemd-shutdown</command> itself
+      (<literal>(systemd-shutdown)</literal>) are added before the firmware/loader/kernel/initrd/userspace
+      phases.</para>
 
       <example>
         <title><command>Show how long the boot took</command></title>
@@ -1146,6 +1162,30 @@ sparc64     foreign
 tilegx      foreign
 x86         secondary
 x86-64      native</programlisting>
+      </example>
+    </refsect2>
+
+    <refsect2>
+      <title><command>systemd-analyze cpu-features <optional><replaceable>NAME</replaceable>...</optional></command></title>
+
+      <para>Lists all known CPU features for the system's CPU architecture, indicating which of them are
+      supported. The listed feature names are those understood by <varname>ConditionCPUFeature=</varname>;
+      see <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+      for details. If one or more feature names are specified, only those are listed.</para>
+
+      <para>The command is currently supported only on arm64, x86, and x86_64 systems.</para>
+
+      <example>
+        <title>Table output on an x86_64 system</title>
+        <programlisting>$ systemd-analyze cpu-features
+NAME         SUPPORT
+abm          ✓
+adx          ✓
+aes          ✓
+apic         ✓
+avx          ✓
+avx2         ✓
+…</programlisting>
       </example>
     </refsect2>
 

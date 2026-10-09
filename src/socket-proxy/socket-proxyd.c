@@ -6,6 +6,7 @@
 
 #include "sd-daemon.h"
 #include "sd-event.h"
+#include "sd-json.h"
 #include "sd-resolve.h"
 
 #include "alloc-util.h"
@@ -14,23 +15,50 @@
 #include "errno-util.h"
 #include "event-util.h"
 #include "fd-util.h"
-#include "format-table.h"
+#include "in-addr-util.h"
+#include "io-util.h"
 #include "log.h"
 #include "main-func.h"
-#include "options.h"
 #include "parse-util.h"
-#include "pretty-print.h"
 #include "resolve-private.h"
+#include "rlimit-util.h"
 #include "set.h"
 #include "socket-forward.h"
 #include "socket-util.h"
+#include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
 #include "time-util.h"
+#include "verbs.h"
 
 static unsigned arg_connections_max = 256;
 static const char *arg_remote_host = NULL;
 static usec_t arg_exit_idle_time = USEC_INFINITY;
+
+typedef enum ProxyProtocol {
+        PROXY_NONE,
+        PROXY_V1,
+        _PROXY_PROTOCOL_MAX,
+        _PROXY_PROTOCOL_INVALID = -EINVAL,
+} ProxyProtocol;
+
+static const char* const proxy_protocol_table[_PROXY_PROTOCOL_MAX] = {
+        [PROXY_V1] = "v1",
+};
+
+static ProxyProtocol arg_proxy_protocol = PROXY_NONE;
+
+DEFINE_PRIVATE_STRING_TABLE_LOOKUP_FROM_STRING(proxy_protocol, ProxyProtocol);
+
+COMMAND(
+        "systemd-socket-proxyd\0",
+        "Bidirectionally proxy local sockets to another (possibly remote) socket.",
+        .argspec =
+                "HOST:PORT\0"
+                "SOCKET\0",
+        .footer = "See systemd.time(7) for the --exit-idle-time= time span format.",
+        .man_pages = "systemd-socket-proxyd(8)\0",
+);
 
 typedef struct Context {
         sd_event *event;
@@ -138,10 +166,95 @@ static int connection_forward_done(SocketForward *sf, int error, void *userdata)
         return 0; /* ignore errors, continue serving */
 }
 
+static int send_proxy_protocol_v1(Connection *c) {
+        _cleanup_free_ char *header = NULL;
+        int r, header_len;
+        union sockaddr_union local_sa, remote_sa;
+        socklen_t sa_len;
+
+        assert(c);
+
+        r = sd_is_socket(c->server_fd, AF_UNSPEC, SOCK_STREAM, /* listening= */ 0);
+        if (r < 0) {
+                log_warning_errno(r, "Failed to issue SO_TYPE, reporting fallback proxy data 'UNKNOWN': %m");
+                goto unknown;
+        }
+        if (r == 0) {
+                log_warning("Only TCP is supported by the PROXY protocol, reporting fallback proxy data 'UNKNOWN'.");
+                goto unknown;
+        }
+
+        sa_len = sizeof(local_sa);
+        if (getsockname(c->server_fd, &local_sa.sa, &sa_len) < 0) {
+                log_warning_errno(errno, "Failed to get local address (getsockname), reporting fallback proxy data 'UNKNOWN': %m");
+                goto unknown;
+        }
+
+        sa_len = sizeof(remote_sa);
+        if (getpeername(c->server_fd, &remote_sa.sa, &sa_len) < 0) {
+                log_warning_errno(errno, "Failed to get remote address (getpeername), reporting fallback proxy data 'UNKNOWN': %m");
+                goto unknown;
+        }
+
+        const char *proto = NULL;
+        switch (remote_sa.sa.sa_family) {
+
+        case AF_INET:
+                proto = "TCP4";
+                break;
+
+        case AF_INET6:
+                proto = "TCP6";
+                break;
+
+        default:
+                log_warning("Only TCP over IPv4 and IPv6 are supported, reporting fallback proxy data 'UNKNOWN'.");
+                goto unknown;
+        }
+
+        const union in_addr_union *remote_addr = sockaddr_in_addr(&remote_sa.sa);
+        const union in_addr_union *local_addr = sockaddr_in_addr(&local_sa.sa);
+
+        unsigned remote_port, local_port;
+        assert_se(sockaddr_port(&remote_sa.sa, &remote_port) >= 0);
+        assert_se(sockaddr_port(&local_sa.sa, &local_port) >= 0);
+
+        header_len = asprintf(
+                         &header, "PROXY %s %s %s %u %u\r\n",
+                         proto,
+                         IN_ADDR_TO_STRING(remote_sa.sa.sa_family, remote_addr),
+                         IN_ADDR_TO_STRING(local_sa.sa.sa_family, local_addr),
+                         remote_port,
+                         local_port);
+        if (header_len < 0)
+                return log_oom();
+
+        r = loop_write_full(c->client_fd, header, header_len, 10 * USEC_PER_SEC);
+        if (r < 0)
+                return log_error_errno(r, "Failed to write to backend host: %m");
+
+        /* success */
+        return 0;
+
+unknown:
+        /* ignore previous errors - server can decide to deny UNKNOWN connections */
+        r = loop_write_full(c->client_fd, "PROXY UNKNOWN\r\n", SIZE_MAX, 10 * USEC_PER_SEC);
+        if (r < 0)
+                return log_error_errno(r, "Failed to write to backend host: %m");
+
+        return 0;
+}
+
 static int connection_complete(Connection *c) {
         int r;
 
         assert(c);
+
+        if (arg_proxy_protocol == PROXY_V1) {
+                r = send_proxy_protocol_v1(c);
+                if (r < 0)
+                        return r;
+        }
 
         r = socket_forward_new(
                         c->context->event,
@@ -296,7 +409,7 @@ static int context_add_connection(Context *context, int fd) {
                 log_debug("New connection from %s", strna(peer));
         }
 
-        if (set_size(context->connections) > arg_connections_max)
+        if (set_size(context->connections) >= arg_connections_max)
                 return log_warning_errno(SYNTHETIC_ERRNO(EBUSY), "Hit connection limit, refusing connection.");
 
         r = sd_event_source_set_enabled(context->idle_time, SD_EVENT_OFF);
@@ -383,39 +496,6 @@ static int add_listen_socket(Context *context, int fd) {
         return 0;
 }
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL, *time_link = NULL;
-        _cleanup_(table_unrefp) Table *options = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-socket-proxyd", "8", &link);
-        if (r < 0)
-                return log_oom();
-        r = terminal_urlify_man("systemd.time", "7", &time_link);
-        if (r < 0)
-                return log_oom();
-
-        r = option_parser_get_help_table(&options);
-        if (r < 0)
-                return r;
-
-        printf("%1$s [HOST:PORT]\n"
-               "%1$s [SOCKET]\n"
-               "\n%2$sBidirectionally proxy local sockets to another (possibly remote) socket.%3$s\n\n",
-               program_invocation_short_name,
-               ansi_highlight(),
-               ansi_normal());
-
-        r = table_print_or_warn(options);
-        if (r < 0)
-                return r;
-
-        printf("\nSee %s for --exit-idle-time= time span format.\n"
-               "See the %s for details.\n",
-               time_link, link);
-        return 0;
-}
-
 static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
@@ -423,11 +503,11 @@ static int parse_argv(int argc, char *argv[]) {
         OptionParser opts = { argc, argv };
         int r;
 
-        FOREACH_OPTION(c, &opts, /* on_error= */ return c)
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return help();
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();
@@ -450,6 +530,16 @@ static int parse_argv(int argc, char *argv[]) {
                         if (r < 0)
                                 return log_error_errno(r, "Failed to parse --exit-idle-time= argument: %s", opts.arg);
                         break;
+
+                OPTION_LONG("proxy-protocol", "v1",
+                            "Enable PROXY protocol: v1"):
+                        arg_proxy_protocol = proxy_protocol_from_string(opts.arg);
+                        if (arg_proxy_protocol < 0)
+                                return log_error_errno(arg_proxy_protocol, "Failed to parse --proxy-protocol= argument: %s", opts.arg);
+                        break;
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
         char **args = option_parser_get_args(&opts);
@@ -473,6 +563,10 @@ static int run(int argc, char *argv[]) {
         r = parse_argv(argc, argv);
         if (r <= 0)
                 return r;
+
+        /* Each connection holds several fds (two sockets, their duplicates and a pipe per direction), so
+         * the default soft limit of 1024 would run out well before the default connection limit. */
+        (void) rlimit_nofile_bump(-1);
 
         r = sd_event_default(&context.event);
         if (r < 0)

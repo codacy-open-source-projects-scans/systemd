@@ -1,9 +1,13 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "shared-forward.h"
+#include "dlopen-note.h"
+#include "forward.h"
 
 #if HAVE_KMOD
+#ifndef SYSTEMD_CFLAGS_MARKER_LIBKMOD
+#  error "missing libkmod_cflags in meson dependency."
+#endif
 
 #include <libkmod.h> /* IWYU pragma: export */
 
@@ -39,7 +43,6 @@ int module_setup_context(struct kmod_ctx **ret);
 
 struct kmod_ctx;
 
-
 static inline int module_setup_context(struct kmod_ctx **ret) {
         return -EOPNOTSUPP;
 }
@@ -50,4 +53,4 @@ static inline int module_load_and_warn(struct kmod_ctx *ctx, const char *module,
 
 #endif
 
-int dlopen_libkmod(int log_level);
+int dlopen_libkmod(int log_level) _dlopen_loader_;
